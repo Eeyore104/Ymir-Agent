@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# --- 工具缓存 ---
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- 环境与密钥（绝不入库） ---
+.env
+.env.*
+!.env.example
+
+# --- 运行时数据（SQLite + 产物文件，见 PRD F5.4） ---
+data/
+
+# --- 前端 ---
+node_modules/
+web/dist/
+web/.vite/
+
+# --- IDE 与本地工作数据 ---
+.idea/
+.vscode/
+.workbuddy/
+*.log
