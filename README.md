@@ -88,4 +88,4 @@ ymir-agent/
 
 ## License
 
-MIT（见 `docs/02-架构设计.md` §8.3 合规边界）。
+MIT License（详见 [LICENSE](LICENSE)；合规边界见 `docs/02-架构设计.md` §8.3）。
