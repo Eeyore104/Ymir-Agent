@@ -1,0 +1,243 @@
+classDiagram
+    direction TB
+
+    class Project {
+        +UUID id
+        +str name
+        +str description
+        +str tenant_id
+        +datetime created_at
+    }
+    class PipelineRun {
+        +UUID id
+        +UUID project_id
+        +str pipeline_id
+        +RunMode mode
+        +RunStatus status
+        +str current_stage_id
+        +JSON context
+        +str error
+        +datetime started_at
+        +datetime finished_at
+    }
+    class StageExecution {
+        +UUID id
+        +UUID run_id
+        +str stage_id
+        +str role_id
+        +StageStatus status
+        +int attempt
+        +JSON input_refs
+        +JSON output_refs
+        +str error
+    }
+    class RoleDefinition {
+        +str id
+        +str name
+        +ModelTier tier
+        +str system_prompt_path
+        +list~str~ capabilities
+        +list~str~ input_types
+        +list~str~ output_types
+        +RetryPolicy retry
+    }
+    class RoleRuntime {
+        +execute(stage_input, run_context) StageOutput
+    }
+    class SopPipeline {
+        +str id
+        +str version
+        +list~SopStage~ stages
+        +list~Transition~ transitions
+    }
+    class SopStage {
+        +str id
+        +str role_id
+        +list~str~ inputs
+        +list~str~ outputs
+        +SopGate gate
+        +bool use_sandbox
+    }
+    class SopGate {
+        +str name
+        +GateType type
+        +str on_reject_target
+    }
+    class Transition {
+        +str from_stage
+        +TransitionEvent event
+        +str to_stage
+    }
+    class Message {
+        +UUID id
+        +UUID run_id
+        +int seq
+        +MessageType type
+        +str from_role
+        +str to_role
+        +list~UUID~ content_refs
+        +str summary
+        +JSON payload
+    }
+    class Artifact {
+        +UUID id
+        +UUID project_id
+        +str name
+        +ArtifactType type
+        +int current_version
+        +str tenant_id
+    }
+    class ArtifactVersion {
+        +UUID id
+        +UUID artifact_id
+        +int version
+        +UUID run_id
+        +str stage_id
+        +str storage_path
+        +str content_hash
+        +int file_count
+        +int size_bytes
+        +str message
+        +UUID parent_version_id
+        +str created_by
+    }
+    class ApprovalRequest {
+        +UUID id
+        +UUID run_id
+        +str stage_id
+        +str gate_name
+        +list~UUID~ artifact_refs
+        +ApprovalStatus status
+        +str decision
+        +str feedback
+        +datetime decided_at
+    }
+    class ApprovalPolicy {
+        +ApprovalMode mode
+        +dict gate_overrides
+        +requires_approval(stage, mode) bool
+    }
+    class OrchestrationEngine {
+        +start_run(project, requirement, mode, pipeline_id) PipelineRun
+        +resume(run_id)
+        +pause(run_id)
+        +cancel(run_id)
+        +handle_decision(approval_id, decision, feedback)
+    }
+    class StageExecutor {
+        +execute(stage, run, attempt) StageResult
+    }
+    class EventBus {
+        +publish(event)
+        +subscribe(handler)
+    }
+    class MessageBus {
+        +send(message) Message
+        +history(run_id) list~Message~
+    }
+    class Sandbox {
+        <<abstract>>
+        +start() SandboxSession
+        +stop(session)
+        +destroy(session)
+    }
+    class SandboxSession {
+        +exec(cmd, timeout) ExecResult
+        +read_file(path) str
+        +write_file(path, content)
+        +list_files(path) list~str~
+        +set_network_policy(policy)
+    }
+    class DockerSandbox {
+        +start() SandboxSession
+    }
+    class ModelGateway {
+        +chat(messages, tier, run_id, stage_id) ChatResult
+    }
+    class ProviderConfig {
+        +str id
+        +str base_url
+        +str api_key_env
+        +dict models
+    }
+    class BudgetGuard {
+        +check(run_id, estimated_tokens) bool
+        +on_exceed(run_id)
+    }
+    class UsageRecorder {
+        +record(call) ModelCall
+        +summary(scope) UsageSummary
+    }
+    class EvaluationHarness {
+        +run_suite(suite_id, artifacts) EvaluationReport
+        +evaluate(task, artifacts) list~EvalScore~
+    }
+    class Evaluator {
+        <<abstract>>
+        +evaluate(task, artifacts, sandbox) EvalScore
+    }
+    class EvaluationReport {
+        +UUID id
+        +UUID project_id
+        +list~EvalScore~ scores
+        +float total_score
+        +bool passed
+        +int total_tokens
+        +float cost_cny
+    }
+    class EvalScore {
+        +str dimension
+        +float score
+        +float weight
+        +list~str~ evidence
+    }
+    class ArtifactStore {
+        +save(artifact, files, message) ArtifactVersion
+        +load(version_id) path
+        +diff(v1, v2) DiffResult
+        +export_zip(project_id) path
+    }
+    class Exporter {
+        <<abstract>>
+        +export(artifact_version, target) ExportResult
+    }
+    class GitHubExporter {
+        +export(artifact_version, target) ExportResult
+    }
+    class RunRepository {
+        +create(run)
+        +get(run_id)
+        +update_status(run_id, status)
+        +list_unfinished()
+    }
+
+    Project "1" --> "*" PipelineRun
+    PipelineRun "1" --> "*" StageExecution
+    PipelineRun "1" --> "*" Message
+    PipelineRun "1" --> "*" ApprovalRequest
+    SopPipeline "1" --> "*" SopStage
+    SopPipeline "1" --> "*" Transition
+    SopStage "1" --> "0..1" SopGate
+    RoleDefinition "1" --> "1" RoleRuntime
+    OrchestrationEngine --> SopPipeline
+    OrchestrationEngine --> StageExecutor
+    OrchestrationEngine --> EventBus
+    OrchestrationEngine --> MessageBus
+    OrchestrationEngine --> ApprovalPolicy
+    StageExecutor --> RoleRuntime
+    StageExecutor --> Sandbox
+    Sandbox <|-- DockerSandbox
+    Sandbox "1" --> "*" SandboxSession
+    RoleRuntime --> ModelGateway
+    ModelGateway --> ProviderConfig
+    ModelGateway --> BudgetGuard
+    ModelGateway --> UsageRecorder
+    Artifact "1" --> "*" ArtifactVersion
+    EvaluationHarness --> Evaluator
+    EvaluationHarness --> EvaluationReport
+    EvaluationReport "1" --> "*" EvalScore
+    EvaluationHarness --> ArtifactStore
+    EvaluationHarness --> Sandbox
+    ApprovalRequest --> ArtifactVersion
+    ArtifactStore --> Exporter
+    Exporter <|-- GitHubExporter

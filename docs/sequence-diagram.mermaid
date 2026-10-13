@@ -1,0 +1,64 @@
+sequenceDiagram
+    actor U as 用户
+    participant API as FastAPI
+    participant ENG as OrchestrationEngine
+    participant PM as RoleRuntime·PM
+    participant AR as RoleRuntime·架构师
+    participant EN as RoleRuntime·工程师
+    participant QA as RoleRuntime·QA
+    participant GW as ModelGateway
+    participant SB as Sandbox
+    participant ST as ArtifactStore
+    participant DB as SQLite
+
+    U->>API: POST /projects/{id}/runs（需求 + 模式）
+    API->>DB: 创建 PipelineRun（running）
+    API->>ENG: 启动 asyncio 任务
+    API-->>U: 202 {run_id}
+    U->>API: GET /runs/{id}/events（SSE 订阅）
+
+    ENG->>ENG: 加载 SOP 定义，进入 prd 阶段
+    ENG->>PM: 执行 prd（输入：需求）
+    PM->>GW: chat（tier=planner）
+    GW-->>PM: PRD 内容 + token 用量
+    PM->>ST: 保存 PRD 产物 v1
+    PM->>DB: Message prd→architect
+    ENG->>DB: prd completed，触发关卡「PRD 确认」
+    ENG-->>U: SSE approval.requested
+
+    alt 驳回（带反馈）
+        U->>API: POST /approvals/{id}/decision {reject, feedback}
+        API->>ENG: 决策事件
+        ENG->>PM: 回退重跑 prd（attempt+1，附反馈消息）
+        PM->>GW: chat（附历史反馈）
+        PM->>ST: 保存 PRD 产物 v2
+        ENG-->>U: SSE approval.requested（再次待审）
+        U->>API: 审批通过
+    else 通过
+        U->>API: POST /approvals/{id}/decision {approve}
+        API->>ENG: 决策事件
+    end
+
+    ENG->>AR: 执行 architecture（输入：PRD）
+    AR->>GW: chat（tier=planner）
+    AR->>ST: 保存设计文档 v1
+    ENG->>DB: architecture completed，关卡「设计评审」
+    ENG-->>U: SSE approval.requested
+    U->>API: 审批通过
+
+    ENG->>EN: 执行 coding（输入：PRD + 设计）
+    EN->>GW: chat（tier=executor，多轮）
+    EN->>SB: write_file 代码 + exec 冒烟检查
+    SB-->>EN: 执行结果
+    EN->>ST: 保存代码产物 v1
+    ENG->>DB: coding completed，关卡「代码合并前」
+    ENG-->>U: SSE approval.requested
+    U->>API: 审批通过
+
+    ENG->>QA: 执行 evaluation（输入：PRD + 设计 + 代码）
+    QA->>SB: 安装依赖 → 构建 → 跑测试
+    QA->>GW: LLM judge（需求符合度 / 架构合理性）
+    QA->>ST: 保存评测报告 v1
+    ENG->>DB: run completed
+    ENG-->>U: SSE run.completed + evaluation.completed
+    U->>API: GET /artifacts/{id} 查看报告 / diff / 导出 zip
