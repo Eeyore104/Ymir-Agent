@@ -30,7 +30,10 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # 用 Settings 注入真实连接串（覆盖 alembic.ini 占位值）
-config.set_main_option("sqlalchemy.url", get_settings().sqlalchemy_url)
+settings = get_settings()
+# SQLite 库文件所在目录不存在时先创建（CI / 新机器干净检出场景，data/ 不在版本库中）
+settings.resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
+config.set_main_option("sqlalchemy.url", settings.sqlalchemy_url)
 
 target_metadata = Base.metadata
 
