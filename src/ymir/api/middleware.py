@@ -17,8 +17,6 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.default_tenant_id = default_tenant_id
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request.state.tenant_id = self.default_tenant_id
         return await call_next(request)

@@ -38,9 +38,7 @@ from ymir.storage.repositories import ProjectRepository, RunRepository
 async def _make_project_run(session: AsyncSession) -> tuple[str, str]:
     project = await ProjectRepository(session).create(name="demo", description="示例")
     await session.flush()
-    run = await RunRepository(session).create(
-        project_id=project.id, requirement="做一个待办 API"
-    )
+    run = await RunRepository(session).create(project_id=project.id, requirement="做一个待办 API")
     await session.flush()
     return project.id, run.id
 
@@ -92,9 +90,7 @@ async def test_relationship_cascade(session: AsyncSession) -> None:
     project_id, run_id = await _make_project_run(session)
 
     session.add(StageExecution(run_id=run_id, stage_id="prd", role_id="pm"))
-    session.add(
-        Message(run_id=run_id, seq=1, type=MessageType.ARTIFACT.value, summary="PRD v1")
-    )
+    session.add(Message(run_id=run_id, seq=1, type=MessageType.ARTIFACT.value, summary="PRD v1"))
     session.add(Approval(run_id=run_id, stage_id="prd", gate_name="PRD 确认"))
     session.add(Event(run_id=run_id, seq=1, type="run.started", payload={}))
     session.add(

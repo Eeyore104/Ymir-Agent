@@ -54,9 +54,7 @@ async def list_projects(
     }
 
 
-@router.get(
-    "/{project_id}", response_model=ApiResponse[ProjectDetail], summary="项目详情"
-)
+@router.get("/{project_id}", response_model=ApiResponse[ProjectDetail], summary="项目详情")
 async def get_project(
     project_id: str,
     session: SessionDep,
@@ -66,7 +64,5 @@ async def get_project(
     if project is None:
         raise NotFoundError("项目不存在")
     run_count = await RunRepository(session).count_by_project(project_id, tenant_id)
-    detail = ProjectDetail(
-        **ProjectOut.model_validate(project).model_dump(), run_count=run_count
-    )
+    detail = ProjectDetail(**ProjectOut.model_validate(project).model_dump(), run_count=run_count)
     return {"code": 0, "data": detail}

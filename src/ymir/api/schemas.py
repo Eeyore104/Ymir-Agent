@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -110,3 +110,84 @@ class HealthData(BaseModel):
     status: str
     database: str
     version: str
+    gateway: str = "unknown"
+
+
+# --- 运行动作（T02）---
+
+
+class RunActionPayload(BaseModel):
+    """运行控制动作（§6.1 runs/{id}/actions）。"""
+
+    action: Literal["pause", "resume", "cancel", "retry-stage"]
+
+
+class RunActionOut(BaseModel):
+    """动作执行结果（返回最新运行状态）。"""
+
+    run_id: str
+    action: str
+    status: str
+
+
+# --- 角色消息（T02）---
+
+
+class MessageOut(BaseModel):
+    """角色消息（消息流面板 / SSE message.created）。"""
+
+    id: str
+    run_id: str
+    seq: int
+    type: str
+    from_role: str | None = None
+    to_role: str | None = None
+    content_refs: list[Any]
+    summary: str | None = None
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+# --- 模型网关（T02，脱敏）---
+
+
+class ModelInfo(BaseModel):
+    """单个模型（脱敏视图）。"""
+
+    name: str
+    tier: str
+    price_in: float
+    price_out: float
+
+
+class ProviderInfo(BaseModel):
+    """provider 视图（不含密钥，仅密钥就绪状态）。"""
+
+    name: str
+    base_url: str
+    enabled: bool
+    key_ready: bool
+    models: list[ModelInfo]
+
+
+class ModelsOut(BaseModel):
+    """网关配置视图（GET /models）。"""
+
+    version: str
+    providers: list[ProviderInfo]
+    routing: dict[str, list[str]]
+    budget: dict[str, float]
+
+
+# --- 用量（T02）---
+
+
+class UsageOut(BaseModel):
+    """token / 成本统计（GET /usage）。"""
+
+    scope: str
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_cny: float

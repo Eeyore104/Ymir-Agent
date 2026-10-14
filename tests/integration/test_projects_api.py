@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 from httpx import AsyncClient
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _wait_for_terminal(
+    client: AsyncClient, run_id: str, timeout: float = 10.0
+) -> dict:
+    """轮询 run 直到终态（T02 stub 流水线毫秒级完成；超时断言失败）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        data = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+        if data["status"] in ("completed", "failed"):
+            return data
+        if time.monotonic() > deadline:
+            raise AssertionError(f"run 未在 {timeout}s 内到达终态: {data['status']}")
+        await asyncio.sleep(0.05)
 
 
 async def test_health(client: AsyncClient) -> None:
@@ -18,9 +35,7 @@ async def test_health(client: AsyncClient) -> None:
 
 
 async def test_create_project(client: AsyncClient) -> None:
-    resp = await client.post(
-        "/api/v1/projects", json={"name": "demo", "description": "示例项目"}
-    )
+    resp = await client.post("/api/v1/projects", json={"name": "demo", "description": "示例项目"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
@@ -62,7 +77,8 @@ async def test_get_project_not_found(client: AsyncClient) -> None:
     assert "message" in body
 
 
-async def test_create_run_returns_202_and_pending_record(client: AsyncClient) -> None:
+async def test_create_run_returns_202_and_engine_takes_over(client: AsyncClient) -> None:
+    """T02：POST /runs 返回 202 后编排引擎接管，stub 四阶段空流水线推进至 completed。"""
     created = await client.post("/api/v1/projects", json={"name": "runner"})
     project_id = created.json()["data"]["id"]
 
@@ -78,13 +94,15 @@ async def test_create_run_returns_202_and_pending_record(client: AsyncClient) ->
 
     detail = await client.get(f"/api/v1/runs/{run_id}")
     assert detail.status_code == 200
-    data = detail.json()["data"]
+    data = await _wait_for_terminal(client, run_id)
     assert data["id"] == run_id
     assert data["project_id"] == project_id
-    assert data["status"] == "pending"
+    assert data["status"] == "completed"
     assert data["mode"] == "key_node"
     assert data["pipeline_id"] == "software-dev"
     assert data["context"]["requirement"] == "做一个待办事项 REST API"
+    assert data["started_at"] is not None
+    assert data["finished_at"] is not None
 
 
 async def test_create_run_with_mode_and_pipeline_override(client: AsyncClient) -> None:
@@ -110,9 +128,7 @@ async def test_create_run_with_mode_and_pipeline_override(client: AsyncClient) -
 
 
 async def test_create_run_project_not_found(client: AsyncClient) -> None:
-    resp = await client.post(
-        "/api/v1/projects/missing/runs", json={"requirement": "x"}
-    )
+    resp = await client.post("/api/v1/projects/missing/runs", json={"requirement": "x"})
     assert resp.status_code == 404
     assert resp.json()["code"] == 1002
 

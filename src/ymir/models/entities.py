@@ -92,9 +92,7 @@ class PipelineRun(Base):
     approvals: Mapped[list[Approval]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
-    events: Mapped[list[Event]] = relationship(
-        back_populates="run", cascade="all, delete-orphan"
-    )
+    events: Mapped[list[Event]] = relationship(back_populates="run", cascade="all, delete-orphan")
     model_calls: Mapped[list[ModelCall]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
@@ -186,9 +184,7 @@ class ArtifactVersion(Base):
 
     artifact: Mapped[Artifact] = relationship(back_populates="versions")
 
-    __table_args__ = (
-        UniqueConstraint("artifact_id", "version", name="uq_artifact_version"),
-    )
+    __table_args__ = (UniqueConstraint("artifact_id", "version", name="uq_artifact_version"),)
 
 
 class Message(Base):

@@ -23,5 +23,10 @@ jobs:
       - name: Ruff (lint)
         run: uv run ruff check .
 
+      - name: Alembic migration drift guard
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+
       - name: Pytest
         run: uv run pytest

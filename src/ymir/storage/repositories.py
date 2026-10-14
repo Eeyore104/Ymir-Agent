@@ -53,9 +53,7 @@ class BaseRepository[ModelT]:
     async def count(self, tenant_id: str = DEFAULT_TENANT_ID) -> int:
         """统计实体数量（带 tenant scope）。"""
         stmt = (
-            select(func.count())
-            .select_from(self.model)
-            .where(self.model.tenant_id == tenant_id)  # type: ignore[attr-defined]
+            select(func.count()).select_from(self.model).where(self.model.tenant_id == tenant_id)  # type: ignore[attr-defined]
         )
         result = await self.session.execute(stmt)
         return int(result.scalar_one())
@@ -137,9 +135,7 @@ class RunRepository(BaseRepository[PipelineRun]):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def count_by_project(
-        self, project_id: str, tenant_id: str = DEFAULT_TENANT_ID
-    ) -> int:
+    async def count_by_project(self, project_id: str, tenant_id: str = DEFAULT_TENANT_ID) -> int:
         stmt = (
             select(func.count())
             .select_from(PipelineRun)

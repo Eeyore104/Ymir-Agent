@@ -1,0 +1,43 @@
+# ymir-agent 模型网关配置（docs/02 §3.9、docs/05 T2-1）
+#
+# 安全约定：密钥只走环境变量（api_key_env 指向的变量名），禁止把密钥写进本文件、
+# 禁止入库、禁止进日志（docs/02 §10.3-7）。
+#
+# 价格单位：元 / 百万 token（price_in=输入价，price_out=输出价）。
+# 扩展方式：新增 provider 按同构结构追加即可（OpenAI 兼容端点）：
+#   qwen:  { base_url: https://dashscope.aliyuncs.com/compatible-mode/v1, api_key_env: QWEN_API_KEY, ... }
+#   glm:   { base_url: https://open.bigmodel.cn/api/paas/v4, api_key_env: GLM_API_KEY, ... }
+#   kimi:  { base_url: https://api.moonshot.cn/v1, api_key_env: KIMI_API_KEY, ... }
+# 非 OpenAI 协议（如 Anthropic）走 gateway/adapters 适配器（v1.x 预留）。
+
+version: "1.0"
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    enabled: true
+    models:
+      deepseek-reasoner:
+        tier: planner   # 推理模型：PM / 架构师 等规划类角色
+        price_in: 4.0
+        price_out: 12.0
+        max_tokens: 8192
+      deepseek-chat:
+        tier: executor  # 快模型：工程师 / QA 等执行类角色
+        price_in: 1.0
+        price_out: 2.0
+        max_tokens: 8192
+
+# 分级路由：tier -> 候选模型优先级列表（左侧优先，失败沿链降级）。
+# 未配置密钥的 provider 会被自动跳过（见 providers.is_available）。
+routing:
+  planner:
+    - deepseek-reasoner
+  executor:
+    - deepseek-chat
+
+# 预算红线（超限 -> 引擎暂停 run + SSE budget.exceeded 告警）
+budget:
+  per_run_tokens: 500000    # 单次运行 token 上限
+  per_day_cost_cny: 50      # 全局日成本上限（元，UTC 日）

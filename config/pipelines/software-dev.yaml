@@ -1,0 +1,40 @@
+# ymir-agent 软件研发流水线（docs/02 §3.2）
+#
+# 声明式 SOP：阶段 -> 关卡 -> 流转。编排内核只解释执行，改流程不改代码。
+# 关卡流转（approved / rejected）由 HITL 引擎在 T04 注入；本文件只声明
+# stage_completed 主链路与各阶段 gate 元数据。
+# 校验器：SopValidator（ID 唯一 / inputs 可被上游满足 / 转移边可达终点 /
+# on_reject_target 存在 / 角色已注册）。
+
+id: software-dev
+version: "1.0"
+description: 需求 → PRD → 架构 → 代码 → 评测
+
+stages:
+  - id: prd
+    role: pm
+    inputs: [requirement]
+    outputs: [prd]
+    gate: { name: "PRD 确认", type: human_approval, on_reject_target: prd }
+  - id: architecture
+    role: architect
+    inputs: [prd]
+    outputs: [design]
+    gate: { name: "设计评审", type: human_approval, on_reject_target: architecture }
+  - id: coding
+    role: engineer
+    inputs: [prd, design]
+    outputs: [code]
+    use_sandbox: true
+    gate: { name: "代码合并前评审", type: human_approval, on_reject_target: coding }
+  - id: evaluation
+    role: qa
+    inputs: [prd, design, code]
+    outputs: [evaluation_report]
+    gate: null                      # 评测后人工终审由 Web 端主动查看，不设阻断关卡
+
+transitions:
+  - { from: prd,          on: stage_completed, to: architecture }
+  - { from: architecture, on: stage_completed, to: coding }
+  - { from: coding,       on: stage_completed, to: evaluation }
+  - { from: evaluation,   on: stage_completed, to: __end__ }

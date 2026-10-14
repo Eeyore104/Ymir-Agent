@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -74,3 +75,25 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """返回进程级配置单例（进程内缓存）。"""
     return Settings()
+
+
+def load_env_file(path: Path | None = None) -> None:
+    """把仓库根目录 ``.env`` 读入进程环境变量（仅补齐缺失项）。
+
+    pydantic-settings 只解析 ``YMIR_`` 前缀字段；模型网关等模块按
+    ``api_key_env`` 直接从 ``os.environ`` 读密钥（如 ``DEEPSEEK_API_KEY``），
+    因此应用启动 / 脚本运行前需显式加载 ``.env``。
+    已存在的环境变量优先（不覆盖）；只读不写、内容不入日志（§10.3-7）。
+    """
+    env_path = path or PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value

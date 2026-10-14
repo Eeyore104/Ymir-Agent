@@ -68,3 +68,5 @@ async def client(
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c
+    # T02：取消引擎推进任务，避免事件循环关闭时后台任务泄漏告警
+    await app.state.orchestrator.shutdown()

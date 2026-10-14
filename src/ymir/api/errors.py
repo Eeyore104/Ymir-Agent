@@ -37,18 +37,14 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _handle_validation(
-        _request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    async def _handle_validation(_request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse(
             status_code=400,
             content=_error_body(int(BizCode.INVALID_PARAM), _format_validation_error(exc)),
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def _handle_http_error(
-        _request: Request, exc: StarletteHTTPException
-    ) -> JSONResponse:
+    async def _handle_http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
         if exc.status_code == 404:
             code = int(BizCode.NOT_FOUND)
         elif exc.status_code in (405, 400, 422):

@@ -1,4 +1,4 @@
-"""QA 独立边界与响应一致性测试（T01 第 1 轮验证）。
+"""QA 独立边界与响应一致性测试（T01 第 1 轮验证；T02 同步引擎接管语义）。
 
 覆盖工程师自述之外的深边界：
 - 参数校验（缺字段 / 空串 / 超长 / 非法枚举）→ 1001
@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 import uuid
 
 import pytest
@@ -27,6 +29,20 @@ async def _new_project(client: AsyncClient, name: str = "qa") -> str:
     resp = await client.post("/api/v1/projects", json={"name": name})
     assert resp.status_code == 200
     return resp.json()["data"]["id"]
+
+
+async def _wait_for_terminal(
+    client: AsyncClient, run_id: str, timeout: float = 10.0
+) -> dict:
+    """轮询 run 直到终态（T02 引擎接管后使用）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        data = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+        if data["status"] in ("completed", "failed"):
+            return data
+        if time.monotonic() > deadline:
+            raise AssertionError(f"run 未在 {timeout}s 内到达终态: {data['status']}")
+        await asyncio.sleep(0.05)
 
 
 # --- 参数校验 → 1001 ---
@@ -47,9 +63,7 @@ async def test_project_name_too_long_returns_1001(client: AsyncClient) -> None:
 
 
 async def test_project_description_too_long_returns_1001(client: AsyncClient) -> None:
-    resp = await client.post(
-        "/api/v1/projects", json={"name": "ok", "description": "d" * 2001}
-    )
+    resp = await client.post("/api/v1/projects", json={"name": "ok", "description": "d" * 2001})
     assert resp.status_code == 400
     assert resp.json()["code"] == 1001
 
@@ -96,9 +110,7 @@ async def test_random_uuid_run_returns_1002(client: AsyncClient) -> None:
 
 
 async def test_run_under_nonexistent_project_returns_1002(client: AsyncClient) -> None:
-    resp = await client.post(
-        f"/api/v1/projects/{uuid.uuid4()}/runs", json={"requirement": "x"}
-    )
+    resp = await client.post(f"/api/v1/projects/{uuid.uuid4()}/runs", json={"requirement": "x"})
     assert resp.status_code == 404
     assert resp.json()["code"] == 1002
 
@@ -162,9 +174,7 @@ async def test_created_project_id_is_uuid_v4_and_time_iso_utc(
 
 async def test_run_response_consistency(client: AsyncClient) -> None:
     pid = await _new_project(client, "consistency-run")
-    created = await client.post(
-        f"/api/v1/projects/{pid}/runs", json={"requirement": "r"}
-    )
+    created = await client.post(f"/api/v1/projects/{pid}/runs", json={"requirement": "r"})
     assert created.status_code == 202
     run_id = created.json()["data"]["run_id"]
     assert UUID_RE.match(run_id), run_id
@@ -173,9 +183,11 @@ async def test_run_response_consistency(client: AsyncClient) -> None:
     assert UUID_RE.match(data["id"])
     assert UUID_RE.match(data["project_id"])
     assert ISO_UTC_RE.match(data["created_at"])
-    # 未开始：started_at / finished_at 为 null
-    assert data["started_at"] is None
-    assert data["finished_at"] is None
+    # T02：创建后引擎立即接管，started_at 必然落库；finished_at 视推进快慢可能已落
+    assert data["started_at"] is not None
+    assert ISO_UTC_RE.match(data["started_at"])
+    if data["finished_at"] is not None:
+        assert ISO_UTC_RE.match(data["finished_at"])
 
 
 async def test_success_envelope_has_no_message_key(client: AsyncClient) -> None:
@@ -190,14 +202,13 @@ async def test_success_envelope_has_no_message_key(client: AsyncClient) -> None:
 
 async def test_run_defaults_when_omitted(client: AsyncClient) -> None:
     pid = await _new_project(client, "defaults")
-    created = await client.post(
-        f"/api/v1/projects/{pid}/runs", json={"requirement": "仅需求"}
-    )
+    created = await client.post(f"/api/v1/projects/{pid}/runs", json={"requirement": "仅需求"})
     run_id = created.json()["data"]["run_id"]
-    data = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+    # T02：默认参数下引擎接管，推送至 completed
+    data = await _wait_for_terminal(client, run_id)
     assert data["mode"] == "key_node"
     assert data["pipeline_id"] == "software-dev"
-    assert data["status"] == "pending"
+    assert data["status"] == "completed"
     assert data["context"]["requirement"] == "仅需求"
     assert data["context"]["context_refs"] == []
 
@@ -242,15 +253,11 @@ async def test_health_is_real_db_probe_not_hardcoded() -> None:
 
     settings = Settings()
     # 把 DB 指向一个目录（sqlite 无法作为库文件打开）→ 触发真实查询失败
-    bad_engine = create_async_engine(
-        "sqlite+aiosqlite:///" + str(settings.resolved_db_path.parent)
-    )
+    bad_engine = create_async_engine("sqlite+aiosqlite:///" + str(settings.resolved_db_path.parent))
     bad_factory = async_sessionmaker(bad_engine, expire_on_commit=False, class_=AsyncSession)
     app = create_app(settings=settings, engine=bad_engine, session_factory=bad_factory)
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
             resp = await c.get("/health")
             assert resp.status_code == 503
             assert resp.json()["code"] == 500
