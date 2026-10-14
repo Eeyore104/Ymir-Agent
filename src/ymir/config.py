@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     default_pipeline_id: str = "software-dev"
     default_run_mode: str = "key_node"
 
+    # --- 沙箱（架构设计 §3.5）---
+    sandbox_backend: str = "auto"  # auto | docker | local（auto：Docker 不可用降级 local）
+    sandbox_image: str = "python:3.12-slim"  # 可换 docker/sandbox.Dockerfile 构建的 ymir-sandbox
+    sandbox_network: str = "none"  # 默认网络策略：none | restricted | open
+    sandbox_cpus: int = 2
+    sandbox_memory: str = "4g"
+    sandbox_pids_limit: int = 512
+    sandbox_exec_timeout: int = 120  # 单条命令默认超时（秒）
+
     # --- CORS：仅放行 localhost（PRD N4）---
     cors_allow_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 

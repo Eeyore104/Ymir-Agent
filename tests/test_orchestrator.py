@@ -69,6 +69,37 @@ async def _wait_status(
         await asyncio.sleep(0.05)
 
 
+async def _wait_events(
+    session_factory: async_sessionmaker[AsyncSession],
+    run_id: str,
+    types_needed: set[str],
+    timeout: float = 5.0,
+):
+    """轮询等待事件流齐全（最终一致）。
+
+    T03 修复 flaky：引擎「先提交状态、后发事件」，状态到达与事件落库存在
+    小时序窗口，事件断言不能即时读取，需等待目标事件出现。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        async with session_factory() as s:
+            rows = list(
+                (
+                    await s.execute(
+                        select(Event).where(Event.run_id == run_id).order_by(Event.seq)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        got = {row.type for row in rows}
+        if types_needed <= got:
+            return rows
+        if time.monotonic() > deadline:
+            raise AssertionError(f"事件未在 {timeout}s 内齐全：需要 {types_needed}，实际 {got}")
+        await asyncio.sleep(0.05)
+
+
 def make_engine(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -631,14 +662,9 @@ async def test_budget_exceeded_pauses_and_emits_events(
     run = await _wait_status(session_factory, run_id, {"paused"})
     assert run.status == "paused"
 
-    events = (
-        (
-            await session.execute(
-                select(Event).where(Event.run_id == run_id).order_by(Event.seq)
-            )
-        )
-        .scalars()
-        .all()
+    # T03：等待事件齐全（状态提交与事件落库间有小时序窗口，避免 flaky）
+    events = await _wait_events(
+        session_factory, run_id, {"budget.exceeded", "run.paused", "stage.failed"}
     )
     types = [e.type for e in events]
     assert "budget.exceeded" in types

@@ -1,0 +1,15 @@
+# 产品经理（架构设计 §3.1）
+# tier=planner：规划模型（deepseek-reasoner）；输出契约 PRDDocument。
+
+id: pm
+name: 产品经理
+description: 负责需求结构化、验收标准与用户故事，产出 PRD
+tier: planner
+system_prompt: prompts/pm.md.j2
+capabilities: [doc_write]
+inputs: [requirement]
+outputs: [prd]
+output_schema: PRDDocument
+retry: { max_attempts: 2 }
+temperature: 0.4
+max_tokens: 8192

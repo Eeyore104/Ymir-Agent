@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from ymir.api.app import create_app
 from ymir.config import Settings
 from ymir.models.base import Base
+from ymir.orchestrator.executor import StageExecutor
+from ymir.sandbox import LocalSandbox, SandboxService
 from ymir.storage import db as db_module
 
 
@@ -62,9 +64,20 @@ async def client(
     temp_settings: Settings,
     engine: AsyncEngine,
     session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
 ) -> AsyncIterator[AsyncClient]:
     """注入隔离引擎的测试客户端（ASGI 内存传输，不启真实端口）。"""
-    app = create_app(settings=temp_settings, engine=engine, session_factory=session_factory)
+    app = create_app(
+        settings=temp_settings,
+        engine=engine,
+        session_factory=session_factory,
+        executor=StageExecutor(),  # T03：API 测试注入 stub 执行器（不发真实模型调用）
+    )
+    # T03：测试注入 LocalSandbox（不依赖 Docker；工作区隔离到 tmp_path）
+    app.state.sandbox_service = SandboxService(
+        session_factory=session_factory,
+        sandbox=LocalSandbox(base_dir=tmp_path / "sandboxes"),
+    )
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c

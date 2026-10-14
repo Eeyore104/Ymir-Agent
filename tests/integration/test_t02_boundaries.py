@@ -427,7 +427,11 @@ async def test_sse_endpoint_unknown_run_returns_1002(
         app, _http_scope(f"/api/v1/runs/{uuid.uuid4()}/events")
     )
     try:
-        await _wait_until(lambda: any(m["type"] == "http.response.start" for m in sent))
+        # T03 修复 flaky：body 为独立帧，需等待其到达再解析（仅等 start 会偶发空 body）
+        await _wait_until(
+            lambda: any(m["type"] == "http.response.start" for m in sent)
+            and bool(_body_text(sent))
+        )
         start = next(m for m in sent if m["type"] == "http.response.start")
         assert start["status"] == 404
         body = json.loads(_body_text(sent))
@@ -598,7 +602,12 @@ async def test_models_response_never_leaks_key(
     assert "api_key" not in deepseek
 
 
-async def test_models_key_ready_false_without_key(client: AsyncClient) -> None:
+async def test_models_key_ready_false_without_key(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 环境无关化（T03 修正）：用户 .env 可能已配置真实 key，
+    # 本用例只校验「缺 key 路径」，显式清除环境变量后再断言。
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     resp = await client.get("/api/v1/models")
     deepseek = next(p for p in resp.json()["data"]["providers"] if p["name"] == "deepseek")
     assert deepseek["key_ready"] is False

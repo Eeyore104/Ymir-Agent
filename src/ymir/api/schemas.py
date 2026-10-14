@@ -191,3 +191,100 @@ class UsageOut(BaseModel):
     completion_tokens: int
     total_tokens: int
     cost_cny: float
+
+
+# --- 产物库（T03，§3.6）---
+
+
+class ArtifactOut(BaseModel):
+    """产物（列表 / 详情公共字段）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    name: str
+    type: str
+    current_version: int
+    created_at: datetime
+
+
+class ArtifactVersionOut(BaseModel):
+    """产物版本元数据。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    artifact_id: str
+    version: int
+    run_id: str | None = None
+    stage_id: str | None = None
+    storage_path: str
+    content_hash: str | None = None
+    file_count: int
+    size_bytes: int
+    message: str | None = None
+    parent_version_id: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+
+class ArtifactDetailOut(ArtifactOut):
+    """产物详情（含版本列表）。"""
+
+    versions: list[ArtifactVersionOut] = []
+
+
+class ArtifactContentOut(BaseModel):
+    """产物版本内容：无 ``path`` 返回文件清单；有 ``path`` 返回单文件内容。"""
+
+    artifact_id: str
+    version: int
+    files: list[str] = []
+    path: str | None = None
+    content: str | None = None
+
+
+class FileDiffOut(BaseModel):
+    """单文件差异。"""
+
+    path: str
+    status: str
+    diff: str
+    additions: int
+    deletions: int
+
+
+class DiffStatsOut(BaseModel):
+    """差异统计。"""
+
+    files_changed: int
+    additions: int
+    deletions: int
+
+
+class ArtifactDiffOut(BaseModel):
+    """版本间 diff（unified，按文件分组）。"""
+
+    artifact_id: str
+    v1: int
+    v2: int
+    files: list[FileDiffOut]
+    stats: DiffStatsOut
+
+
+# --- 沙箱（T03，§3.5）---
+
+
+class SandboxSessionOut(BaseModel):
+    """沙箱会话视图。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    container_id: str | None = None
+    image: str
+    status: str
+    created_at: datetime
+    destroyed_at: datetime | None = None

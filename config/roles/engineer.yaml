@@ -1,0 +1,16 @@
+# 工程师（架构设计 §3.1）
+# tier=executor：执行模型（deepseek-chat）；输出契约 CodeBundle；
+# coding 阶段 use_sandbox=true，产物在沙箱内冒烟执行（§3.5）。
+
+id: engineer
+name: 工程师
+description: 依据 PRD 与设计文档实现代码，并在沙箱内冒烟验证
+tier: executor
+system_prompt: prompts/engineer.md.j2
+capabilities: [code_write, read_artifact]
+inputs: [prd, design]
+outputs: [code]
+output_schema: CodeBundle
+retry: { max_attempts: 2 }
+temperature: 0.2
+max_tokens: 8192

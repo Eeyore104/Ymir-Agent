@@ -8,11 +8,13 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ymir.artifacts.store import ArtifactStore
 from ymir.config import Settings, get_settings
 from ymir.events.bus import EventPublisher
 from ymir.gateway.gateway import ModelGateway
 from ymir.messages.bus import MessagePublisher
 from ymir.orchestrator.engine import OrchestrationEngine
+from ymir.sandbox.session import SandboxService
 
 
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
@@ -60,6 +62,16 @@ def get_gateway(request: Request) -> ModelGateway:
     return request.app.state.gateway
 
 
+def get_artifact_store(request: Request) -> ArtifactStore:
+    """返回应用绑定的产物库。"""
+    return request.app.state.artifacts
+
+
+def get_sandbox_service(request: Request) -> SandboxService:
+    """返回应用绑定的沙箱会话服务。"""
+    return request.app.state.sandbox_service
+
+
 # --- Annotated 依赖别名（供路由签名使用，避免 B008）---
 SessionDep = Annotated[AsyncSession, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
@@ -68,3 +80,5 @@ OrchestratorDep = Annotated[OrchestrationEngine, Depends(get_orchestrator)]
 EventsDep = Annotated[EventPublisher, Depends(get_event_publisher)]
 MessagesDep = Annotated[MessagePublisher, Depends(get_message_publisher)]
 GatewayDep = Annotated[ModelGateway, Depends(get_gateway)]
+ArtifactsDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
+SandboxesDep = Annotated[SandboxService, Depends(get_sandbox_service)]

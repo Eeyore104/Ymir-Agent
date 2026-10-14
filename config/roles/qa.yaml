@@ -1,0 +1,16 @@
+# 质量工程师（架构设计 §3.1）
+# tier=executor：执行模型（deepseek-chat）；输出契约 EvalSummary（T03 简化版，
+# T05 升级为四维评测报告：requirement_conformance / runnability / convention / architecture）。
+
+id: qa
+name: 质量工程师
+description: 对代码产物做静态审查与风险评估，产出评测报告
+tier: executor
+system_prompt: prompts/qa.md.j2
+capabilities: [doc_write, read_artifact]
+inputs: [prd, design, code]
+outputs: [evaluation_report]
+output_schema: EvalSummary
+retry: { max_attempts: 2 }
+temperature: 0.2
+max_tokens: 4096

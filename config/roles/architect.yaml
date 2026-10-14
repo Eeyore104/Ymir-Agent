@@ -1,0 +1,15 @@
+# 架构师（架构设计 §3.1）
+# tier=planner：规划模型（deepseek-reasoner）；输出契约 DesignDocument。
+
+id: architect
+name: 架构师
+description: 负责模块划分、技术选型、接口草案与目录结构，产出设计文档
+tier: planner
+system_prompt: prompts/architect.md.j2
+capabilities: [doc_write, read_artifact]
+inputs: [prd]
+outputs: [design]
+output_schema: DesignDocument
+retry: { max_attempts: 2 }
+temperature: 0.3
+max_tokens: 8192

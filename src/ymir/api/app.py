@@ -5,6 +5,8 @@
 - TenantContext no-op 中间件（§2.4 扩展点）
 - ``/health`` 含 DB 可达性与网关密钥就绪检查
 - T02：装配模型网关 / 事件与消息总线 / 编排引擎，启动时断点恢复
+- T03：装配角色运行时 / 产物库 / 沙箱服务，引擎默认接真实执行器
+  （测试可注入 stub 执行器）；日志统一初始化（T02 遗留①）
 """
 
 from __future__ import annotations
@@ -21,14 +23,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ymir.api.errors import register_exception_handlers
 from ymir.api.middleware import TenantContextMiddleware
-from ymir.api.routers import events, models, projects, runs, usage
+from ymir.api.routers import artifacts, events, models, projects, runs, sandboxes, usage
 from ymir.api.schemas import ApiResponse, HealthData
+from ymir.bootstrap import build_execution_stack
 from ymir.common.errors import BizCode
+from ymir.common.logging import setup_logging
 from ymir.config import Settings, get_settings, load_env_file
-from ymir.events.bus import EventPublisher
-from ymir.gateway.gateway import build_gateway
-from ymir.messages.bus import MessagePublisher
 from ymir.orchestrator.engine import OrchestrationEngine
+from ymir.orchestrator.executor import StageExecutor
 from ymir.orchestrator.recovery import recover_runs
 from ymir.storage.db import build_engine, build_session_factory
 
@@ -39,25 +41,28 @@ def create_app(
     settings: Settings | None = None,
     engine: AsyncEngine | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    executor: StageExecutor | None = None,
 ) -> FastAPI:
     """构建并装配 FastAPI 应用。
 
-    允许注入 ``engine`` / ``session_factory``（测试用），否则按配置构建。
+    允许注入 ``engine`` / ``session_factory``（测试用），否则按配置构建；
+    ``executor`` 缺省装配真实角色执行器（T03），测试可注入 stub 执行器
+    （避免真实模型调用）。
     """
     load_env_file()  # 注入 .env 密钥（如 DEEPSEEK_API_KEY，幂等，仅补齐缺失项）
     settings = settings or get_settings()
+    setup_logging(debug=settings.debug)
     engine = engine or build_engine(settings)
     session_factory = session_factory or build_session_factory(engine)
 
-    # --- T02 组件装配：事件/消息总线 -> 引擎；模型网关 ---
-    event_publisher = EventPublisher(session_factory)
-    message_publisher = MessagePublisher(session_factory, event_publisher)
+    # --- 组件装配：执行栈（总线 / 网关 / 产物库 / 沙箱 / 角色 -> 执行器）---
+    stack = build_execution_stack(settings, session_factory, executor=executor)
     orchestrator = OrchestrationEngine(
         session_factory=session_factory,
-        events=event_publisher,
-        messages=message_publisher,
+        events=stack.event_publisher,
+        messages=stack.message_publisher,
+        executor=stack.executor,
     )
-    gateway = build_gateway(session_factory)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -82,10 +87,13 @@ def create_app(
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = session_factory
-    app.state.events = event_publisher
-    app.state.messages = message_publisher
+    app.state.events = stack.event_publisher
+    app.state.messages = stack.message_publisher
     app.state.orchestrator = orchestrator
-    app.state.gateway = gateway
+    app.state.gateway = stack.gateway
+    app.state.artifacts = stack.artifact_store
+    app.state.sandbox_service = stack.sandbox_service
+    app.state.roles = stack.role_registry
 
     app.add_middleware(
         CORSMiddleware,
@@ -103,6 +111,8 @@ def create_app(
     app.include_router(events.router, prefix=settings.api_prefix)
     app.include_router(models.router, prefix=settings.api_prefix)
     app.include_router(usage.router, prefix=settings.api_prefix)
+    app.include_router(artifacts.router, prefix=settings.api_prefix)
+    app.include_router(sandboxes.router, prefix=settings.api_prefix)
 
     @app.get("/health", response_model=ApiResponse[HealthData], tags=["system"])
     async def health(request: Request) -> JSONResponse:
