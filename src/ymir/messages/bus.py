@@ -69,7 +69,10 @@ class MessagePublisher:
                 "type": record.type,
                 "from_role": record.from_role,
                 "to_role": record.to_role,
+                "content_refs": record.content_refs,
                 "summary": record.summary,
+                "payload": record.payload,
+                "created_at": record.created_at.isoformat(),
             },
             tenant_id=tenant_id,
         )

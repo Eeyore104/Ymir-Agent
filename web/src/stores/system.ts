@@ -43,11 +43,14 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
-  /** 用量统计（默认 global）。 */
-  async function loadUsage(scope: 'global' | 'run' | 'project' = usageScope.value): Promise<void> {
+  /** 用量统计（默认 global；可传 run / project 口径）。 */
+  async function loadUsage(
+    scope: 'global' | 'run' | 'project' = usageScope.value,
+    params: { runId?: string; projectId?: string } = {},
+  ): Promise<void> {
     usageScope.value = scope
     try {
-      usage.value = await systemApi.fetchUsage(scope)
+      usage.value = await systemApi.fetchUsage(scope, params)
     } catch (e) {
       healthError.value = messageOf(e)
     }

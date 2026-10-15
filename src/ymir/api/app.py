@@ -27,7 +27,9 @@ from ymir.api.middleware import TenantContextMiddleware
 from ymir.api.routers import (
     approvals,
     artifacts,
+    evaluations,
     events,
+    export,
     models,
     projects,
     runs,
@@ -39,6 +41,7 @@ from ymir.bootstrap import build_approval_stack, build_execution_stack
 from ymir.common.errors import BizCode
 from ymir.common.logging import setup_logging
 from ymir.config import Settings, get_settings, load_env_file
+from ymir.evaluation import build_eval_harness
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.orchestrator.executor import StageExecutor
 from ymir.orchestrator.gates import build_approval_hook
@@ -81,6 +84,14 @@ def create_app(
     )
     approval_stack.engine.bind_orchestrator(orchestrator)
 
+    # T05：评测 harness（四维 + 双门槛 + 证据链）；judge 经网关、沙箱惰性构建
+    eval_harness = build_eval_harness(
+        settings,
+        stack.artifact_store,
+        gateway=stack.gateway,
+        session_factory=session_factory,
+    )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # 断点恢复：扫描上次中断的 run 并重新拉起推进任务（§3.4）
@@ -113,6 +124,7 @@ def create_app(
     app.state.roles = stack.role_registry
     app.state.approvals = approval_stack.engine
     app.state.approval_service = approval_stack.service
+    app.state.evaluations = eval_harness
 
     app.add_middleware(
         CORSMiddleware,
@@ -133,6 +145,8 @@ def create_app(
     app.include_router(artifacts.router, prefix=settings.api_prefix)
     app.include_router(sandboxes.router, prefix=settings.api_prefix)
     app.include_router(approvals.router, prefix=settings.api_prefix)
+    app.include_router(evaluations.router, prefix=settings.api_prefix)
+    app.include_router(export.router, prefix=settings.api_prefix)
 
     @app.get("/health", response_model=ApiResponse[HealthData], tags=["system"])
     async def health(request: Request) -> JSONResponse:

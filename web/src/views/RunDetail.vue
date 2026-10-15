@@ -19,7 +19,7 @@ import { useApprovalsStore } from '@/stores/approvals'
 import { useArtifactsStore } from '@/stores/artifacts'
 import { useRunsStore } from '@/stores/runs'
 import { RUN_MODE_LABELS, RUN_STATUS_LABELS, RUN_STATUS_TAG_TYPES } from '@/constants'
-import type { ApprovalDetail, ArtifactContent, RunAction } from '@/api/types'
+import type { ApprovalDetail, ArtifactContent, RunAction, RunMessage } from '@/api/types'
 
 const route = useRoute()
 const runsStore = useRunsStore()
@@ -63,8 +63,8 @@ useRunEvents(runId, {
     runsStore.ingestEvent(event)
     switch (event.type) {
       case 'message.created':
-        // 消息 payload 仅含摘要，落库后整体刷新（低频，可接受）
-        void runsStore.loadMessages(runId)
+        // 消息事件已携带完整消息体：按 seq 去重增量追加（替代整体刷新）
+        ingestMessage(event)
         break
       case 'approval.requested':
         void refreshPendingApproval()
@@ -86,8 +86,33 @@ useRunEvents(runId, {
   },
 })
 
-/** 刷新当前 run 的待审批（审批卡数据源）。 */
-async function refreshPendingApproval(): Promise<void> {
+/**
+ * 从 message.created 事件增量追加一条角色消息（按 seq 去重）。
+ * 事件 payload 若缺关键字段则回退整体刷新（兼容旧帧 / 重放）。
+ */
+function ingestMessage(event: RunEvent): void {
+  const p = (event.payload ?? {}) as Record<string, unknown>
+  const str = (value: unknown): string | null => (typeof value === 'string' ? value : null)
+  if (typeof p.message_id !== 'string' || typeof p.seq !== 'number') {
+    void runsStore.loadMessages(runId)
+    return
+  }
+  const message: RunMessage = {
+    id: p.message_id,
+    run_id: runId,
+    seq: p.seq,
+    type: str(p.type) ?? 'system',
+    from_role: str(p.from_role),
+    to_role: str(p.to_role),
+    content_refs: Array.isArray(p.content_refs) ? p.content_refs : [],
+    summary: str(p.summary),
+    payload: (p.payload as Record<string, unknown>) ?? {},
+    created_at: str(p.created_at) ?? event.timestamp,
+  }
+  runsStore.appendMessage(message)
+}
+
+/** 刷新当前 run 的待审批（审批卡数据源）。 */async function refreshPendingApproval(): Promise<void> {
   await approvalsStore.loadApprovals({ status: 'pending', runId })
   const first = approvalsStore.items.find((a) => a.run_id === runId)
   if (!first) {

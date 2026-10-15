@@ -1,0 +1,32 @@
+# ymir-agent 默认评测套件（docs/02 §12.2）
+#
+# 四维权重 + 双门槛 + 回归基线任务。改提示词 / 角色 / 流水线后重跑本套件，
+# 分数变化即为回归信号（CI 可挂 nightly 批量）。
+#
+# - weights：requirement_conformance 30% / runnability 30% / convention 20% / architecture 20%
+# - thresholds：total ≥ 75 且 runnability ≥ 60（双门槛，防「分高但跑不起来」）
+# - tasks[].checks：可复现的确定性检查（在沙箱内执行的命令，按权重计入可运行率）
+# - tasks[].artifact_name：目标产物名（解析为项目内该产物指定版本，version 缺省为 latest）
+
+id: default
+version: "1.0"
+description: v1.0 默认评测套件（四维 + 双门槛 + 证据链）
+
+weights:
+  requirement_conformance: 0.3
+  runnability: 0.3
+  convention: 0.2
+  architecture: 0.2
+
+thresholds:
+  total: 75
+  runnability: 60
+
+tasks:
+  - id: task-todo-api
+    requirement: "实现一个待办事项 REST API：支持增删改查、数据持久化，并附带自动化测试。"
+    artifact_name: code
+    version: null            # null = latest
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.6 }
+      - { type: command, run: "ruff check .", weight: 0.4 }

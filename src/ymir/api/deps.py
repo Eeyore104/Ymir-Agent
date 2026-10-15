@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,6 +78,11 @@ def get_approval_service(request: Request) -> ApprovalService:
     return request.app.state.approval_service
 
 
+def get_eval_harness(request: Request) -> Any:
+    """返回应用绑定的评测 harness（T05）。"""
+    return request.app.state.evaluations
+
+
 # --- Annotated 依赖别名（供路由签名使用，避免 B008）---
 SessionDep = Annotated[AsyncSession, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
@@ -89,3 +94,4 @@ GatewayDep = Annotated[ModelGateway, Depends(get_gateway)]
 ArtifactsDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
 SandboxesDep = Annotated[SandboxService, Depends(get_sandbox_service)]
 ApprovalsDep = Annotated[ApprovalService, Depends(get_approval_service)]
+EvaluationsDep = Annotated[Any, Depends(get_eval_harness)]

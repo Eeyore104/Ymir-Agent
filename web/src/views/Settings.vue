@@ -2,17 +2,30 @@
   设置（/settings）：后端健康探测 + 模型网关视图（脱敏）+ token / 成本用量。
 -->
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 
 import { useSystemStore } from '@/stores/system'
 
 const systemStore = useSystemStore()
 
+/** 用量口径（global / run / project）。 */
+const usageScope = ref<'global' | 'run' | 'project'>('global')
+const usageRunId = ref('')
+const usageProjectId = ref('')
+
 onMounted(async () => {
   await systemStore.probeHealth()
   await systemStore.loadModels()
-  await systemStore.loadUsage('global')
+  await refreshUsage()
 })
+
+/** 按当前口径刷新用量（global 无需附加参数；run / project 传对应 ID）。 */
+async function refreshUsage(): Promise<void> {
+  await systemStore.loadUsage(usageScope.value, {
+    runId: usageRunId.value || undefined,
+    projectId: usageProjectId.value || undefined,
+  })
+}
 
 function formatCost(cost: number): string {
   return `¥${cost.toFixed(4)}`
@@ -99,6 +112,28 @@ function formatCost(cost: number): string {
     <!-- 用量 -->
     <el-card shadow="never" class="panel">
       <template #header><strong>Token / 成本用量</strong></template>
+      <div class="usage-controls">
+        <el-radio-group v-model="usageScope" @change="refreshUsage">
+          <el-radio-button value="global">全局</el-radio-button>
+          <el-radio-button value="run">按运行</el-radio-button>
+          <el-radio-button value="project">按项目</el-radio-button>
+        </el-radio-group>
+        <el-input
+          v-if="usageScope === 'run'"
+          v-model="usageRunId"
+          placeholder="run_id"
+          style="width: 300px"
+          clearable
+        />
+        <el-input
+          v-if="usageScope === 'project'"
+          v-model="usageProjectId"
+          placeholder="project_id"
+          style="width: 300px"
+          clearable
+        />
+        <el-button size="small" type="primary" @click="refreshUsage">查询</el-button>
+      </div>
       <div v-if="systemStore.usage" class="usage-grid">
         <div class="usage-item">
           <div class="usage-value">{{ systemStore.usage.calls }}</div>
@@ -161,6 +196,14 @@ function formatCost(cost: number): string {
 
 .model-tag {
   margin: 2px 4px 2px 0;
+}
+
+.usage-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
 }
 
 .usage-grid {

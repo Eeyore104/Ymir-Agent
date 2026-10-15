@@ -82,7 +82,9 @@ class OrchestrationEngine:
             run.started_at = _utcnow()
             run.error = None
             await session.commit()
-        await self._events.emit(run_id, EventType.RUN_STARTED, {"status": "running"})
+        await self._events.emit(
+            run_id, EventType.RUN_STARTED, {"status": "running", "mode": run.mode}
+        )
         self._spawn(run_id)
         return run
 
@@ -106,7 +108,7 @@ class OrchestrationEngine:
             run.status = RunStatus.RUNNING.value
             await session.commit()
         await self._events.emit(
-            run_id, EventType.RUN_STARTED, {"status": "running", "resumed": True}
+            run_id, EventType.RUN_STARTED, {"status": "running", "resumed": True, "mode": run.mode}
         )
         self._wake(run_id)
         return run
@@ -136,17 +138,23 @@ class OrchestrationEngine:
             run.finished_at = None
             await session.commit()
         await self._events.emit(
-            run_id, EventType.RUN_STARTED, {"status": "running", "retry": True}
+            run_id, EventType.RUN_STARTED, {"status": "running", "retry": True, "mode": run.mode}
         )
         self._wake(run_id)
         return run
 
     async def resume_interrupted(self, run_id: str) -> None:
         """启动恢复（recovery 调用）：run 已是 running，重新拉起推进任务。"""
+        run = await self._load_run(run_id)
         await self._events.emit(
             run_id,
             EventType.RUN_STARTED,
-            {"status": "running", "resumed": True, "interrupted": True},
+            {
+                "status": "running",
+                "resumed": True,
+                "interrupted": True,
+                "mode": run.mode if run is not None else None,
+            },
         )
         self._wake(run_id)
 

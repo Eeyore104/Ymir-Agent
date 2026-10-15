@@ -358,3 +358,31 @@ class ApprovalDecisionPayload(BaseModel):
         default=None, max_length=5000, description="驳回反馈（注入角色上下文）"
     )
     decided_by: str = Field(default="human", max_length=128, description="决策人标识")
+
+
+# --- 评测（T05，§3.7、§12）---
+
+
+class EvaluationSummaryOut(BaseModel):
+    """评测报告摘要（列表项，取自 ``evaluation_report.json``）。"""
+
+    artifact_id: str
+    version: int
+    project_id: str
+    suite_id: str
+    total_score: float
+    runnability: float
+    passed: bool
+    generated_at: str | None = None
+    created_at: datetime
+
+
+class EvaluationRunRequest(BaseModel):
+    """发起评测请求（对项目某产物版本跑套件）。"""
+
+    suite_id: str = Field(default="default", description="评测套件 ID")
+    artifact_name: str = Field(default="code", description="目标产物名")
+    version: int | None = Field(default=None, description="产物版本（缺省 latest）")
+    requirement: str | None = Field(default=None, description="原始需求（缺省取最新 run）")
+    run_id: str | None = Field(default=None, description="关联 run（用于发 evaluation.completed）")
+    save: bool = Field(default=True, description="是否将报告作为产物入库")

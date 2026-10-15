@@ -231,3 +231,67 @@ export interface ArtifactRef {
   type?: string
   version?: number
 }
+
+/** 评测报告摘要（列表项，出自后端 evaluation_report.json）。 */
+export interface EvaluationSummary {
+  artifact_id: string
+  version: number
+  project_id: string
+  suite_id: string
+  total_score: number
+  runnability: number
+  passed: boolean
+  generated_at: string | null
+  created_at: string
+}
+
+/** 单条评分证据（可定位）。 */
+export interface EvalEvidence {
+  kind: string
+  ref: string
+  detail: string
+}
+
+/** 单维评分（0-100，附证据链）。 */
+export interface EvalDimension {
+  name: string
+  label: string
+  score: number
+  weight: number
+  rationale: string
+  evidence: EvalEvidence[]
+  cost_cny: number
+  tokens: number
+}
+
+/** 单任务评测结果。 */
+export interface EvalTask {
+  id: string
+  requirement: string
+  artifact_ref: Record<string, unknown>
+  dimensions: EvalDimension[]
+  total_score: number
+  runnability: number
+  passed: boolean
+  thresholds: Record<string, number>
+  wall_time_ms: number
+  cost_cny: number
+  tokens: number
+}
+
+/** 评测报告（一等产物，机读 JSON）。 */
+export interface EvaluationReport {
+  suite_id: string
+  suite_version: string
+  project_id: string | null
+  generated_at: string
+  weights: Record<string, number>
+  thresholds: Record<string, number>
+  tasks: EvalTask[]
+  total_score: number
+  runnability: number
+  passed: boolean
+  cost_cny: number
+  total_tokens: number
+  wall_time_ms: number
+}

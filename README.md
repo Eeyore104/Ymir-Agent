@@ -14,21 +14,22 @@
 - **声明式流水线**：阶段 / 关卡 / 转移边全部 YAML 定义，**改流程不改代码**；加载时静态校验（ID 唯一 / 输入可被上游满足 / 转移边可达终点 / 角色已注册）；
 - **Docker 沙箱**承接不可信代码执行：默认断网、`--cpus=2 --memory=4g --pids-limit=512` 限额，接口化设计可替换（无 Docker 时可降级 LocalSandbox）；
 - **产物库 + 版本管理**：版本不可变 + `parent_version` 血缘 + 逐文件 unified diff + zip 导出（含 manifest）；内容进文件系统、元数据 / hash 进库；
-- **四角色真实链路已跑通**：PM / 架构师 / 工程师 / QA 发真实模型调用，输出过 JSON schema 校验；单跑脚本一条命令从需求跑到任意角色，产物 / 消息 / 事件 / 用量全量落库。
+- **四角色真实链路已跑通**：PM / 架构师 / 工程师 / QA 发真实模型调用，输出过 JSON schema 校验；单跑脚本一条命令从需求跑到任意角色，产物 / 消息 / 事件 / 用量全量落库；
+- **四维评测体系**（差异化核心）：`需求符合度 / 可运行率 / 规范符合度 / 架构合理性` 加权总分 + **双门槛**（总分 ≥ 75 且可运行率 ≥ 60）+ **逐分证据链**，报告作为一等产物可版本 diff；批量跑分输出「性价比榜单」（total_score vs cost）。
 
 ## 项目进度
 
-按严格依赖链分五批推进，当前 **T01–T03 已完成验收**：
+按严格依赖链分五批推进，**T01–T05 全部完成，v1.0 收官**：
 
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | T01 | 项目基础设施 + 数据层：FastAPI 骨架 / 11 表 ORM 与迁移 / 统一响应与错误码 / CI | ✅ 2026-10-13 |
 | T02 | 模型网关 + 编排内核：分级路由 / 预算计量 / SOP 引擎 / 状态机 / 事件消息 / SSE 断线重放 / 断点恢复 | ✅ 2026-10-14 |
 | T03 | 角色运行时 + 沙箱 + 产物版本：四角色真实上线 / Docker 沙箱限额 / 版本不可变 + 血缘 + diff + zip / 单跑脚本 | ✅ 2026-10-14 |
-| T04 | HITL 三模式审批完整版 + Web 控制台（六页面 + 五组件） | 🔜 进行中 |
-| T05 | 评测体系（四维 + 双门槛 + 证据链 + 批量跑分）+ 使用手册 / 验收收尾 | 🔜 计划中 |
+| T04 | HITL 三模式审批完整版 + Web 控制台（六页面 + 五组件） | ✅ 2026-10-15 |
+| T05 | 评测 harness（四维 + 双门槛 + 证据链 + 批量跑分）+ 导出 API + 使用手册 / e2e 收尾 | ✅ 2026-10-15 |
 
-v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回退 / 四维评测报告 / diff + zip 导出 / 杀进程恢复 / CI 全绿。设计与任务分解见 `docs/05-增量设计与任务列表-v1.0.md`。
+v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回退 / 四维评测报告 / diff + zip 导出 / 杀进程恢复 / CI 全绿。设计与任务分解见 `docs/05-增量设计与任务列表-v1.0.md`；**验收结论见 `docs/06-验收报告-v1.0.md`（六大验收线 6/6 通过，266 用例全绿）**。
 
 ## 架构一览
 
@@ -39,6 +40,9 @@ flowchart LR
     ROLES --> GW["模型网关<br/>分级路由 + 预算 + 计量"]
     ROLES --> SB["沙箱<br/>Docker · 限额 · 断网"]
     ROLES --> AR["产物库<br/>版本 / 血缘 / diff / zip"]
+    EVAL["评测 harness<br/>四维 + 双门槛 + 证据链"] --> AR
+    EVAL --> SB
+    EVAL --> GW
     GW --> LLM["DeepSeek<br/>OpenAI 兼容端点"]
     ORCH --> DB[("SQLite (WAL)<br/>11 表")]
     GW --> DB
@@ -60,7 +64,7 @@ flowchart LR
 | 编排 | 自研状态机 + 声明式 SOP（YAML / Pydantic）+ 事件 / 消息总线（SSE） |
 | 模型网关 | OpenAI SDK（DeepSeek 先行；qwen / glm / kimi 同构预留）+ Anthropic 适配器接口 |
 | 执行沙箱 | Docker（python:3.12-slim，限额 + 断网；LocalSandbox 降级） |
-| 工程化 | uv · pytest（213 用例）· ruff · GitHub Actions |
+| 工程化 | uv · pytest（266 用例，全部 mock LLM）· ruff · GitHub Actions |
 | 前端 | Vue 3 · Element Plus · Pinia · vue-router · Vite · TypeScript |
 
 ## 快速开始
@@ -80,6 +84,12 @@ uv run alembic upgrade head
 
 # 4) 启动后端 API（http://127.0.0.1:8000，接口文档 /docs）
 uv run uvicorn ymir.api.app:app --port 8000
+
+# 5) 启动前端控制台（另开终端；http://127.0.0.1:5173）
+cd web && npm install && npm run dev
+
+# 一键起（后端 + 前端，Ctrl+C 一并退出）—— Windows Git Bash / macOS / Linux 通用
+bash scripts/dev.sh
 ```
 
 ### 单跑演示（真实编排链路）
@@ -99,7 +109,7 @@ uv run python scripts/run_single_role.py --requirement "x" --role qa --dry-run
 
 ```bash
 uv run ruff check .
-uv run pytest                            # 213 tests
+uv run pytest -q                         # 全量单测 + 集成 + e2e（全部 mock LLM，0 费用）
 
 # 模型网关真实调用冒烟（产生真实费用，需 .env 密钥）
 uv run python scripts/smoke_gateway.py
@@ -111,8 +121,21 @@ uv run python scripts/verify_docker_sandbox.py
 ### 前端控制台
 
 ```bash
-cd web && npm install && npm run dev     # http://127.0.0.1:5173（完整控制在 T04 落地）
+cd web && npm install && npm run dev     # http://127.0.0.1:5173（六页面控制台）
 ```
+
+### 评测（四维 + 批量跑分）
+
+```bash
+# 对项目 code 产物 v1、v2 批量跑分（确定性口径，0 费用）
+uv run python scripts/run_eval.py --project-name demo --versions v1,v2 --no-judge
+
+# 单版本 + 真实 judge，并把报告入库（需 .env 密钥）
+uv run python scripts/run_eval.py --project-id <id> --suite default --save
+```
+
+评测套件定义见 `evals/suites/default.yaml`（四维权重 + 双门槛 + 回归基线任务）；Web 端
+「评测报告」页可查看四维分数与证据链。完整操作见 `docs/04-使用手册.md`。
 
 ## 目录结构（monorepo）
 
@@ -132,16 +155,19 @@ ymir-agent/
 │   ├── tools/               # 角色工具（code_writer / doc_writer / read_artifact）
 │   ├── events/              # 事件总线 + 落库 + SSE 桥
 │   ├── messages/            # 角色消息协议与总线
+│   ├── evaluation/          # 评测 harness：四维评估器 / 聚合 / 报告 / 套件 / 批量跑分
 │   └── api/                 # FastAPI app / schemas / routers
 ├── config/
 │   ├── models.yaml          # 模型档位 / 路由 / 预算红线
 │   ├── pipelines/           # 声明式 SOP 流水线定义（software-dev.yaml）
 │   └── roles/               # 四角色 YAML + 提示词模板
+├── evals/
+│   └── suites/              # 评测套件（default.yaml：权重 + 双门槛 + 任务）
 ├── migrations/              # Alembic 迁移
-├── scripts/                 # 单跑角色 / 网关冒烟 / 沙箱自检
+├── scripts/                 # 一键启动 / 单跑角色 / 批量跑分 / 网关冒烟 / 沙箱自检 / 清理演示库
 ├── docker/                  # 沙箱镜像构建（sandbox.Dockerfile）
 ├── web/                     # Vue3 控制台
-├── tests/                   # 单元 + 边界 / 集成测试
+├── tests/                   # 单元 + 边界 / 集成 / e2e 测试
 └── data/                    # 运行时生成（SQLite + 产物，gitignore）
 ```
 
@@ -167,16 +193,17 @@ ymir-agent/
 | 运行 | `POST /projects/{id}/runs`（202）· `GET /runs/{id}` · `POST /runs/{id}/actions` | 发起 / 详情 / 控制动作（pause / resume / cancel / retry-stage） |
 | 事件 | `GET /runs/{id}/events`（SSE）· `GET /runs/{id}/messages` | 实时事件流（seq 断线重放）+ 角色消息 |
 | 产物 | `GET /projects/{id}/artifacts` · `GET /artifacts/{id}` · `GET /artifacts/{id}/versions/{v}/content` · `GET /artifacts/{id}/diff` | 列表 / 详情 / 版本内容 / 版本 diff |
+| 审批 | `GET /approvals` · `GET /approvals/{id}` · `POST /approvals/{id}/decision` | 审批中心列表 / 详情（含反馈链）/ 决策（approve / reject 带反馈回退） |
+| 评测 | `GET /evaluations` · `GET /projects/{id}/evaluations` · `POST /projects/{id}/evaluations` | 全局 / 项目评测报告列表 · 对产物发起四维评测 |
+| 导出 | `GET /projects/{id}/export` | 整库导出 zip（含 manifest.json） |
 | 沙箱 | `GET /sandboxes` · `GET /sandboxes/{id}` | 会话列表 / 详情 |
-| 网关 | `GET /models` · `GET /usage` | 档位与路由解析 / token 与成本统计 |
+| 网关 | `GET /models` · `GET /usage?scope=run\|project\|global` | 档位与路由解析 / token 与成本统计 |
 
 响应约定：
 
 - 成功：`{"code": 0, "data": ...}`；列表：`{"code": 0, "data": {"items": [...], "total": n}}`；错误：`{"code": <biz_code>, "message": "..."}`；
 - 业务码：`1001` 参数错误 / `1002` 资源不存在 / `1003` 状态冲突 / `1004` 预算超限 / `1005` 沙箱错误 / `1006` 模型调用失败；
 - 时间一律 ISO 8601 UTC 存储，前端本地化渲染；ID 使用 UUID v4 字符串。
-
-T04 / T05 将补齐 approvals（审批）与 evaluations / export（评测与导出）端点。
 
 ## 文档
 
@@ -185,7 +212,9 @@ T04 / T05 将补齐 approvals（审批）与 evaluations / export（评测与导
 | `docs/01-开源项目调研报告.md` | 开源组件调研与复用边界 |
 | `docs/02-架构设计.md` | 分层架构 / 九大抽象 / 类图 / 时序图 |
 | `docs/03-产品需求文档（PRD）.md` | PRD v1.1 定稿（含决策记录 D1–D7） |
+| `docs/04-使用手册.md` | 环境要求 / Docker（Win10/WSL2）/ 一键启动 / 全流程操作 / 评测 / 导出备份 |
 | `docs/05-增量设计与任务列表-v1.0.md` | v1.0 实施口径与任务分解（T01–T05） |
+| `docs/06-验收报告-v1.0.md` | v1.0 版本验收报告（六大验收线 / 探针证据 / 遗留清单） |
 
 ## License
 
