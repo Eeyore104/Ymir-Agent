@@ -214,6 +214,19 @@ class ModelGateway:
         usage = getattr(response, "usage", None)
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+
+        # 退化空响应防御（T04.1）：上游异常 / 网络中断时可能返回「content 空 +
+        # 0 token」的伪成功（曾挂起 ~900s 后如此返回，被误当成功调用 → 角色层
+        # JSON 校验失败，静默烧掉整条超时预算）。此处 fail-fast 抛错，交由
+        # ``chat()`` 的逐候选 ``except`` 捕获后沿 fallback 链降级。
+        # 注意：仅当「无内容且零 token」才判定退化；content 空但 usage>0
+        # （如 max_tokens 截断）属合法场景，维持成功返回与角色层校验重试链路。
+        if not content.strip() and prompt_tokens == 0 and completion_tokens == 0:
+            raise ModelCallError(
+                f"{route.provider}/{route.model} 返回空响应"
+                f"（0 token，{latency_ms}ms）——疑似上游异常或网络中断，跳过该候选"
+            )
+
         return ChatResult(
             content=content,
             provider=route.provider,

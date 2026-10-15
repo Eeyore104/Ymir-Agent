@@ -49,6 +49,21 @@ def fake_response(content: str = "ok", prompt_tokens: int = 10, completion_token
     )
 
 
+def fake_empty_response(
+    *, prompt_tokens: int = 0, completion_tokens: int = 0, with_usage: bool = True
+):
+    """退化空响应（T04.1）：无 choices（content 空）+ 0 token（上游异常特征）。
+
+    ``with_usage=False`` 模拟 usage 字段整体缺失（None）的极端情形。
+    """
+    usage = (
+        SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        if with_usage
+        else None
+    )
+    return SimpleNamespace(choices=[], usage=usage)
+
+
 def build_config(
     *,
     per_run_tokens: int = 500_000,
@@ -197,6 +212,68 @@ async def test_chat_all_candidates_fail_raises_1006(
     assert "beta-exec" in exc_info.value.message and "alpha-exec" in exc_info.value.message
     calls = (await session.execute(select(ModelCall))).scalars().all()
     assert calls == []
+
+
+# --------------------------------------------------- 退化空响应防御（T04.1）
+
+
+async def test_chat_empty_response_degrades_to_next_candidate(
+    session_factory, session: AsyncSession, keys: None
+) -> None:
+    """退化空响应（0 token）判失败并沿候选链降级（不得当作成功返回）。"""
+
+    def behavior(url: str, model: str, params: dict) -> Any:
+        if url == "http://beta.local":
+            return fake_empty_response()  # 伪成功：content 空 + 0 token
+        return fake_response(f"from:{model}")
+
+    gateway = make_gateway(session_factory, build_config(), behavior)
+    result = await gateway.chat(MSG, tier="executor")
+    # 降级到下一候选 alpha-exec
+    assert result.provider == "alpha"
+    assert result.model == "alpha-exec"
+    assert result.content == "from:alpha-exec"
+    # 空响应不落库（未成功），仅记录降级后的成功调用
+    calls = (await session.execute(select(ModelCall))).scalars().all()
+    assert [call.model for call in calls] == ["alpha-exec"]
+
+
+async def test_chat_all_empty_responses_raise_1006_with_hint(
+    session_factory, session: AsyncSession, keys: None
+) -> None:
+    """全部候选均退化空响应（含 usage 缺失/为 0）-> 聚合抛 1006，信息含「空响应」。"""
+
+    def behavior(url: str, model: str, params: dict) -> Any:
+        # beta：usage 为 0；alpha：usage 字段整体缺失（None）
+        if url == "http://beta.local":
+            return fake_empty_response()
+        return fake_empty_response(with_usage=False)
+
+    gateway = make_gateway(session_factory, build_config(), behavior)
+    with pytest.raises(ModelCallError) as exc_info:
+        await gateway.chat(MSG, tier="executor")
+    assert exc_info.value.biz_code == 1006
+    assert "空响应" in exc_info.value.message
+    assert "beta-exec" in exc_info.value.message and "alpha-exec" in exc_info.value.message
+    calls = (await session.execute(select(ModelCall))).scalars().all()
+    assert calls == []  # 退化响应不计入用量
+
+
+async def test_chat_empty_content_with_usage_is_not_degenerate(
+    session_factory, session: AsyncSession, keys: None
+) -> None:
+    """不误伤：content 为空但 usage>0（如 max_tokens 截断）仍为合法成功返回。"""
+    gateway = make_gateway(
+        session_factory,
+        build_config(),
+        lambda url, model, params: fake_response("", prompt_tokens=120, completion_tokens=0),
+    )
+    result = await gateway.chat(MSG, tier="executor")
+    assert result.content == ""
+    assert result.provider == "beta"
+    assert result.usage.prompt_tokens == 120
+    calls = (await session.execute(select(ModelCall))).scalars().all()
+    assert len(calls) == 1 and calls[0].prompt_tokens == 120
 
 
 # --------------------------------------------------------------------- 预算
