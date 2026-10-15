@@ -25,6 +25,26 @@ async def _wait_for_terminal(
         await asyncio.sleep(0.05)
 
 
+async def _approve_all_gates(client: AsyncClient, run_id: str, timeout: float = 10.0) -> None:
+    """T04：key_node 模式下依次通过三关审批，直到 run 到达终态。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        run = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+        if run["status"] in ("completed", "failed"):
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError(f"run 未在 {timeout}s 内完成审批流（当前 {run['status']}）")
+        pending = (
+            await client.get(f"/api/v1/approvals?status=pending&run_id={run_id}")
+        ).json()["data"]["items"]
+        for item in pending:
+            resp = await client.post(
+                f"/api/v1/approvals/{item['id']}/decision", json={"decision": "approve"}
+            )
+            assert resp.status_code == 200
+        await asyncio.sleep(0.05)
+
+
 async def test_health(client: AsyncClient) -> None:
     resp = await client.get("/health")
     assert resp.status_code == 200
@@ -78,7 +98,7 @@ async def test_get_project_not_found(client: AsyncClient) -> None:
 
 
 async def test_create_run_returns_202_and_engine_takes_over(client: AsyncClient) -> None:
-    """T02：POST /runs 返回 202 后编排引擎接管，stub 四阶段空流水线推进至 completed。"""
+    """T02：POST /runs 返回 202 后编排引擎接管；T04：默认 key_node 三关审批后 completed。"""
     created = await client.post("/api/v1/projects", json={"name": "runner"})
     project_id = created.json()["data"]["id"]
 
@@ -94,6 +114,7 @@ async def test_create_run_returns_202_and_engine_takes_over(client: AsyncClient)
 
     detail = await client.get(f"/api/v1/runs/{run_id}")
     assert detail.status_code == 200
+    await _approve_all_gates(client, run_id)
     data = await _wait_for_terminal(client, run_id)
     assert data["id"] == run_id
     assert data["project_id"] == project_id

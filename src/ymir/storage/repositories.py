@@ -11,8 +11,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ymir.models.entities import PipelineRun, Project
-from ymir.models.enums import RunMode, RunStatus
+from ymir.models.entities import Approval, PipelineRun, Project
+from ymir.models.enums import ApprovalStatus, RunMode, RunStatus
 
 DEFAULT_TENANT_ID = "default"
 
@@ -171,6 +171,56 @@ class RunRepository(BaseRepository[PipelineRun]):
             select(PipelineRun)
             .where(PipelineRun.tenant_id == tenant_id, PipelineRun.status.in_(unfinished))
             .order_by(PipelineRun.created_at.asc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+
+class ApprovalRepository(BaseRepository[Approval]):
+    """审批仓储（T04，§3.8）。"""
+
+    model = Approval
+
+    async def create(
+        self,
+        *,
+        run_id: str,
+        stage_id: str,
+        gate_name: str,
+        artifact_refs: list[Any] | None = None,
+        status: str | ApprovalStatus = ApprovalStatus.PENDING,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> Approval:
+        """新增审批记录（flush 不提交，事务边界由调用方控制）。"""
+        approval = Approval(
+            run_id=run_id,
+            stage_id=stage_id,
+            gate_name=gate_name,
+            artifact_refs=list(artifact_refs or []),
+            status=_as_value(status),
+            tenant_id=tenant_id,
+        )
+        return await self.add(approval)
+
+    async def list_filtered(
+        self,
+        *,
+        status: str | ApprovalStatus | None = None,
+        run_id: str | None = None,
+        tenant_id: str = DEFAULT_TENANT_ID,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Approval]:
+        """按 status / run_id 过滤（供审批中心列表；新的在前）。"""
+        stmt = select(Approval).where(Approval.tenant_id == tenant_id)
+        if status is not None:
+            stmt = stmt.where(Approval.status == _as_value(status))
+        if run_id is not None:
+            stmt = stmt.where(Approval.run_id == run_id)
+        stmt = (
+            stmt.order_by(Approval.created_at.desc(), Approval.id.desc())
+            .limit(limit)
+            .offset(offset)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

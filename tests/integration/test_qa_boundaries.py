@@ -45,6 +45,26 @@ async def _wait_for_terminal(
         await asyncio.sleep(0.05)
 
 
+async def _approve_all_gates(client: AsyncClient, run_id: str, timeout: float = 10.0) -> None:
+    """T04：key_node 模式下依次通过三关审批，直到 run 到达终态。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        run = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+        if run["status"] in ("completed", "failed"):
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError(f"run 未在 {timeout}s 内完成审批流（当前 {run['status']}）")
+        pending = (
+            await client.get(f"/api/v1/approvals?status=pending&run_id={run_id}")
+        ).json()["data"]["items"]
+        for item in pending:
+            resp = await client.post(
+                f"/api/v1/approvals/{item['id']}/decision", json={"decision": "approve"}
+            )
+            assert resp.status_code == 200
+        await asyncio.sleep(0.05)
+
+
 # --- 参数校验 → 1001 ---
 
 
@@ -204,7 +224,8 @@ async def test_run_defaults_when_omitted(client: AsyncClient) -> None:
     pid = await _new_project(client, "defaults")
     created = await client.post(f"/api/v1/projects/{pid}/runs", json={"requirement": "仅需求"})
     run_id = created.json()["data"]["run_id"]
-    # T02：默认参数下引擎接管，推送至 completed
+    # T04：默认 key_node 在三关阻断，依次审批后引擎推送至 completed
+    await _approve_all_gates(client, run_id)
     data = await _wait_for_terminal(client, run_id)
     assert data["mode"] == "key_node"
     assert data["pipeline_id"] == "software-dev"

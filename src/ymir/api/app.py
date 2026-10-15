@@ -7,6 +7,7 @@
 - T02：装配模型网关 / 事件与消息总线 / 编排引擎，启动时断点恢复
 - T03：装配角色运行时 / 产物库 / 沙箱服务，引擎默认接真实执行器
   （测试可注入 stub 执行器）；日志统一初始化（T02 遗留①）
+- T04：装配 HITL 审批栈，审批挂点注入编排引擎（三关审批可驳回回退）
 """
 
 from __future__ import annotations
@@ -23,14 +24,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ymir.api.errors import register_exception_handlers
 from ymir.api.middleware import TenantContextMiddleware
-from ymir.api.routers import artifacts, events, models, projects, runs, sandboxes, usage
+from ymir.api.routers import (
+    approvals,
+    artifacts,
+    events,
+    models,
+    projects,
+    runs,
+    sandboxes,
+    usage,
+)
 from ymir.api.schemas import ApiResponse, HealthData
-from ymir.bootstrap import build_execution_stack
+from ymir.bootstrap import build_approval_stack, build_execution_stack
 from ymir.common.errors import BizCode
 from ymir.common.logging import setup_logging
 from ymir.config import Settings, get_settings, load_env_file
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.orchestrator.executor import StageExecutor
+from ymir.orchestrator.gates import build_approval_hook
 from ymir.orchestrator.recovery import recover_runs
 from ymir.storage.db import build_engine, build_session_factory
 
@@ -57,12 +68,18 @@ def create_app(
 
     # --- 组件装配：执行栈（总线 / 网关 / 产物库 / 沙箱 / 角色 -> 执行器）---
     stack = build_execution_stack(settings, session_factory, executor=executor)
+    # T04：HITL 审批栈（引擎 + 服务）；挂点注入编排引擎，决策路径反向绑定
+    approval_stack = build_approval_stack(
+        session_factory, stack.event_publisher, stack.message_publisher
+    )
     orchestrator = OrchestrationEngine(
         session_factory=session_factory,
         events=stack.event_publisher,
         messages=stack.message_publisher,
         executor=stack.executor,
+        approval_hook=build_approval_hook(approval_stack.engine),
     )
+    approval_stack.engine.bind_orchestrator(orchestrator)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -94,6 +111,8 @@ def create_app(
     app.state.artifacts = stack.artifact_store
     app.state.sandbox_service = stack.sandbox_service
     app.state.roles = stack.role_registry
+    app.state.approvals = approval_stack.engine
+    app.state.approval_service = approval_stack.service
 
     app.add_middleware(
         CORSMiddleware,
@@ -113,6 +132,7 @@ def create_app(
     app.include_router(usage.router, prefix=settings.api_prefix)
     app.include_router(artifacts.router, prefix=settings.api_prefix)
     app.include_router(sandboxes.router, prefix=settings.api_prefix)
+    app.include_router(approvals.router, prefix=settings.api_prefix)
 
     @app.get("/health", response_model=ApiResponse[HealthData], tags=["system"])
     async def health(request: Request) -> JSONResponse:

@@ -12,6 +12,7 @@ from ymir.artifacts.store import ArtifactStore
 from ymir.config import Settings, get_settings
 from ymir.events.bus import EventPublisher
 from ymir.gateway.gateway import ModelGateway
+from ymir.hitl.service import ApprovalService
 from ymir.messages.bus import MessagePublisher
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.sandbox.session import SandboxService
@@ -72,6 +73,11 @@ def get_sandbox_service(request: Request) -> SandboxService:
     return request.app.state.sandbox_service
 
 
+def get_approval_service(request: Request) -> ApprovalService:
+    """返回应用绑定的审批服务（T04 HITL）。"""
+    return request.app.state.approval_service
+
+
 # --- Annotated 依赖别名（供路由签名使用，避免 B008）---
 SessionDep = Annotated[AsyncSession, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
@@ -82,3 +88,4 @@ MessagesDep = Annotated[MessagePublisher, Depends(get_message_publisher)]
 GatewayDep = Annotated[ModelGateway, Depends(get_gateway)]
 ArtifactsDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
 SandboxesDep = Annotated[SandboxService, Depends(get_sandbox_service)]
+ApprovalsDep = Annotated[ApprovalService, Depends(get_approval_service)]

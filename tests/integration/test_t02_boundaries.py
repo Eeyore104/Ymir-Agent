@@ -246,8 +246,11 @@ def test_ensure_transition_raises_state_conflict() -> None:
 
 async def test_actions_on_completed_all_conflict_1003(client: AsyncClient) -> None:
     pid = (await client.post("/api/v1/projects", json={"name": "act"})).json()["data"]["id"]
+    # T04：batch 模式全自动跑完（key_node 会在三关阻断等待审批）
     run_id = (
-        await client.post(f"/api/v1/projects/{pid}/runs", json={"requirement": "x"})
+        await client.post(
+            f"/api/v1/projects/{pid}/runs", json={"requirement": "x", "mode": "batch"}
+        )
     ).json()["data"]["run_id"]
     assert (await _wait_terminal(client, run_id))["status"] == "completed"
 
@@ -449,8 +452,11 @@ async def test_seq_monotonic_no_gaps_after_full_run(
     client: AsyncClient, session: AsyncSession
 ) -> None:
     pid = (await client.post("/api/v1/projects", json={"name": "seq"})).json()["data"]["id"]
+    # T04：batch 模式全自动跑完（key_node 会在三关阻断等待审批）
     run_id = (
-        await client.post(f"/api/v1/projects/{pid}/runs", json={"requirement": "seq 校验"})
+        await client.post(
+            f"/api/v1/projects/{pid}/runs", json={"requirement": "seq 校验", "mode": "batch"}
+        )
     ).json()["data"]["run_id"]
     assert (await _wait_terminal(client, run_id))["status"] == "completed"
 

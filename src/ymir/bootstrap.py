@@ -2,6 +2,8 @@
 
 装配顺序：事件总线 -> 消息总线 -> 模型网关 -> 产物库 -> 沙箱服务
 -> 角色注册表 / 运行时 -> 真实执行器（可注入 stub 覆盖，测试用）。
+T04：HITL 审批栈（审批引擎 + 服务）经 :func:`build_approval_stack` 装配，
+审批挂点注入编排引擎（见 :mod:`ymir.orchestrator.gates`）。
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ from ymir.artifacts.store import ArtifactStore
 from ymir.config import PROJECT_ROOT, Settings
 from ymir.events.bus import EventPublisher
 from ymir.gateway.gateway import ModelGateway, build_gateway
+from ymir.hitl.engine import ApprovalEngine
+from ymir.hitl.service import ApprovalService
 from ymir.messages.bus import MessagePublisher
 from ymir.orchestrator.executor import StageExecutor
 from ymir.orchestrator.role_executor import RoleStageExecutor
@@ -37,6 +41,14 @@ class ExecutionStack:
     role_registry: RoleRegistry
     role_runtime: RoleRuntime
     executor: StageExecutor
+
+
+@dataclass
+class ApprovalStack:
+    """HITL 组件集合（T04，§3.8）。"""
+
+    engine: ApprovalEngine
+    service: ApprovalService
 
 
 def build_execution_stack(
@@ -84,3 +96,23 @@ def build_execution_stack(
         role_runtime=role_runtime,
         executor=executor,
     )
+
+
+def build_approval_stack(
+    session_factory: async_sessionmaker[AsyncSession],
+    events: EventPublisher,
+    messages: MessagePublisher,
+) -> ApprovalStack:
+    """构建 HITL 审批栈（T04，§3.8）。
+
+    引擎负责审批生命周期（挂点 / 决策 / 驳回回退），服务负责聚合查询与
+    决策入口；引擎与编排引擎的相互绑定由调用方在装配完成后完成
+    （``ApprovalStack.engine.bind_orchestrator``，打破循环依赖）。
+    """
+    engine = ApprovalEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+    )
+    service = ApprovalService(session_factory=session_factory, engine=engine)
+    return ApprovalStack(engine=engine, service=service)

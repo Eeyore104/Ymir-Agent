@@ -278,11 +278,15 @@ def test_load_pipeline_missing_raises_404() -> None:
 
 
 async def test_stub_pipeline_full_flow(client: AsyncClient, session: AsyncSession) -> None:
-    """stub 四阶段空流水线：消息链 + 事件 seq 单调 + 阶段执行记录。"""
+    """stub 四阶段空流水线：消息链 + 事件 seq 单调 + 阶段执行记录。
+
+    T04：默认 key_node 会在三关阻断，这里显式用 batch 模式验证全自动推进。
+    """
     created = await client.post("/api/v1/projects", json={"name": "flow"})
     project_id = created.json()["data"]["id"]
     resp = await client.post(
-        f"/api/v1/projects/{project_id}/runs", json={"requirement": "做一个 CLI 工具"}
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "做一个 CLI 工具", "mode": "batch"},
     )
     run_id = resp.json()["data"]["run_id"]
 
@@ -532,10 +536,16 @@ async def test_sse_endpoint_respects_last_event_id_header(
 
 
 async def test_run_actions_state_conflicts(client: AsyncClient) -> None:
-    """已完成 run 上的控制动作 -> 1003；非法动作名 -> 1001。"""
+    """已完成 run 上的控制动作 -> 1003；非法动作名 -> 1001。
+
+    T04：用 batch 模式直接跑到 completed（key_node 会在三关阻断）。
+    """
     created = await client.post("/api/v1/projects", json={"name": "actions"})
     project_id = created.json()["data"]["id"]
-    resp = await client.post(f"/api/v1/projects/{project_id}/runs", json={"requirement": "x"})
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "x", "mode": "batch"},
+    )
     run_id = resp.json()["data"]["run_id"]
 
     deadline = time.monotonic() + 10
@@ -560,7 +570,11 @@ async def test_run_actions_state_conflicts(client: AsyncClient) -> None:
 async def test_run_messages_endpoint(client: AsyncClient) -> None:
     created = await client.post("/api/v1/projects", json={"name": "msgs"})
     project_id = created.json()["data"]["id"]
-    resp = await client.post(f"/api/v1/projects/{project_id}/runs", json={"requirement": "x"})
+    # T04：batch 模式全自动跑完（key_node 会在三关阻断等待审批）
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "x", "mode": "batch"},
+    )
     run_id = resp.json()["data"]["run_id"]
 
     deadline = time.monotonic() + 10

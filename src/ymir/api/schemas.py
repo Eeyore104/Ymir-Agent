@@ -288,3 +288,73 @@ class SandboxSessionOut(BaseModel):
     status: str
     created_at: datetime
     destroyed_at: datetime | None = None
+
+
+# --- 审批（T04，§3.8）---
+
+
+class ApprovalOut(BaseModel):
+    """审批记录（列表 / 决策结果公共字段）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    stage_id: str
+    gate_name: str
+    artifact_refs: list[Any]
+    status: str
+    decision: str | None = None
+    feedback: str | None = None
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+    created_at: datetime
+
+
+class RunBriefOut(BaseModel):
+    """审批卡片用的运行摘要（项目名 / 需求 / 模式 / 状态）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    project_name: str
+    requirement: str
+    mode: str
+    status: str
+    current_stage_id: str | None = None
+
+
+class ApprovalListItem(ApprovalOut):
+    """审批列表项（含 run 摘要的聚合视图）。"""
+
+    run: RunBriefOut | None = None
+
+
+class ApprovalFeedbackOut(BaseModel):
+    """历史反馈链条目（历次驳回产生的 feedback 消息）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    seq: int
+    from_role: str | None = None
+    to_role: str | None = None
+    summary: str | None = None
+    created_at: datetime
+
+
+class ApprovalDetail(ApprovalListItem):
+    """审批详情（含 run 摘要与历史反馈链）。"""
+
+    feedback_history: list[ApprovalFeedbackOut] = []
+
+
+class ApprovalDecisionPayload(BaseModel):
+    """审批决策请求（§3.8）。"""
+
+    decision: Literal["approve", "reject"]
+    feedback: str | None = Field(
+        default=None, max_length=5000, description="驳回反馈（注入角色上下文）"
+    )
+    decided_by: str = Field(default="human", max_length=128, description="决策人标识")

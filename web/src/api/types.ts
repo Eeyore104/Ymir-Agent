@@ -1,0 +1,233 @@
+/**
+ * 领域类型定义（与后端 ``src/ymir/api/schemas.py`` 一一对应）。
+ *
+ * 时间字段为 ISO 8601 UTC 字符串（后端 TZDateTime 序列化产物）。
+ */
+
+/** 项目。 */
+export interface Project {
+  id: string
+  name: string
+  description: string | null
+  tenant_id: string
+  created_at: string
+}
+
+/** 项目详情（含运行数）。 */
+export interface ProjectDetail extends Project {
+  run_count: number
+}
+
+/** HITL 运行模式（docs/02 §3.8）。 */
+export type RunMode = 'key_node' | 'batch' | 'debug'
+
+/** 运行状态（docs/02 §3.4 状态机）。 */
+export type RunStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_approval'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+
+/** 一次流水线运行。 */
+export interface Run {
+  id: string
+  project_id: string
+  pipeline_id: string
+  mode: RunMode
+  status: RunStatus
+  current_stage_id: string | null
+  context: Record<string, unknown>
+  error: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+}
+
+/** 发起运行请求。 */
+export interface RunCreatePayload {
+  requirement: string
+  pipeline_id?: string
+  mode?: RunMode
+  context_refs?: string[]
+}
+
+/** 运行控制动作。 */
+export type RunAction = 'pause' | 'resume' | 'cancel' | 'retry-stage'
+
+/** 角色消息（消息流面板数据源）。 */
+export interface RunMessage {
+  id: string
+  run_id: string
+  seq: number
+  type: string
+  from_role: string | null
+  to_role: string | null
+  content_refs: unknown[]
+  summary: string | null
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+/** 产物。 */
+export interface Artifact {
+  id: string
+  project_id: string
+  name: string
+  type: string
+  current_version: number
+  created_at: string
+}
+
+/** 产物版本元数据。 */
+export interface ArtifactVersion {
+  id: string
+  artifact_id: string
+  version: number
+  run_id: string | null
+  stage_id: string | null
+  storage_path: string
+  content_hash: string | null
+  file_count: number
+  size_bytes: number
+  message: string | null
+  parent_version_id: string | null
+  created_by: string | null
+  created_at: string
+}
+
+/** 产物详情（含版本历史）。 */
+export interface ArtifactDetail extends Artifact {
+  versions: ArtifactVersion[]
+}
+
+/** 产物版本内容（无 path 为文件清单，有 path 为单文件内容）。 */
+export interface ArtifactContent {
+  artifact_id: string
+  version: number
+  files?: string[]
+  path?: string | null
+  content?: string | null
+}
+
+/** 单文件 diff。 */
+export interface FileDiff {
+  path: string
+  status: string
+  diff: string
+  additions: number
+  deletions: number
+}
+
+/** 版本间 diff。 */
+export interface ArtifactDiff {
+  artifact_id: string
+  v1: number
+  v2: number
+  files: FileDiff[]
+  stats: { files_changed: number; additions: number; deletions: number }
+}
+
+/** 审批状态。 */
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+
+/** 审批卡片用的 run 摘要。 */
+export interface RunBrief {
+  id: string
+  project_id: string
+  project_name: string
+  requirement: string
+  mode: string
+  status: string
+  current_stage_id: string | null
+}
+
+/** 审批记录（列表项，含 run 摘要）。 */
+export interface Approval {
+  id: string
+  run_id: string
+  stage_id: string
+  gate_name: string
+  artifact_refs: unknown[]
+  status: ApprovalStatus
+  decision: string | null
+  feedback: string | null
+  decided_by: string | null
+  decided_at: string | null
+  created_at: string
+  run?: RunBrief
+}
+
+/** 历史反馈链条目。 */
+export interface FeedbackItem {
+  id: string
+  seq: number
+  from_role: string | null
+  to_role: string | null
+  summary: string | null
+  created_at: string
+}
+
+/** 审批详情（含历史反馈链）。 */
+export interface ApprovalDetail extends Approval {
+  feedback_history: FeedbackItem[]
+}
+
+/** 审批决策请求。 */
+export interface ApprovalDecision {
+  decision: 'approve' | 'reject'
+  feedback?: string
+  decided_by?: string
+}
+
+/** 健康检查数据。 */
+export interface HealthData {
+  status: string
+  database: string
+  version: string
+  gateway: string
+}
+
+/** 模型价目。 */
+export interface ModelInfo {
+  name: string
+  tier: string
+  price_in: number
+  price_out: number
+}
+
+/** provider 视图（脱敏）。 */
+export interface ProviderInfo {
+  name: string
+  base_url: string
+  enabled: boolean
+  key_ready: boolean
+  models: ModelInfo[]
+}
+
+/** 网关配置视图。 */
+export interface ModelsOut {
+  version: string
+  providers: ProviderInfo[]
+  routing: Record<string, string[]>
+  budget: Record<string, number>
+}
+
+/** 用量统计。 */
+export interface UsageOut {
+  scope: string
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost_cny: number
+}
+
+/** 产物引用（审批卡片待审内容元素）。 */
+export interface ArtifactRef {
+  artifact_id?: string
+  name?: string
+  type?: string
+  version?: number
+}
