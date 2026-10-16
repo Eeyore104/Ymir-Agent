@@ -29,5 +29,9 @@
     "vite": "^5.4.11",
     "vitest": "^2.1.9",
     "vue-tsc": "^2.1.10"
+  },
+  "optionalDependencies": {
+    "@esbuild/linux-x64": "0.21.5",
+    "@rollup/rollup-linux-x64-gnu": "4.64.5"
   }
 }
