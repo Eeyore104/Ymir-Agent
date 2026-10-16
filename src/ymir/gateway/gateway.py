@@ -147,9 +147,12 @@ class ModelGateway:
             )
 
         estimated = estimate_tokens(messages, max_tokens)
+        # 保守口径（QA-06）：按候选链中的最大价目估算 —— 实际可能 fallback 到
+        # 更贵模型，取首选的价目会低估；与 estimate_tokens「宁大勿小」意图一致。
+        estimated_cost = max(_estimate_cost(route.spec, estimated) for route in routes)
         await self._guard.check(
             estimated_tokens=estimated,
-            estimated_cost_cny=_estimate_cost(routes[0].spec, estimated),
+            estimated_cost_cny=estimated_cost,
             run_id=run_id,
         )
 

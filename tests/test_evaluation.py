@@ -43,7 +43,13 @@ from ymir.evaluation.evaluators import (
     RequirementConformanceEvaluator,
     RunnabilityEvaluator,
 )
-from ymir.evaluation.evaluators.architecture import _DesignJudgement
+from ymir.evaluation.evaluators.architecture import (
+    _build_graph,
+    _DesignJudgement,
+    _find_cycles,
+    _layer_rank,
+    _module_name,
+)
 from ymir.evaluation.evaluators.convention import _ConventionJudgement
 from ymir.evaluation.evaluators.requirement import _ItemJudgement, _RequirementJudgement
 from ymir.sandbox.base import ExecResult, NetworkPolicy, SandboxSession
@@ -687,3 +693,159 @@ async def test_export_project_not_found(client) -> None:
     resp = await client.get("/api/v1/projects/no-such/export")
     assert resp.status_code == 404
     assert resp.json()["code"] == 1002
+
+
+async def test_evaluation_detail_by_id(client) -> None:
+    """GET /evaluations/{id}：报告详情（分数 + 证据链）；不存在 -> 404/1002（ARCH-03）。"""
+    _install_fake_harness(client)
+    project_id = await _create_project(client, "评测详情")
+    store = client._transport.app.state.artifacts
+    await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.json": PRD_JSON}
+    )
+    await store.save(project_id=project_id, name="code", artifact_type="code", files=CODE_FILES)
+
+    await client.post(
+        f"/api/v1/projects/{project_id}/evaluations",
+        json={"suite_id": "default", "artifact_name": "code", "requirement": "实现待办 API"},
+    )
+    listing = (await client.get(f"/api/v1/projects/{project_id}/evaluations")).json()["data"]
+    assert listing["total"] == 1
+    artifact_id = listing["items"][0]["artifact_id"]
+
+    detail = await client.get(f"/api/v1/evaluations/{artifact_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["code"] == 0
+    data = detail.json()["data"]
+    assert data["suite_id"] == "default"
+    assert len(data["tasks"]) == 1
+    assert data["tasks"][0]["dimensions"]  # 分数 + 证据链
+
+    missing = await client.get("/api/v1/evaluations/no-such-report")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == 1002
+
+
+# --------------------------------------------------------------------- 图分析定点（B3）
+
+
+class TestArchitectureGraphAnalysis:
+    """B3：architecture 评估器图分析定点用例（环检测 / 分层判分 / 嵌套路径）。
+
+    覆盖巡检盲区 B3：``_find_cycles`` 环检测与 ``_layer_penalty`` 分层判分的
+    独立断言（不经端到端评测间接覆盖），并回归 T05 修过的「嵌套路径匹配」问题。
+    """
+
+    def test_module_name_and_layer_rank(self) -> None:
+        assert _module_name("a.py") == "a"
+        assert _module_name("pkg/__init__.py") == "pkg"
+        assert _module_name("pkg/mod.py") == "pkg.mod"
+        # 分层：序号越小越靠外
+        assert _layer_rank("api.handler") == 0
+        assert _layer_rank("services.user") == 1
+        assert _layer_rank("domain.x") == 2
+        assert _layer_rank("db.session") == 3
+        assert _layer_rank("common.util") == 4
+        assert _layer_rank("app.main") is None  # 无层名匹配
+
+    def test_find_cycles_none_for_dag(self) -> None:
+        # 菱形依赖（非环）：a -> b/c -> d
+        graph = {"a.py": {"b.py", "c.py"}, "b.py": {"d.py"}, "c.py": {"d.py"}, "d.py": set()}
+        assert _find_cycles(graph) == []
+
+    def test_find_cycles_two_node(self) -> None:
+        graph = {"a.py": {"b.py"}, "b.py": {"a.py"}}
+        cycles = _find_cycles(graph)
+        assert len(cycles) == 1
+        assert frozenset(cycles[0]) == frozenset({"a.py", "b.py"})
+
+    def test_find_cycles_self_loop(self) -> None:
+        graph = {"a.py": {"a.py"}}
+        cycles = _find_cycles(graph)
+        assert len(cycles) == 1
+        assert cycles[0] == ["a.py", "a.py"]
+
+    def test_find_cycles_two_independent(self) -> None:
+        graph = {
+            "a.py": {"b.py"},
+            "b.py": {"a.py"},
+            "c.py": {"d.py"},
+            "d.py": {"c.py"},
+        }
+        assert len(_find_cycles(graph)) == 2
+
+    def test_find_cycles_reports_distinct_cycles(self) -> None:
+        # a-b-c-a 与 b-c-b 节点集合不同，分别记录（frozenset 去重以节点集为准）
+        graph = {"a.py": {"b.py"}, "b.py": {"c.py"}, "c.py": {"a.py", "b.py"}}
+        cycles = _find_cycles(graph)
+        assert len(cycles) == 2
+        assert {frozenset(cycle) for cycle in cycles} == {
+            frozenset({"a.py", "b.py", "c.py"}),
+            frozenset({"b.py", "c.py"}),
+        }
+
+    # --- 分层判分 ---
+
+    def test_layer_penalty_legal_direction_is_zero(self) -> None:
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        # api(rank0) -> domain(rank2)：外层依赖内层，合法
+        penalty = evaluator._layer_penalty({"api/y.py": {"domain/x.py"}}, [])
+        assert penalty == 0.0
+
+    def test_layer_penalty_same_layer_is_zero(self) -> None:
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        assert evaluator._layer_penalty({"domain/a.py": {"domain/b.py"}}, []) == 0.0
+
+    def test_layer_penalty_unmatched_modules_ignored(self) -> None:
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        assert evaluator._layer_penalty({"app/main.py": {"app/util.py"}}, []) == 0.0
+
+    def test_layer_penalty_violation_counts(self) -> None:
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        evidence: list[Any] = []
+        # domain(rank2) -> api(rank0)：低层反向导入外层 = 违规
+        penalty = evaluator._layer_penalty({"domain/x.py": {"api/y.py"}}, evidence)
+        assert penalty == pytest.approx(6.0)
+        assert len(evidence) == 1
+        assert "分层违规" in evidence[0].detail
+
+    def test_layer_penalty_is_capped(self) -> None:
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        graph = {f"domain/m{i}.py": {"api/y.py"} for i in range(6)}
+        assert evaluator._layer_penalty(graph, []) == pytest.approx(30.0)
+
+    # --- 嵌套路径（回归 T05「嵌套路径匹配失效」）---
+
+    def test_build_graph_resolves_nested_package(self) -> None:
+        py = {
+            "api/y.py": "from domain.models import X\n",
+            "domain/models.py": "X = 1\n",
+        }
+        name_to_path = {"api.y": "api/y.py", "domain.models": "domain/models.py"}
+        graph = _build_graph(py, name_to_path)
+        assert graph["api/y.py"] == {"domain/models.py"}
+
+    def test_build_graph_resolves_package_init(self) -> None:
+        py = {"api/y.py": "import domain\n", "domain/__init__.py": "X = 1\n"}
+        name_to_path = {"api.y": "api/y.py", "domain": "domain/__init__.py"}
+        graph = _build_graph(py, name_to_path)
+        assert graph["api/y.py"] == {"domain/__init__.py"}
+
+    def test_build_graph_ignores_self_and_external(self) -> None:
+        py = {"a.py": "import a\nimport requests\n"}
+        graph = _build_graph(py, {"a": "a.py"})
+        assert graph["a.py"] == set()  # 自环不入图；外部依赖不可解析
+
+    async def test_nested_dirs_violation_detected_end_to_end(self) -> None:
+        # 嵌套目录下的分层违规必须真实触发扣分（T05 修复回归）
+        evaluator = ArchitectureEvaluator(weight=0.2)
+        score = await evaluator.evaluate(
+            _ctx(
+                workdir={
+                    "domain/x.py": "import api.y\n\n\ndef x():\n    return 1\n",
+                    "api/y.py": "def y():\n    return 2\n",
+                }
+            )
+        )
+        assert score.score == pytest.approx(94.0)
+        assert any("分层违规" in item.detail for item in score.evidence)

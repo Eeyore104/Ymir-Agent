@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ymir.config import PROJECT_ROOT
 
@@ -49,6 +49,25 @@ class ModelsConfig(BaseModel):
     providers: dict[str, ProviderSpec] = Field(default_factory=dict)
     routing: dict[str, list[str]] = Field(default_factory=dict)
     budget: BudgetSpec = Field(default_factory=BudgetSpec)
+
+    @model_validator(mode="after")
+    def _reject_cross_provider_duplicate_models(self) -> ModelsConfig:
+        """禁止跨 provider 重名模型（QA-07：避免 ``find_model`` 路由歧义）。
+
+        ``routing`` 仅按模型名寻址，同名模型会被静默路由到字典序在前的
+        provider；配置加载期即报错并指出冲突模型名，杜绝歧义。
+        """
+        seen: dict[str, str] = {}
+        for provider_name, provider in self.providers.items():
+            for model_name in provider.models:
+                existing = seen.get(model_name)
+                if existing is not None:
+                    raise ValueError(
+                        f"模型名跨 provider 冲突: '{model_name}' 同时声明于 "
+                        f"provider '{existing}' 与 '{provider_name}'"
+                    )
+                seen[model_name] = provider_name
+        return self
 
 
 def load_models_config(path: Path | None = None) -> ModelsConfig:

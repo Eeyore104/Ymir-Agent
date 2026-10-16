@@ -2,7 +2,7 @@
 
 - ``load_pipeline``：YAML -> Pydantic 结构校验 -> SopValidator 静态校验；
 - ``truncate_pipeline``：截断至目标阶段（单角色调试 / 分步演示）；
-- ``sync_pipeline``：定义快照版本化入 ``pipelines`` 表（id+version 幂等 upsert），
+- ``sync_pipeline``：定义快照版本化入 ``pipelines`` 表（id+version+tenant 幂等 upsert），
   为 v1.x 可视化编排留数据基础。
 """
 
@@ -93,9 +93,16 @@ async def sync_pipeline(
     *,
     tenant_id: str = DEFAULT_TENANT_ID,
 ) -> Pipeline:
-    """定义快照入库（同 id+version 幂等更新，不产生重复行）。"""
+    """定义快照入库（同 id+version+tenant 幂等更新，不产生重复行）。
+
+    ``tenant_id`` 参与 upsert 定位（QA-B3-01）：同 ``(id, version)`` 可依租户
+    各存一行（``pipelines`` 复合主键为 ``(id, version, tenant_id)``），跨租户
+    互不覆盖；单租户下 tenant 恒定，行为与此前完全一致。
+    """
     stmt = select(Pipeline).where(
-        Pipeline.id == definition.id, Pipeline.version == definition.version
+        Pipeline.id == definition.id,
+        Pipeline.version == definition.version,
+        Pipeline.tenant_id == tenant_id,
     )
     existing = (await session.execute(stmt)).scalar_one_or_none()
     snapshot = definition.snapshot()

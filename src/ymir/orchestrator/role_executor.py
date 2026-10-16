@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.artifacts.store import ArtifactStore
-from ymir.common.errors import InvalidParamError
+from ymir.common.errors import InvalidParamError, SandboxError
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
 from ymir.models.entities import Message, PipelineRun
@@ -210,7 +210,9 @@ class RoleStageExecutor:
             report["error"] = "skipped: 无自测命令"
             return report
 
-        assert self._sandbox_service is not None  # noqa: S101 - 调用方已判空
+        if self._sandbox_service is None:
+            # 显式前置条件（QA-08）：assert 在 ``python -O`` 下被剥离，改用明确异常
+            raise SandboxError(f"沙箱服务未装配，无法执行冒烟（run {run.id}）")
         try:
             managed = await self._sandbox_service.start(
                 run.id, network=self._sandbox_network

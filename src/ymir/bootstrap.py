@@ -16,7 +16,7 @@ from ymir.artifacts.store import ArtifactStore
 from ymir.config import PROJECT_ROOT, Settings
 from ymir.events.bus import EventPublisher
 from ymir.gateway.gateway import ModelGateway, build_gateway
-from ymir.hitl.engine import ApprovalEngine
+from ymir.hitl.engine import DEFAULT_WAITING_STATUS_GRACE_SECONDS, ApprovalEngine
 from ymir.hitl.service import ApprovalService
 from ymir.messages.bus import MessagePublisher
 from ymir.orchestrator.executor import StageExecutor
@@ -58,7 +58,7 @@ def build_execution_stack(
     executor: StageExecutor | None = None,
 ) -> ExecutionStack:
     """按配置构建执行栈（``executor`` 显式注入时跳过真实执行器装配）。"""
-    event_publisher = EventPublisher(session_factory)
+    event_publisher = EventPublisher(session_factory, queue_size=settings.event_queue_size)
     message_publisher = MessagePublisher(session_factory, event_publisher)
     gateway = build_gateway(session_factory)
     artifact_store = ArtifactStore(session_factory, settings.resolved_artifacts_dir)
@@ -102,6 +102,8 @@ def build_approval_stack(
     session_factory: async_sessionmaker[AsyncSession],
     events: EventPublisher,
     messages: MessagePublisher,
+    *,
+    waiting_grace_seconds: float = DEFAULT_WAITING_STATUS_GRACE_SECONDS,
 ) -> ApprovalStack:
     """构建 HITL 审批栈（T04，§3.8）。
 
@@ -113,6 +115,7 @@ def build_approval_stack(
         session_factory=session_factory,
         events=events,
         messages=messages,
+        waiting_grace_seconds=waiting_grace_seconds,
     )
     service = ApprovalService(session_factory=session_factory, engine=engine)
     return ApprovalStack(engine=engine, service=service)

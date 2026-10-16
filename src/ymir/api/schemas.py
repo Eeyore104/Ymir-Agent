@@ -90,6 +90,7 @@ class RunOut(BaseModel):
     current_stage_id: str | None = None
     context: dict[str, Any]
     error: str | None = None
+    error_code: int | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     created_at: datetime
@@ -325,12 +326,6 @@ class RunBriefOut(BaseModel):
     current_stage_id: str | None = None
 
 
-class ApprovalListItem(ApprovalOut):
-    """审批列表项（含 run 摘要的聚合视图）。"""
-
-    run: RunBriefOut | None = None
-
-
 class ApprovalFeedbackOut(BaseModel):
     """历史反馈链条目（历次驳回产生的 feedback 消息）。"""
 
@@ -344,10 +339,15 @@ class ApprovalFeedbackOut(BaseModel):
     created_at: datetime
 
 
+class ApprovalListItem(ApprovalOut):
+    """审批列表项（含 run 摘要 + 历史反馈链的聚合视图）。"""
+
+    run: RunBriefOut | None = None
+    feedback_history: list[ApprovalFeedbackOut] = []
+
+
 class ApprovalDetail(ApprovalListItem):
     """审批详情（含 run 摘要与历史反馈链）。"""
-
-    feedback_history: list[ApprovalFeedbackOut] = []
 
 
 class ApprovalDecisionPayload(BaseModel):

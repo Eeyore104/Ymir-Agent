@@ -27,9 +27,13 @@ class LocalSandbox(Sandbox):
     backend = "local"
 
     def __init__(self, *, base_dir: Path | str | None = None) -> None:
-        base = Path(tempfile.mkdtemp(prefix="ymir-sbx-")) if base_dir is None else Path(base_dir)
-        base.mkdir(parents=True, exist_ok=True)
-        self._base = base
+        # 基目录为可选：不提供时（生产默认）会话工作区直接落系统临时目录，
+        # ``destroy`` 即彻底回收，从根上消除「每构造一次泄漏一个基目录」的
+        # 问题（QA-03）；提供时视为调用方所有（把工作区聚合到指定目录，如
+        # 测试的 tmp_path），本实例不负责清理。
+        self._base = Path(base_dir) if base_dir is not None else None
+        if self._base is not None:
+            self._base.mkdir(parents=True, exist_ok=True)
 
     @property
     def image(self) -> str:
@@ -39,7 +43,8 @@ class LocalSandbox(Sandbox):
         policy = network if isinstance(network, NetworkPolicy) else NetworkPolicy(network)
         if policy != NetworkPolicy.NONE:
             logger.warning("LocalSandbox 无法强制网络策略（请求=%s），命令运行于本机网络", policy)
-        workdir = Path(tempfile.mkdtemp(prefix="ws-", dir=self._base))
+        # dir=None（默认基目录未提供）-> 系统临时目录：会话销毁即回收，无残留
+        workdir = Path(tempfile.mkdtemp(prefix="ymir-ws-", dir=self._base))
         return LocalSession(self, workdir, policy)
 
     async def stop(self, session: SandboxSession) -> None:

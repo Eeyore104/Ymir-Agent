@@ -73,7 +73,10 @@ def create_app(
     stack = build_execution_stack(settings, session_factory, executor=executor)
     # T04：HITL 审批栈（引擎 + 服务）；挂点注入编排引擎，决策路径反向绑定
     approval_stack = build_approval_stack(
-        session_factory, stack.event_publisher, stack.message_publisher
+        session_factory,
+        stack.event_publisher,
+        stack.message_publisher,
+        waiting_grace_seconds=settings.approval_waiting_grace_seconds,
     )
     orchestrator = OrchestrationEngine(
         session_factory=session_factory,

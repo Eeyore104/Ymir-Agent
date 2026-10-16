@@ -7,14 +7,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
-from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from ymir.common.errors import BizCode, YmirError
+from ymir.common.contracts import RoleOutputError
+from ymir.common.jsonx import extract_json
 from ymir.gateway.gateway import ModelGateway
 from ymir.roles.definition import RoleDefinition
 from ymir.roles.io import StageInput, StageOutput
@@ -25,36 +23,6 @@ from ymir.tools.code_writer import build_code_files
 from ymir.tools.doc_writer import build_document_files
 
 logger = logging.getLogger(__name__)
-
-
-class RoleOutputError(YmirError):
-    """角色输出不满足契约（解析失败 / schema 校验失败，重试后仍不过）。"""
-
-    biz_code = BizCode.MODEL_CALL_FAILED
-    http_status = 502
-
-
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def extract_json(text: str) -> dict[str, Any]:
-    """从 LLM 输出中提取 JSON 对象（容错：纯 JSON / 代码围栏 / 前后夹杂说明）。"""
-    stripped = text.strip()
-    candidates: list[str] = [stripped]
-    fence = _FENCE_RE.search(stripped)
-    if fence:
-        candidates.append(fence.group(1).strip())
-    start, end = stripped.find("{"), stripped.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(stripped[start : end + 1])
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    raise RoleOutputError(f"无法从模型输出提取 JSON 对象（前 200 字符）：{stripped[:200]}")
 
 
 def render_files(role: RoleDefinition, validated: BaseModel) -> dict[str, str]:

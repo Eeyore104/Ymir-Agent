@@ -33,6 +33,12 @@ class BudgetGuard:
         """检查本次预估是否越过红线；超限抛 BudgetExceededError。
 
         规则：``已用量 + 本次预估 > 上限`` 即拦截（先拦截再说，宁可误停不可超支）。
+
+        已知边界（ARCH-05 TOCTOU）：本检查为「读用量 -> 判定放行」，与
+        后续 :meth:`~ymir.gateway.usage.UsageRecorder.record` 结算分属两段，
+        并发调用下两请求可同时读到未超限并各自放行，造成轻微超支。v1.0 为
+        单 run 串行（引擎 task-per-run），该窗口不触发，故本版以注释标注为
+        已知边界，不引入「预留-结算」的额外复杂度；v1.x 多 run 并行时再评估。
         """
         if run_id is not None and self._spec.per_run_tokens > 0:
             used = await self._recorder.run_tokens(run_id)

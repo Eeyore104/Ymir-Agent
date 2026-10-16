@@ -394,6 +394,7 @@ async def test_invalid_output_exhausts_retry_run_failed_no_silent_swallow(
     run = await _wait_status(session_factory, run_id, {"completed", "failed"})
     assert run.status == "failed"
     assert run.error and "prd" in run.error
+    assert run.error_code == 1006  # PM-10：RoleOutputError -> MODEL_CALL_FAILED
     assert len(gateway.calls) == 2  # 恰好 max_attempts 次
 
     assert await store.list_artifacts(project_id) == []  # 不静默产半成品
@@ -408,6 +409,8 @@ async def test_invalid_output_exhausts_retry_run_failed_no_silent_swallow(
     events = await _wait_events(session_factory, run_id, {"run.failed"})
     types = [e.type for e in events]
     assert "stage.failed" in types and "run.failed" in types
+    failed_event = next(e for e in events if e.type == "run.failed")
+    assert failed_event.payload.get("error_code") == 1006  # PM-10：事件透传错误码
     await engine.shutdown()
 
 

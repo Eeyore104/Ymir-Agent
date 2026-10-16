@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -43,10 +43,11 @@ class RunBrief:
 
 @dataclass(frozen=True)
 class ApprovalView:
-    """审批列表项（聚合视图：审批记录 + run 摘要）。"""
+    """审批列表项（聚合视图：审批记录 + run 摘要 + 历史反馈链）。"""
 
     approval: Approval
     run: RunBrief | None
+    feedback_history: list[Message] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -88,10 +89,20 @@ class ApprovalService:
             approvals = await ApprovalRepository(session).list_filtered(
                 status=status, run_id=run_id, tenant_id=tenant_id, limit=limit, offset=offset
             )
+            # 一次性批量取历史反馈链（PM-12：消除前端逐条拉详情的 N+1）
+            feedback_by_run = await self._feedback_by_run(
+                session, list({approval.run_id for approval in approvals})
+            )
             views: list[ApprovalView] = []
             for approval in approvals:
                 brief = await self._run_brief(session, approval.run_id)
-                views.append(ApprovalView(approval=approval, run=brief))
+                views.append(
+                    ApprovalView(
+                        approval=approval,
+                        run=brief,
+                        feedback_history=feedback_by_run.get(approval.run_id, []),
+                    )
+                )
             return views
 
     async def get_approval(
@@ -144,12 +155,23 @@ class ApprovalService:
         self, session: AsyncSession, run_id: str
     ) -> list[Message]:
         """同 run 的 feedback 消息链（历次驳回的修订要求，按 seq 升序）。"""
+        return (await self._feedback_by_run(session, [run_id])).get(run_id, [])
+
+    async def _feedback_by_run(
+        self, session: AsyncSession, run_ids: list[str]
+    ) -> dict[str, list[Message]]:
+        """批量取多个 run 的 feedback 消息链（一次 IN 查询，PM-12）。"""
+        if not run_ids:
+            return {}
         stmt = (
             select(Message)
             .where(
-                Message.run_id == run_id,
+                Message.run_id.in_(run_ids),
                 Message.type == MessageType.FEEDBACK.value,
             )
-            .order_by(Message.seq.asc())
+            .order_by(Message.run_id.asc(), Message.seq.asc())
         )
-        return list((await session.execute(stmt)).scalars().all())
+        grouped: dict[str, list[Message]] = {}
+        for row in (await session.execute(stmt)).scalars().all():
+            grouped.setdefault(row.run_id, []).append(row)
+        return grouped

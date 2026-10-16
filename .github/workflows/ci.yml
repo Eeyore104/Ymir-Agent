@@ -23,6 +23,9 @@ jobs:
       - name: Ruff (lint)
         run: uv run ruff check .
 
+      - name: Import graph guard (layering + cycles)
+        run: uv run python scripts/check_import_graph.py
+
       - name: Alembic migration drift guard
         run: |
           uv run alembic upgrade head
@@ -30,3 +33,28 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
+
+  frontend:
+    name: Lint & Test (frontend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 说明：web/package-lock.json 的 resolved 指向 npmmirror 镜像（公网可达）。
+      # 若需改用官方源，在能访问 registry.npmjs.org 的机器上重生成 lock 即可。
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Vitest
+        run: npm run test:unit
+        working-directory: web
+
+      - name: Build (vue-tsc + vite)
+        run: npm run build
+        working-directory: web

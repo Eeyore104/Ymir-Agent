@@ -12,7 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
-from ymir.api.deps import EventsDep, TenantDep
+from ymir.api.deps import EventsDep, SettingsDep, TenantDep
 from ymir.common.errors import NotFoundError
 from ymir.events.sse import stream_run_events
 from ymir.storage.repositories import RunRepository
@@ -26,6 +26,7 @@ async def stream_events(
     request: Request,
     events: EventsDep,
     tenant_id: TenantDep,
+    settings: SettingsDep,
     after_seq: int | None = Query(default=None, ge=0, description="从该 seq 之后重放"),
 ) -> StreamingResponse:
     session_factory = request.app.state.session_factory
@@ -40,7 +41,9 @@ async def stream_events(
         resume_from = int(header) if header.isdigit() else 0
 
     return StreamingResponse(
-        stream_run_events(events, run_id, after_seq=resume_from),
+        stream_run_events(
+            events, run_id, after_seq=resume_from, heartbeat=settings.sse_heartbeat_seconds
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

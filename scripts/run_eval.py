@@ -30,6 +30,7 @@ from ymir.config import get_settings, load_env_file
 from ymir.evaluation import BatchEntry, BatchReport, BatchTarget, build_eval_harness
 from ymir.evaluation.evaluators import Judge, LLMJudge
 from ymir.evaluation.harness import BackendSandboxProvider
+from ymir.events.bus import EventPublisher
 from ymir.gateway.gateway import build_gateway
 from ymir.sandbox.base import NetworkPolicy
 from ymir.sandbox.factory import build_sandbox
@@ -52,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cost", type=float, default=0.0, help="该目标的生成成本（元）")
     parser.add_argument("--no-judge", action="store_true", help="纯确定性口径，不调 judge")
     parser.add_argument("--save", action="store_true", help="把报告作为产物入库")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="关联 run ID：提供时对每次报告补发 evaluation.completed 事件（L6）",
+    )
     parser.add_argument("--json", action="store_true", help="额外输出机读 JSON")
     return parser.parse_args()
 
@@ -101,6 +107,7 @@ async def run_main(args: argparse.Namespace) -> int:
     try:
         store = ArtifactStore(session_factory, settings.resolved_artifacts_dir)
         gateway = build_gateway(session_factory)
+        events = EventPublisher(session_factory)
         judge = _build_judge(settings, gateway, no_judge=args.no_judge)
         harness = build_eval_harness(
             settings,
@@ -112,6 +119,7 @@ async def run_main(args: argparse.Namespace) -> int:
                 network=NetworkPolicy(settings.sandbox_network),
             ),
             session_factory=session_factory,
+            events=events,
         )
 
         project_id = await _resolve_project(session_factory, args)
@@ -137,6 +145,9 @@ async def run_main(args: argparse.Namespace) -> int:
             if args.save:
                 saved = await report.save(store, project_id=project_id)
                 print(f"[saved] 报告入库：{saved.artifact_name} v{saved.version}")
+            if args.run_id:
+                # L6：CLI 带 run_id 时补发 evaluation.completed（与 API 路径一致）
+                await harness.emit_evaluation_completed(args.run_id, report)
             payloads.append(json.loads(report.to_json()))
             cost = target.cost_cny if target.cost_cny > 0 else report.cost_cny
             entries.append(

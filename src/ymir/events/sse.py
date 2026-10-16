@@ -18,6 +18,9 @@ from ymir.models.entities import Event
 #: 心跳间隔（秒）
 SSE_HEARTBEAT_SECONDS = 15.0
 
+#: 断线重放分页大小（避免超长 run 一次性全量载入，QA-11）
+_REPLAY_PAGE_SIZE = 500
+
 
 def format_sse(event: Event) -> str:
     """把一条事件格式化为 SSE 帧（id / event / data + 空行）。"""
@@ -47,9 +50,18 @@ async def stream_run_events(
     """
     async with publisher.subscribe(run_id) as queue:
         replayed_upto = 0
-        for event in await publisher.list_after(run_id, after_seq or 0):
-            yield format_sse(event)
-            replayed_upto = max(replayed_upto, event.seq)
+        cursor = after_seq or 0
+        # 分页重放：每页 _REPLAY_PAGE_SIZE 条，直到走完历史（QA-11 分页上限）
+        while True:
+            batch = await publisher.list_after(run_id, cursor, limit=_REPLAY_PAGE_SIZE)
+            if not batch:
+                break
+            for event in batch:
+                yield format_sse(event)
+                replayed_upto = max(replayed_upto, event.seq)
+            cursor = batch[-1].seq
+            if len(batch) < _REPLAY_PAGE_SIZE:
+                break
 
         while True:
             try:

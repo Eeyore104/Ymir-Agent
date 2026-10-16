@@ -44,6 +44,8 @@ class DimensionOut(BaseModel):
     evidence: list[EvidenceOut] = Field(default_factory=list)
     cost_cny: float = 0.0
     tokens: int = 0
+    #: 该维度是否降级（评估器异常 / 沙箱不可用），供前端显著标记（QA-10）
+    degraded: bool = False
 
     @classmethod
     def from_score(cls, score: EvalScore, *, weight: float | None = None) -> DimensionOut:
@@ -56,6 +58,7 @@ class DimensionOut(BaseModel):
             evidence=[EvidenceOut(**item.to_dict()) for item in score.evidence],
             cost_cny=round(score.cost_cny, 6),
             tokens=score.tokens,
+            degraded=score.degraded,
         )
 
 

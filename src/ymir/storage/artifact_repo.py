@@ -46,6 +46,19 @@ class ArtifactRepository(BaseRepository[Artifact]):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_many(
+        self, artifact_ids: list[str], tenant_id: str = DEFAULT_TENANT_ID
+    ) -> list[Artifact]:
+        """批量按主键读取（ARCH-08：避免逐条 load 的 N+1）。"""
+        ids = list(dict.fromkeys(artifact_ids))
+        if not ids:
+            return []
+        stmt = select(Artifact).where(
+            Artifact.id.in_(ids), Artifact.tenant_id == tenant_id
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def count_by_project(
         self, project_id: str, tenant_id: str = DEFAULT_TENANT_ID
     ) -> int:
@@ -112,3 +125,34 @@ class ArtifactVersionRepository(BaseRepository[ArtifactVersion]):
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def list_for_artifacts(
+        self, artifact_ids: list[str], tenant_id: str = DEFAULT_TENANT_ID
+    ) -> dict[str, list[ArtifactVersion]]:
+        """批量拉取多个产物的全部版本（一次 IN 查询，ARCH-08）。
+
+        返回 ``artifact_id -> [版本升序]``；无版本的产物不出现在结果中。
+        """
+        ids = list(dict.fromkeys(artifact_ids))
+        if not ids:
+            return {}
+        stmt = (
+            select(ArtifactVersion)
+            .where(
+                ArtifactVersion.artifact_id.in_(ids),
+                ArtifactVersion.tenant_id == tenant_id,
+            )
+            .order_by(ArtifactVersion.artifact_id.asc(), ArtifactVersion.version.asc())
+        )
+        result = await self.session.execute(stmt)
+        grouped: dict[str, list[ArtifactVersion]] = {}
+        for row in result.scalars().all():
+            grouped.setdefault(row.artifact_id, []).append(row)
+        return grouped
+
+    async def latest_many(
+        self, artifact_ids: list[str], tenant_id: str = DEFAULT_TENANT_ID
+    ) -> dict[str, ArtifactVersion]:
+        """批量拉取多个产物的最新版本（一次 IN 查询，ARCH-08）。"""
+        grouped = await self.list_for_artifacts(artifact_ids, tenant_id=tenant_id)
+        return {artifact_id: rows[-1] for artifact_id, rows in grouped.items() if rows}

@@ -98,6 +98,7 @@ class EvaluationHarness:
         sandbox_provider: SandboxProvider | None = None,
         exec_timeout: float = 120.0,
         session_factory: Any = None,
+        events: Any = None,
     ) -> None:
         self._store = store
         self._evaluators: list[Evaluator] = list(evaluators) if evaluators else default_evaluators()
@@ -105,6 +106,8 @@ class EvaluationHarness:
         self._sandbox_provider = sandbox_provider
         self._exec_timeout = exec_timeout
         self._session_factory = session_factory
+        # 可选事件总线注入（L6）：CLI/脚本带 run_id 时据此补发 evaluation.completed
+        self._events = events
 
     @property
     def store(self) -> Any:
@@ -119,6 +122,26 @@ class EvaluationHarness:
             sandbox_provider=self._sandbox_provider,
             exec_timeout=self._exec_timeout,
             session_factory=self._session_factory,
+            events=self._events,
+        )
+
+    async def emit_evaluation_completed(self, run_id: str, report: EvaluationReport) -> None:
+        """补发 ``evaluation.completed`` 事件（L6：harness/CLI 无 run 绑定时不发）。
+
+        仅当注入了 events 且提供 run_id 时生效；载荷与 API 路径保持一致。
+        """
+        if self._events is None:
+            return
+        await self._events.emit(
+            run_id,
+            "evaluation.completed",
+            {
+                "suite_id": report.suite_id,
+                "total_score": report.total_score,
+                "runnability": report.runnability,
+                "passed": report.passed,
+                "verdict": "pass" if report.passed else "fail",
+            },
         )
 
     # ------------------------------------------------------------------ 单任务
@@ -187,7 +210,10 @@ class EvaluationHarness:
             logger.warning(
                 "评测沙箱会话不可用，降级为无沙箱判定（task=%s）", task.id, exc_info=True
             )
-            return await self._gather(task, workdir, references, None)
+            degraded = await self._gather(task, workdir, references, None)
+            for score in degraded:
+                score.degraded = True  # 整场沙箱降级：所有维度标记 degraded（QA-10）
+            return degraded
 
     async def _gather(
         self,
@@ -221,6 +247,7 @@ class EvaluationHarness:
                 weight=evaluator.weight,
                 rationale=f"评估器异常：{exc}",
                 evidence=[Evidence("metric", evaluator.name, f"执行异常：{exc}")],
+                degraded=True,  # 单维降级标记（QA-10）：供前端显著提示，勿当产物劣质
             )
 
     # ------------------------------------------------------------------ 套件 / 项目
@@ -377,6 +404,7 @@ def build_eval_harness(
     sandbox_provider: SandboxProvider | None = None,
     exec_timeout: float | None = None,
     session_factory: Any = None,
+    events: Any = None,
 ) -> EvaluationHarness:
     """按运行配置装配评测 harness（app 装配与脚本共用）。"""
     effective_judge = judge
@@ -394,4 +422,5 @@ def build_eval_harness(
         sandbox_provider=effective_provider,
         exec_timeout=float(settings.sandbox_exec_timeout if exec_timeout is None else exec_timeout),
         session_factory=session_factory,
+        events=events,
     )

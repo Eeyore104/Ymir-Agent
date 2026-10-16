@@ -10,8 +10,8 @@ import json
 
 from pydantic import BaseModel
 
+from ymir.common.contracts import dump_structured
 from ymir.common.errors import InvalidParamError
-from ymir.roles.schemas import dump_structured
 
 
 def build_document_files(document: BaseModel, *, name: str) -> dict[str, str]:

@@ -13,6 +13,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
+from weakref import WeakValueDictionary
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,10 +30,31 @@ _SUBSCRIBER_QUEUE_SIZE = 1000
 class EventPublisher:
     """事件写入 + 订阅广播。"""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        queue_size: int = _SUBSCRIBER_QUEUE_SIZE,
+    ) -> None:
         self._session_factory = session_factory
-        self._write_lock = asyncio.Lock()
+        self._queue_size = queue_size
+        # 按 run 维度的写锁：seq 仅需 run 内唯一，per-run 锁避免跨 run 全局串行（ARCH-06）。
+        # 弱引用字典（QA-06-1）：锁仅在 `async with` 作用域内被强引用，释放后自动回收，
+        # 不再随历史 run 数无界增长；同一 run 的并发 emit 仍拿到同一把锁（语义不变）。
+        self._write_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
+
+    def _write_lock_for(self, run_id: str) -> asyncio.Lock:
+        """取（懒建）某 run 的写锁；同一 run 的 seq 分配串行化。
+
+        无 await 的原子「取或建」，故并发调用不会为同一 run 生成两把锁；
+        返回值在 ``async with`` 存续期被强引用，弱引用字典不会在持锁期间回收它。
+        """
+        lock = self._write_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[run_id] = lock
+        return lock
 
     async def emit(
         self,
@@ -42,9 +64,9 @@ class EventPublisher:
         *,
         tenant_id: str = DEFAULT_TENANT_ID,
     ) -> Event:
-        """落库并广播一条事件（seq 事务内取 max+1，写锁串行化）。"""
+        """落库并广播一条事件（seq 事务内取 max+1，per-run 写锁串行化）。"""
         type_value = event_type.value if isinstance(event_type, EventType) else str(event_type)
-        async with self._write_lock, self._session_factory() as session:
+        async with self._write_lock_for(run_id), self._session_factory() as session:
             seq = (
                 await session.execute(
                     select(func.coalesce(func.max(Event.seq), 0)).where(Event.run_id == run_id)
@@ -80,7 +102,7 @@ class EventPublisher:
     @asynccontextmanager
     async def subscribe(self, run_id: str) -> AsyncIterator[asyncio.Queue[Event]]:
         """订阅某 run 的实时事件（上下文退出自动退订）。"""
-        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=self._queue_size)
         subscribers = self._subscribers.setdefault(run_id, set())
         subscribers.add(queue)
         try:

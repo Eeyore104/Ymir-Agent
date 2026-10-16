@@ -13,10 +13,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from ymir.common.contracts import CodeBundle
 from ymir.common.errors import InvalidParamError
 
 
@@ -143,23 +144,6 @@ class DesignDocument(BaseModel):
         return "\n".join(lines).strip() + "\n"
 
 
-class CodeFile(BaseModel):
-    """一个代码文件。"""
-
-    path: str = Field(description="相对路径，如 app/main.py")
-    content: str
-
-
-class CodeBundle(BaseModel):
-    """代码产物（engineer 输出契约）。"""
-
-    files: list[CodeFile] = Field(min_length=1)
-    run_commands: list[str] = Field(
-        default_factory=list, description="冒烟/自测命令（在沙箱内执行）"
-    )
-    notes: str = Field(default="", description="实现说明与未决事项")
-
-
 class EvalFinding(BaseModel):
     """评测发现项。"""
 
@@ -213,8 +197,3 @@ def schema_json(name: str) -> str:
     """输出契约的 JSON Schema 文本（提示词注入用，中文友好）。"""
     schema = get_output_schema(name)
     return json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=1)
-
-
-def dump_structured(model: BaseModel) -> dict[str, Any]:
-    """结构化数据序列化（落 ``<out>.json``）。"""
-    return model.model_dump(mode="json")

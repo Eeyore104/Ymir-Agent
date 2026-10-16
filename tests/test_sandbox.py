@@ -219,6 +219,31 @@ class TestDockerSandbox:
         assert DockerSandbox(client=FakeDockerClient()).probe() is True
         assert DockerSandbox(client=FakeDockerClient(ping_ok=False)).probe() is False
 
+    async def test_read_file_missing_raises_not_found(self) -> None:
+        """B4：归档读取不存在的文件 -> NotFoundError（1002 语义）。"""
+        client = FakeDockerClient()
+        sbx = DockerSandbox(client=client)
+        session = await sbx.start()
+        with pytest.raises(NotFoundError):
+            await session.read_file("missing.py")
+
+    async def test_recreate_session_migrates_empty_workspace(self) -> None:
+        """B4：空工作区也能完成网络策略重建（导出无内容时跳过迁移）。"""
+        client = FakeDockerClient()
+        sbx = DockerSandbox(client=client)
+        session = await sbx.start()
+        old = session.container
+
+        await session.set_network_policy(NetworkPolicy.RESTRICTED)
+
+        assert old.removed
+        assert session.network_policy is NetworkPolicy.RESTRICTED
+        assert client.run_log[-1]["network_mode"] == "bridge"
+        assert await session.list_files(".") == []  # 空工作区
+        # 重建后读写链路仍可用
+        await session.write_file("a.py", "print(1)")
+        assert await session.read_file("a.py") == "print(1)"
+
 
 # --------------------------------------------------------------------- LocalSandbox
 
@@ -263,6 +288,16 @@ class TestLocalSandbox:
         assert session.network_policy == NetworkPolicy.NONE
         await session.set_network_policy(NetworkPolicy.OPEN)
         assert session.network_policy == NetworkPolicy.OPEN
+
+    async def test_no_base_dir_leak_without_explicit_base(self) -> None:
+        """无显式 base_dir 时不留基目录：会话销毁即彻底回收（QA-03）。"""
+        sbx = LocalSandbox()
+        assert sbx._base is None  # 不再自动 mkdtemp 持久基目录
+        session = await sbx.start()
+        workdir = session.workdir
+        assert workdir.is_dir() and workdir.name.startswith("ymir-ws-")
+        await sbx.destroy(session)
+        assert not workdir.exists()  # 工作区回收，无残留
 
 
 # --------------------------------------------------------------------- 工厂

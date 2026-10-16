@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
 import shutil
 import zipfile
 from collections.abc import Mapping
@@ -30,6 +32,8 @@ from ymir.common.errors import NotFoundError, StateConflictError
 from ymir.models.base import utcnow
 from ymir.models.entities import DEFAULT_TENANT_ID, Artifact, ArtifactVersion
 from ymir.storage.artifact_repo import ArtifactRepository, ArtifactVersionRepository
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -125,10 +129,15 @@ class ArtifactStore:
             parent = await versions.latest(artifact.id, tenant_id=tenant_id)
 
             target_dir = self._version_dir(project_id, artifact.id, next_version)
-            if target_dir.exists():
+            # 原子占位（QA-04）：mkdir(exist_ok=False) 以文件系统为并发裁决 ——
+            # 并行双写同一版本时仅一方能建目录，另一方 FileExistsError 即冲突，
+            # 绝不覆盖已写版本；DB 唯一约束（uq_artifact_version）仍为最终裁决。
+            try:
+                target_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
                 raise StateConflictError(
                     f"产物版本目录已存在（版本不可变，禁止覆盖）: {target_dir}"
-                )
+                ) from exc
             self._write_tree(target_dir, normalized)
 
             row = ArtifactVersion(
@@ -217,9 +226,35 @@ class ArtifactStore:
             return None
         return await self.load(artifact.id, tenant_id=tenant_id)
 
+    async def load_many(
+        self, artifact_ids: list[str], *, tenant_id: str = DEFAULT_TENANT_ID
+    ) -> list[LoadedVersion]:
+        """批量加载多个产物各自的最新版本（ARCH-08：避免逐条 load 的 N+1）。
+
+        一次 IN 查询取回全部产物与版本行，再逐条读文件树（KB 级小文件）。
+        """
+        async with self._session_factory() as session:
+            artifacts = await ArtifactRepository(session).get_many(
+                artifact_ids, tenant_id=tenant_id
+            )
+            latest = await ArtifactVersionRepository(session).latest_many(
+                [art.id for art in artifacts], tenant_id=tenant_id
+            )
+        loaded: list[LoadedVersion] = []
+        for artifact in artifacts:
+            row = latest.get(artifact.id)
+            if row is None:
+                continue
+            files = self._read_tree(self._root / row.storage_path)
+            loaded.append(LoadedVersion(artifact=artifact, version_row=row, files=files))
+        return loaded
+
     @staticmethod
     def _read_tree(base: Path) -> dict[str, str]:
         if not base.is_dir():
+            # 版本行存在但目录缺失（外部清理 / 迁移丢失）：显式告警（QA-09），
+            # 但保持既有返回语义（空文件集）以免破坏 API / 评测路径。
+            logger.warning("产物版本目录缺失（可能被外部清理）: %s", base)
             return {}
         files: dict[str, str] = {}
         for path in sorted(base.rglob("*")):
@@ -278,12 +313,22 @@ class ArtifactStore:
             artifacts = await ArtifactRepository(session).list_by_project(
                 project_id, tenant_id=tenant_id, limit=1000
             )
-            version_rows: dict[str, list[ArtifactVersion]] = {}
-            for art in artifacts:
-                version_rows[art.id] = await ArtifactVersionRepository(session).list_versions(
-                    art.id, tenant_id=tenant_id
-                )
+            # 批量 IN 查询版本行（ARCH-08），替换逐 artifact 的 list_versions（N+1）
+            version_rows = await ArtifactVersionRepository(session).list_for_artifacts(
+                [art.id for art in artifacts], tenant_id=tenant_id
+            )
+        # 整库打包为同步阻塞 IO（逐文件读取 + zip 压缩），转线程避免阻塞事件循环（ARCH-07）
+        return await asyncio.to_thread(
+            self._build_export_zip, project_id, artifacts, version_rows
+        )
 
+    def _build_export_zip(
+        self,
+        project_id: str,
+        artifacts: list[Artifact],
+        version_rows: dict[str, list[ArtifactVersion]],
+    ) -> bytes:
+        """同步构建导出包（供 :meth:`export_zip` 经 ``asyncio.to_thread`` 调度）。"""
         manifest: dict[str, Any] = {
             "project_id": project_id,
             "exported_at": utcnow().isoformat(),

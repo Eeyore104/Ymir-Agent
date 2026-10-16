@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from ymir.api.deps import EvaluationsDep, EventsDep, SessionDep, TenantDep
@@ -46,11 +47,14 @@ async def _report_artifacts(session, *, project_id: str | None, tenant_id: str) 
 
 
 async def _summaries(store, artifacts: list[Artifact]) -> list[EvaluationSummaryOut]:
+    if not artifacts:
+        return []
+    # 批量加载（ARCH-08）：一次 IN 查询取各报告最新版本，替换逐个 store.load 的 N+1
+    loaded_map = {lv.artifact.id: lv for lv in await store.load_many([a.id for a in artifacts])}
     items: list[EvaluationSummaryOut] = []
     for artifact in artifacts:
-        try:
-            loaded = await store.load(artifact.id)
-        except NotFoundError:
+        loaded = loaded_map.get(artifact.id)
+        if loaded is None:
             continue
         raw = loaded.files.get("evaluation_report.json")
         if not raw:
@@ -111,6 +115,36 @@ async def list_evaluations(
     artifacts = await _report_artifacts(session, project_id=None, tenant_id=tenant_id)
     items = await _summaries(harness.store, artifacts)
     return {"code": 0, "data": {"items": items, "total": len(items)}}
+
+
+@router.get(
+    "/evaluations/{evaluation_id}",
+    response_model=ApiResponse[EvaluationReport],
+    summary="评测报告详情（分数 + 证据链）",
+)
+async def get_evaluation(
+    evaluation_id: str,
+    tenant_id: TenantDep,
+    harness: EvaluationsDep,
+) -> dict[str, object]:
+    """按产物 ID 读取评测报告详情（§6.1、§12.3）。
+
+    报告以一等产物（``evaluation_report`` json）承载；不存在或非四维报告
+    -> ``NotFoundError``（1002 / 404）。
+    """
+    store = harness.store
+    try:
+        loaded = await store.load(evaluation_id, tenant_id=tenant_id)
+    except NotFoundError as exc:
+        raise NotFoundError(f"评测报告不存在: {evaluation_id}") from exc
+    raw = loaded.files.get("evaluation_report.json")
+    if not raw:
+        raise NotFoundError(f"评测报告不存在: {evaluation_id}")
+    try:
+        report = EvaluationReport.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise NotFoundError(f"评测报告格式不合法: {evaluation_id}") from exc
+    return {"code": 0, "data": report}
 
 
 @router.post(

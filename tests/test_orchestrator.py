@@ -18,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ymir.common.errors import BudgetExceededError, StateConflictError
 from ymir.events.bus import EventPublisher
 from ymir.messages.bus import MessagePublisher
+from ymir.messages.schema import MessageCreate
 from ymir.models.entities import Event, Message, StageExecution
+from ymir.models.enums import MessageType
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.orchestrator.executor import StageExecutor
 from ymir.orchestrator.recovery import recover_runs
@@ -828,3 +830,111 @@ async def test_recovery_skips_waiting_approval(
     run = await _get_run(session_factory, run_id)
     assert run.status == "waiting_approval"
     await engine.shutdown()
+
+
+async def test_write_lock_registry_reclaims_locks(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """弱引用写锁（QA-06-1）：按 run 懒建的锁在释放后回收，注册表不无界增长；seq 语义不变。"""
+    import gc
+
+    publisher = EventPublisher(session_factory)
+    run_ids = [await _new_run(session) for _ in range(5)]
+    for run_id in run_ids:
+        await publisher.emit(run_id, "stage.log", {"x": 1})
+    gc.collect()
+    assert len(publisher._write_locks) == 0  # 锁随作用域释放被回收
+
+    # 同一 run 并发 emit：per-run 锁仍串行分配 seq（语义不变）
+    target = await _new_run(session)
+    await asyncio.gather(*(publisher.emit(target, "stage.log", {"i": i}) for i in range(10)))
+    seqs = sorted(e.seq for e in await publisher.list_after(target, 0))
+    assert seqs == list(range(1, 11))
+
+
+async def test_message_write_lock_registry_reclaims_locks(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """MessagePublisher 弱引用写锁（QA-06-1）：注册表不无界增长。"""
+    import gc
+
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    run_ids = [await _new_run(session) for _ in range(5)]
+    for run_id in run_ids:
+        await messages.publish(
+            run_id, MessageCreate(type=MessageType.SYSTEM, summary="消息")
+        )
+    gc.collect()
+    assert len(messages._write_locks) == 0
+
+
+# ----------------------------------------------------- SSE 重连去重边界（B6 补测）
+
+
+async def test_list_after_boundaries_and_full_replay(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """B6：after_seq 中间断点 / 等于 max / 越界（大于 max，旧库残留）的边界。"""
+    run_id = await _new_run(session)
+    publisher = EventPublisher(session_factory)
+    for i in range(1, 4):
+        await publisher.emit(run_id, "stage.log", {"i": i})
+
+    assert [e.seq for e in await publisher.list_after(run_id, 0)] == [1, 2, 3]
+    assert [e.seq for e in await publisher.list_after(run_id, 1)] == [2, 3]
+    assert await publisher.list_after(run_id, 3) == []  # 等于 max：无缺口可补
+    assert await publisher.list_after(run_id, 99) == []  # 越界：不报错、不返回
+
+
+async def test_stream_after_seq_beyond_max_does_not_suppress_live(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """B6：after_seq 越界时去重水位取 0，实时帧不被抑制（T02 修复回归）。"""
+    from ymir.events.sse import stream_run_events
+
+    run_id = await _new_run(session)
+    publisher = EventPublisher(session_factory)
+    for i in range(1, 4):
+        await publisher.emit(run_id, "stage.log", {"i": i})
+
+    frames: list[str] = []
+    gen = stream_run_events(publisher, run_id, after_seq=99, heartbeat=5.0)
+    consumer = asyncio.create_task(_collect_frames(gen, frames))
+    try:
+        await publisher.emit(run_id, "usage.updated", {"k": 1})
+        await _wait_until(lambda: len(frames) >= 1)
+        assert len(frames) == 1  # 无重放帧；实时帧未被越界 after_seq 抑制
+        assert "id: 4" in frames[0]
+        assert '"type": "usage.updated"' in frames[0]
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
+async def test_stream_full_replay_then_live_has_no_duplicates(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """B6：全量重放后接实时帧，seq 连续、不丢不重。"""
+    from ymir.events.sse import stream_run_events
+
+    run_id = await _new_run(session)
+    publisher = EventPublisher(session_factory)
+    for i in range(1, 4):
+        await publisher.emit(run_id, "stage.log", {"i": i})
+
+    frames: list[str] = []
+    gen = stream_run_events(publisher, run_id, after_seq=0, heartbeat=5.0)
+    consumer = asyncio.create_task(_collect_frames(gen, frames))
+    try:
+        await _wait_until(lambda: len(frames) >= 3)
+        assert sum("id: 1" in frame for frame in frames) == 1  # 重放无重复
+        await publisher.emit(run_id, "usage.updated", {"k": 1})
+        await _wait_until(lambda: len(frames) >= 4)
+        assert len(frames) == 4  # 3 条重放 + 1 条实时
+        assert "id: 4" in frames[3]
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer

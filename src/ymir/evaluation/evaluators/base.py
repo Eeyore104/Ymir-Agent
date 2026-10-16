@@ -21,7 +21,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
-from ymir.roles.runtime import extract_json
+from ymir.common.jsonx import extract_json
 from ymir.sandbox.base import SandboxSession
 
 # --- 维度标识（冻结口径，勿改）---
@@ -90,6 +90,8 @@ class EvalScore:
     evidence: list[Evidence] = field(default_factory=list)
     cost_cny: float = 0.0
     tokens: int = 0
+    #: 该维度是否因「评估器异常 / 沙箱降级」而未走完正常判定（QA-10）
+    degraded: bool = False
 
     def __post_init__(self) -> None:
         self.score = clamp(self.score)
@@ -104,6 +106,7 @@ class EvalScore:
             "evidence": [item.to_dict() for item in self.evidence],
             "cost_cny": round(self.cost_cny, 6),
             "tokens": self.tokens,
+            "degraded": self.degraded,
         }
 
 

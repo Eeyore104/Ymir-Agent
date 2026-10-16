@@ -20,24 +20,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ymir.common.errors import BudgetExceededError, NotFoundError
+from ymir.common.errors import BizCode, BudgetExceededError, NotFoundError
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
 from ymir.messages.bus import MessagePublisher
 from ymir.messages.schema import MessageCreate
+from ymir.models.base import utcnow
 from ymir.models.entities import PipelineRun, StageExecution
 from ymir.models.enums import RunStatus, StageStatus
 from ymir.orchestrator.executor import StageExecutor, StageOutcome
 from ymir.orchestrator.transitions import ensure_run_transition
 from ymir.sop.loader import load_pipeline
 from ymir.sop.models import END_TOKEN, PipelineDefinition, StageSpec
-from ymir.storage.repositories import RunRepository
+from ymir.storage.repositories import RunRepository, StageExecutionRepository
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +44,10 @@ logger = logging.getLogger(__name__)
 ApprovalHook = Callable[[PipelineRun, StageSpec], Awaitable[bool]]
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+def _biz_code_of(exc: BaseException) -> int | None:
+    """提取业务异常的业务码（``YmirError.biz_code``）；非业务异常返回 None（PM-10）。"""
+    code = getattr(exc, "biz_code", None)
+    return int(code) if code is not None else None
 
 
 class OrchestrationEngine:
@@ -79,7 +80,7 @@ class OrchestrationEngine:
             run = await self._require_run(session, run_id)
             ensure_run_transition(run.status, RunStatus.RUNNING)
             run.status = RunStatus.RUNNING.value
-            run.started_at = _utcnow()
+            run.started_at = utcnow()
             run.error = None
             await session.commit()
         await self._events.emit(
@@ -120,7 +121,7 @@ class OrchestrationEngine:
             ensure_run_transition(run.status, RunStatus.FAILED)
             run.status = RunStatus.FAILED.value
             run.error = "cancelled by user"
-            run.finished_at = _utcnow()
+            run.finished_at = utcnow()
             await session.commit()
         await self._events.emit(
             run_id, EventType.RUN_FAILED, {"status": "failed", "error": "cancelled by user"}
@@ -230,7 +231,7 @@ class OrchestrationEngine:
         except Exception as exc:  # noqa: BLE001 - 引擎级兜底：尽力标记失败
             logger.exception("run %s 推进异常", run_id)
             try:
-                await self._fail_run(run_id, f"引擎异常: {exc}")
+                await self._fail_run(run_id, f"引擎异常: {exc}", error_code=_biz_code_of(exc))
             except Exception:  # noqa: BLE001
                 logger.exception("run %s 标记失败时再次异常", run_id)
         finally:
@@ -278,7 +279,9 @@ class OrchestrationEngine:
             await self._events.emit(
                 run_id, EventType.STAGE_FAILED, {**payload_common, "error": str(exc)}
             )
-            await self._fail_run(run_id, f"阶段 {stage.id} 执行失败: {exc}")
+            await self._fail_run(
+                run_id, f"阶段 {stage.id} 执行失败: {exc}", error_code=_biz_code_of(exc)
+            )
             return "failed"
 
         await self._finish_stage_exec(
@@ -317,7 +320,7 @@ class OrchestrationEngine:
                 return "invalid"
             if next_id == END_TOKEN:
                 run.status = RunStatus.COMPLETED.value
-                run.finished_at = _utcnow()
+                run.finished_at = utcnow()
                 await session.commit()
                 return "finished"
             run.current_stage_id = next_id
@@ -360,7 +363,7 @@ class OrchestrationEngine:
                 status=StageStatus.RUNNING.value,
                 attempt=attempt,
                 input_refs=list(stage.inputs),
-                started_at=_utcnow(),
+                started_at=utcnow(),
             )
             session.add(row)
             await session.commit()
@@ -379,7 +382,7 @@ class OrchestrationEngine:
             if row is None:
                 return
             row.status = status.value
-            row.finished_at = _utcnow()
+            row.finished_at = utcnow()
             if error is not None:
                 row.error = error
             if output_refs is not None:
@@ -387,26 +390,23 @@ class OrchestrationEngine:
             await session.commit()
 
     async def _latest_stage_exec(self, run_id: str, stage_id: str) -> StageExecution | None:
-        stmt = (
-            select(StageExecution)
-            .where(StageExecution.run_id == run_id, StageExecution.stage_id == stage_id)
-            .order_by(StageExecution.attempt.desc())
-            .limit(1)
-        )
         async with self._session_factory() as session:
-            return (await session.execute(stmt)).scalar_one_or_none()
+            return await StageExecutionRepository(session).latest(run_id, stage_id)
 
-    async def _fail_run(self, run_id: str, error: str) -> None:
+    async def _fail_run(self, run_id: str, error: str, *, error_code: int | None = None) -> None:
         async with self._session_factory() as session:
             run = await self._require_run(session, run_id)
             if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value):
                 return  # 已是终态（如已被 cancel），不覆盖
             run.status = RunStatus.FAILED.value
             run.error = error
-            run.finished_at = _utcnow()
+            run.error_code = error_code
+            run.finished_at = utcnow()
             await session.commit()
         await self._events.emit(
-            run_id, EventType.RUN_FAILED, {"status": "failed", "error": error}
+            run_id,
+            EventType.RUN_FAILED,
+            {"status": "failed", "error": error, "error_code": error_code},
         )
 
     async def _pause_for_budget(self, run_id: str, error: str) -> None:
@@ -415,6 +415,7 @@ class OrchestrationEngine:
             run = await self._require_run(session, run_id)
             if run.status == RunStatus.RUNNING.value:
                 run.status = RunStatus.PAUSED.value
+                run.error_code = int(BizCode.BUDGET_EXCEEDED)  # PM-10：预算码透传
                 await session.commit()
         await self._events.emit(
             run_id, EventType.BUDGET_EXCEEDED, {"status": "paused", "error": error}

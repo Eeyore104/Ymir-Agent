@@ -33,9 +33,9 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from typing import Protocol, runtime_checkable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.common.errors import InvalidParamError, NotFoundError, StateConflictError
@@ -54,23 +54,57 @@ from ymir.hitl.policy import (
 )
 from ymir.messages.bus import MessagePublisher
 from ymir.messages.schema import SUMMARY_MAX_LENGTH, MessageCreate
+from ymir.models.base import utcnow
 from ymir.models.entities import Approval, PipelineRun, StageExecution
 from ymir.models.enums import ApprovalStatus, MessageType, RunStatus, StageStatus
-from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.sop.loader import load_pipeline
-from ymir.sop.models import PipelineDefinition, StageSpec
-from ymir.storage.repositories import ApprovalRepository, RunRepository
+from ymir.sop.models import END_TOKEN, PipelineDefinition, StageSpec
+from ymir.storage.repositories import (
+    ApprovalRepository,
+    RunRepository,
+    StageExecutionRepository,
+)
 
 logger = logging.getLogger(__name__)
 
-#: 决策时等待 run 进入 waiting_approval 的容忍窗口（秒）——
+
+@runtime_checkable
+class ResumeTrigger(Protocol):
+    """编排引擎恢复入口（接口倒置，打破 ``hitl <-> orchestrator`` 循环依赖）。
+
+    审批引擎决策后只需「唤醒 run 推进」这一能力，故仅声明
+    :meth:`request_resume`；:class:`~ymir.orchestrator.engine.OrchestrationEngine`
+    结构上隐式满足该协议，hitl 无需 import 具体编排类（ARCH-02）。
+    """
+
+    async def request_resume(self, run_id: str) -> object: ...
+
+
+#: 决策时等待 run 进入 waiting_approval 的容忍窗口（秒）默认值——
 #: 引擎「创建审批记录 -> 迁移 run 状态」之间有毫秒级间隙，期间到达的决策
 #: 不应误判为状态冲突；窗口外仍严格校验（如等待中被取消 -> 1003）。
-_WAITING_STATUS_GRACE_SECONDS = 2.0
+DEFAULT_WAITING_STATUS_GRACE_SECONDS = 2.0
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+def _downstream_stage_ids(definition: PipelineDefinition, stage_id: str) -> list[str]:
+    """沿 ``stage_completed`` 主链求某阶段的下游阶段集合（不含自身）。
+
+    用于驳回回退到上游阶段时的「下游级联重跑」判定（QA-01）：目标阶段的
+    下游（可达链上的）阶段需与新一次上游产出保持一致，不能沿用旧产物。
+    """
+    downstream: list[str] = []
+    seen: set[str] = set()
+    frontier: list[str] = [stage_id]
+    while frontier:
+        current = frontier.pop()
+        for edge in definition.outgoing(current, on="stage_completed"):
+            nxt = edge.to
+            if nxt == END_TOKEN or nxt in seen:
+                continue
+            seen.add(nxt)
+            downstream.append(nxt)
+            frontier.append(nxt)
+    return downstream
 
 
 class ApprovalEngine:
@@ -83,19 +117,22 @@ class ApprovalEngine:
         events: EventPublisher,
         messages: MessagePublisher,
         definition_loader: Callable[[str], PipelineDefinition] | None = None,
+        waiting_grace_seconds: float = DEFAULT_WAITING_STATUS_GRACE_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._events = events
         self._messages = messages
         self._definition_loader = definition_loader or load_pipeline
-        self._orchestrator: OrchestrationEngine | None = None
+        self._waiting_grace = waiting_grace_seconds
+        self._orchestrator: ResumeTrigger | None = None
 
-    def bind_orchestrator(self, orchestrator: OrchestrationEngine) -> None:
+    def bind_orchestrator(self, orchestrator: ResumeTrigger) -> None:
         """绑定编排引擎（决策后恢复推进并唤醒任务；bootstrap 装配后注入）。
 
         采用后置绑定而非构造注入，是为了打破「引擎需要挂点 / 挂点需要引擎」
         的循环依赖：``OrchestrationEngine`` 构造时收 ``approval_hook``，
-        而决策路径需要反向调用引擎的 ``request_resume``。
+        而决策路径需要反向调用引擎的 ``request_resume``（经
+        :class:`ResumeTrigger` 协议解耦，避免 hitl 反向 import 编排类）。
         """
         self._orchestrator = orchestrator
 
@@ -158,7 +195,7 @@ class ApprovalEngine:
             approval.decision = DECISION_APPROVE
             approval.feedback = "batch 模式：关卡自动通过"
             approval.decided_by = BATCH_DECIDER
-            approval.decided_at = _utcnow()
+            approval.decided_at = utcnow()
             await session.commit()
         await self._events.emit(
             run.id,
@@ -176,14 +213,8 @@ class ApprovalEngine:
 
     async def _latest_output_refs(self, run_id: str, stage_id: str) -> list[object]:
         """阶段最新执行记录的产物引用（审批卡片的待审内容）。"""
-        stmt = (
-            select(StageExecution)
-            .where(StageExecution.run_id == run_id, StageExecution.stage_id == stage_id)
-            .order_by(StageExecution.attempt.desc())
-            .limit(1)
-        )
         async with self._session_factory() as session:
-            row = (await session.execute(stmt)).scalar_one_or_none()
+            row = await StageExecutionRepository(session).latest(run_id, stage_id)
         if row is None:
             return []
         return list(row.output_refs or [])
@@ -203,10 +234,23 @@ class ApprovalEngine:
         校验：审批不存在 -> ``NotFoundError``（1002）；审批非 pending
         （重复决策 / 已决策）-> ``StateConflictError``（1003）；run 不在
         waiting_approval（如等待中被取消）-> ``StateConflictError``（1003）。
+
+        并发安全（ARCH-04 / QA-02）：落库改为原子条件更新
+        （``UPDATE ... WHERE id=? AND status='pending'``），以 ``rowcount==1``
+        作为「决策成功」的唯一裁决；并发双写时仅一方成功，另一方抛 1003，
+        保证 ``_after_approved`` / ``_after_rejected`` 仅由成功方执行一次。
         """
         normalized = str(decision).strip().lower()
         if normalized not in VALID_DECISIONS:
             raise InvalidParamError(f"不支持的审批决策: {decision}（仅 approve / reject）")
+
+        new_status = (
+            ApprovalStatus.APPROVED.value
+            if normalized == DECISION_APPROVE
+            else ApprovalStatus.REJECTED.value
+        )
+        resolved_by = decided_by or DEFAULT_DECIDER
+        decided_at = utcnow()
 
         async with self._session_factory() as session:
             approval = await ApprovalRepository(session).get(approval_id)
@@ -226,16 +270,31 @@ class ApprovalEngine:
                 raise StateConflictError(
                     f"运行当前状态为 {run.status}（非等待审批），无法决策: {approval.run_id}"
                 )
-            approval.status = (
-                ApprovalStatus.APPROVED.value
-                if normalized == DECISION_APPROVE
-                else ApprovalStatus.REJECTED.value
+
+            # 原子条件更新（CAS）：并发下仅一个事务能命中 pending 行
+            cas = (
+                update(Approval)
+                .where(
+                    Approval.id == approval_id,
+                    Approval.status == ApprovalStatus.PENDING.value,
+                )
+                .values(
+                    status=new_status,
+                    decision=normalized,
+                    feedback=feedback,
+                    decided_by=resolved_by,
+                    decided_at=decided_at,
+                )
+                .execution_options(synchronize_session=False)
             )
-            approval.decision = normalized
-            approval.feedback = feedback
-            approval.decided_by = decided_by or DEFAULT_DECIDER
-            approval.decided_at = _utcnow()
+            result = await session.execute(cas)
+            if result.rowcount != 1:
+                await session.rollback()
+                raise StateConflictError(
+                    f"审批已被并发决策，不能重复决策: {approval_id}"
+                )
             await session.commit()
+            await session.refresh(approval)
 
         if normalized == DECISION_APPROVE:
             await self._after_approved(approval)
@@ -303,6 +362,10 @@ class ApprovalEngine:
         引擎恢复推进时自然走 attempt+1 重跑 —— 与断点恢复同一机制，引擎零改动。
         目标阶段取 ``gate.on_reject_target``（缺省为审批阶段自身）；指向上游
         阶段时同步纠正 ``run.current_stage_id``。
+
+        下游级联（QA-01）：目标非自身（回退到上游阶段）时，沿主链作废目标
+        下游所有 ``completed`` 执行 —— 否则引擎「恢复补推进」会对下游已
+        completed 的执行直接跳过、沿用旧产物而不随上游修订重跑。
         """
         async with self._session_factory() as session:
             run = await RunRepository(session).get(approval.run_id)
@@ -314,24 +377,51 @@ class ApprovalEngine:
             target_stage = definition.stage(target_stage_id)
             target_role = target_stage.role if target_stage is not None else None
 
-            latest = (
-                await session.execute(
-                    select(StageExecution)
-                    .where(
-                        StageExecution.run_id == run.id,
-                        StageExecution.stage_id == target_stage_id,
-                    )
-                    .order_by(StageExecution.attempt.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
+            latest = await StageExecutionRepository(session).latest(run.id, target_stage_id)
             if latest is not None and latest.status == StageStatus.COMPLETED.value:
                 latest.status = StageStatus.FAILED.value
                 latest.error = f"被驳回（审批不通过），等待重跑: {approval.gate_name}"
-            if target_stage_id != approval.stage_id and run.current_stage_id != target_stage_id:
-                run.current_stage_id = target_stage_id
+            if target_stage_id != approval.stage_id:
+                await self._invalidate_downstream(
+                    session, run.id, definition, target_stage_id, approval.gate_name
+                )
+                if run.current_stage_id != target_stage_id:
+                    run.current_stage_id = target_stage_id
             await session.commit()
         return target_stage_id, target_role
+
+    async def _invalidate_downstream(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        definition: PipelineDefinition,
+        target_stage_id: str,
+        gate_name: str,
+    ) -> None:
+        """作废目标阶段下游（沿主链可达）的 ``completed`` 执行（QA-01）。
+
+        仅当回退目标为上游阶段时调用；保证下游阶段随上游修订同步重跑，
+        产物产出新版本，而非沿用旧产物。
+        """
+        downstream = _downstream_stage_ids(definition, target_stage_id)
+        if not downstream:
+            return
+        rows = list(
+            (
+                await session.execute(
+                    select(StageExecution).where(
+                        StageExecution.run_id == run_id,
+                        StageExecution.stage_id.in_(downstream),
+                        StageExecution.status == StageStatus.COMPLETED.value,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            row.status = StageStatus.FAILED.value
+            row.error = f"上游阶段 {target_stage_id} 被驳回，需同步重跑: {gate_name}"
 
     async def _resume_run(self, run_id: str) -> None:
         """决策后恢复推进：waiting_approval -> running 并唤醒挂起任务。
@@ -349,7 +439,7 @@ class ApprovalEngine:
         每轮用全新会话读取（规避外层会话的事务快照看不到新提交）；
         超时返回最后一次读到的 run（可能仍非等待态，由调用方判定冲突）。
         """
-        deadline = time.monotonic() + _WAITING_STATUS_GRACE_SECONDS
+        deadline = time.monotonic() + self._waiting_grace
         run: PipelineRun | None = None
         while True:
             async with self._session_factory() as session:

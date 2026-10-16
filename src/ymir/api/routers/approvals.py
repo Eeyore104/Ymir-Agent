@@ -38,10 +38,13 @@ def _run_brief_out(brief: RunBrief | None) -> RunBriefOut | None:
 
 
 def _to_list_item(view: ApprovalView) -> ApprovalListItem:
-    """审批列表项（聚合视图 -> API 模型）。"""
+    """审批列表项（聚合视图 -> API 模型，含历史反馈链；PM-12）。"""
     return ApprovalListItem(
         **ApprovalOut.model_validate(view.approval).model_dump(),
         run=_run_brief_out(view.run),
+        feedback_history=[
+            ApprovalFeedbackOut.model_validate(message) for message in view.feedback_history
+        ],
     )
 
 

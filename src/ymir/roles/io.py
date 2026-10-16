@@ -11,14 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ymir.common.contracts import UpstreamArtifact
 
-@dataclass
-class UpstreamArtifact:
-    """上游产物（按名字引用的最新版本）。"""
-
-    name: str
-    version: int
-    files: dict[str, str]
+__all__ = ["StageInput", "StageOutput", "UpstreamArtifact"]
 
 
 @dataclass

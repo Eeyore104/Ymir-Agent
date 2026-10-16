@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 from ymir.artifacts.store import ArtifactStore
+from ymir.common.contracts import UpstreamArtifact
 from ymir.models.entities import DEFAULT_TENANT_ID
-from ymir.roles.io import UpstreamArtifact
 
 
 async def read_artifacts(

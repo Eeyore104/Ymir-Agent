@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from weakref import WeakValueDictionary
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -28,7 +29,17 @@ class MessagePublisher:
     ) -> None:
         self._session_factory = session_factory
         self._events = events
-        self._write_lock = asyncio.Lock()
+        # 按 run 维度写锁：seq 仅需 run 内唯一（ARCH-06）。弱引用字典（QA-06-1）：
+        # 锁仅在 `async with` 作用域内被强引用，释放后自动回收，不随历史 run 无界增长。
+        self._write_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+    def _write_lock_for(self, run_id: str) -> asyncio.Lock:
+        """取（懒建）某 run 的写锁；同一 run 的 seq 分配串行化。"""
+        lock = self._write_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[run_id] = lock
+        return lock
 
     async def publish(
         self,
@@ -38,7 +49,7 @@ class MessagePublisher:
         tenant_id: str = DEFAULT_TENANT_ID,
     ) -> Message:
         """落库一条消息并发出 ``message.created`` 事件。"""
-        async with self._write_lock, self._session_factory() as session:
+        async with self._write_lock_for(run_id), self._session_factory() as session:
             seq = (
                 await session.execute(
                     select(func.coalesce(func.max(Message.seq), 0)).where(

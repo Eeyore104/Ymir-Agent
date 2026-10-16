@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 
 from ymir.artifacts.versioning import normalize_rel_path
+from ymir.common.contracts import CodeBundle
 from ymir.common.errors import InvalidParamError
-from ymir.roles.schemas import CodeBundle
 
 
 def build_code_files(bundle: CodeBundle, *, name: str = "code") -> dict[str, str]:

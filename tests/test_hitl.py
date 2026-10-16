@@ -27,7 +27,7 @@ from ymir.models.enums import RunMode
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.orchestrator.executor import StageExecutor, StageOutcome
 from ymir.orchestrator.gates import build_approval_hook
-from ymir.sop.models import StageSpec
+from ymir.sop.models import END_TOKEN, GateSpec, PipelineDefinition, StageSpec, TransitionSpec
 from ymir.storage.repositories import ProjectRepository, RunRepository
 
 # --------------------------------------------------------------------- 工具
@@ -533,6 +533,9 @@ async def test_service_list_and_detail_views(
     # 详情（新 pending）：过滤后的列表也能按 approved/rejected 取到
     rejected_views = await service.list_approvals(status="rejected")
     assert [v.approval.id for v in rejected_views] == [first.id]
+    # PM-12：列表项内联历史反馈链（无需再逐条拉详情）
+    assert len(rejected_views[0].feedback_history) == 1
+    assert "边界场景" in (rejected_views[0].feedback_history[0].summary or "")
     assert second.id != first.id
 
     # 详情不存在 -> 1002
@@ -673,3 +676,152 @@ async def test_api_batch_mode_completes_without_pending(client: AsyncClient) -> 
     body = (await client.get(f"/api/v1/approvals?run_id={run_id}")).json()
     assert body["data"]["total"] == 3
     assert all(item["decided_by"] == "batch" for item in body["data"]["items"])
+
+
+# ------------------------------------------------------------- 并发决策（B5 / ARCH-04）
+
+
+async def test_concurrent_decisions_exactly_one_wins(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """并发决策同一审批：恰 1 成功 + 1 抛 1003，且仅一条 approval.decided 事件（B5）。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    run_id = await _new_run(session, mode="key_node")
+    engine, approval_engine = make_stack(session_factory, executor=ArtifactSavingExecutor(store))
+    await engine.launch(run_id)
+    approval = await _wait_pending_approval(session_factory, run_id)
+
+    results = await asyncio.gather(
+        approval_engine.decide(approval.id, decision="approve"),
+        approval_engine.decide(approval.id, decision="approve"),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if not isinstance(r, BaseException)]
+    conflicts = [r for r in results if isinstance(r, StateConflictError)]
+    assert len(successes) == 1, results
+    assert len(conflicts) == 1, results
+    assert conflicts[0].biz_code == 1003
+
+    # 落库恰为一次决策；approval.decided 事件恰一条（无重复唤醒 / 双写）
+    rows = await _list_approvals(session_factory, run_id)
+    assert rows[0].status == "approved"
+    async with session_factory() as s:
+        decided = list(
+            (
+                await s.execute(
+                    select(Event).where(Event.run_id == run_id, Event.type == "approval.decided")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(decided) == 1
+    await engine.shutdown()
+
+
+# ------------------------------------------------------------- 上游驳回级联（B1 / QA-01）
+
+
+def make_stack_with_definition(
+    session_factory: async_sessionmaker[AsyncSession],
+    definition: PipelineDefinition,
+    *,
+    executor: Any = None,
+) -> tuple[OrchestrationEngine, ApprovalEngine]:
+    """用自定义流水线定义装配「引擎 + 审批引擎」（穿透默认 YAML 加载）。"""
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    loader = lambda _pipeline_id: definition  # noqa: E731 - 测试桩：忽略 id 返回固定定义
+    approval_engine = ApprovalEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        definition_loader=loader,
+    )
+    engine = OrchestrationEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        executor=executor or StageExecutor(),
+        approval_hook=build_approval_hook(approval_engine),
+        definition_loader=loader,
+    )
+    approval_engine.bind_orchestrator(engine)
+    return engine, approval_engine
+
+
+def _upstream_reject_definition() -> PipelineDefinition:
+    """prd -> design -> code；末阶段关卡驳回回退到上游 prd（on_reject_target=prd）。"""
+    stages = [
+        StageSpec(id="prd", role="pm", inputs=["requirement"], outputs=["prd"]),
+        StageSpec(id="design", role="architect", inputs=["prd"], outputs=["design"]),
+        StageSpec(
+            id="code",
+            role="engineer",
+            inputs=["design"],
+            outputs=["code"],
+            gate=GateSpec(name="代码评审", on_reject_target="prd"),
+        ),
+    ]
+    transitions = [
+        TransitionSpec(**{"from": "prd", "on": "stage_completed", "to": "design"}),
+        TransitionSpec(**{"from": "design", "on": "stage_completed", "to": "code"}),
+        TransitionSpec(**{"from": "code", "on": "stage_completed", "to": END_TOKEN}),
+    ]
+    return PipelineDefinition(
+        id="upstream-reject-test",
+        version="1.0",
+        description="上游驳回级联测试",
+        stages=stages,
+        transitions=transitions,
+    )
+
+
+async def test_reject_to_upstream_cascades_downstream_rerun(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """驳回回退到上游阶段：下游已完成阶段级联作废并重跑、产物产出新版本（B1 / QA-01）。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    definition = _upstream_reject_definition()
+    run_id = await _new_run(session, mode="key_node", requirement="级联重跑验证")
+    engine, approval_engine = make_stack_with_definition(
+        session_factory, definition, executor=ArtifactSavingExecutor(store)
+    )
+    await engine.launch(run_id)
+
+    # 首轮：prd / design / code 均 attempt=1 completed，末阶段 code 关卡阻断
+    first = await _wait_pending_approval(session_factory, run_id)
+    assert first.stage_id == "code"
+    for sid in ("prd", "design", "code"):
+        execs = await _latest_stage_execs(session_factory, run_id, sid)
+        assert [(e.attempt, e.status) for e in execs] == [(1, "completed")], sid
+
+    # 驳回，回退目标 = prd（上游）；下游 design / code 应被级联作废
+    await approval_engine.decide(first.id, decision="reject", feedback="需求需修订，全链路重跑")
+
+    second = await _wait_pending_approval(session_factory, run_id)
+    assert second.stage_id == "code"
+    assert second.id != first.id
+
+    # 级联重跑：prd / design / code 全部 attempt=2 completed，attempt=1 被作废为 failed
+    for sid in ("prd", "design", "code"):
+        execs = await _latest_stage_execs(session_factory, run_id, sid)
+        assert [(e.attempt, e.status) for e in execs] == [(1, "failed"), (2, "completed")], sid
+        assert "被驳回" in (execs[0].error or "") or "上游阶段" in (execs[0].error or ""), sid
+
+    # 下游产物产出新版本（design / code：v1 -> v2）
+    for sid in ("design", "code"):
+        execs = await _latest_stage_execs(session_factory, run_id, sid)
+        artifact_id = execs[-1].output_refs[0]["artifact_id"]
+        _artifact, versions = await store.get_artifact_detail(artifact_id)
+        assert [v.version for v in versions] == [1, 2], sid
+
+    # 放行末关 -> 完成
+    await approval_engine.decide(second.id, decision="approve")
+    run = await _wait_status(session_factory, run_id, {"completed"})
+    assert run.status == "completed"
+    await engine.shutdown()

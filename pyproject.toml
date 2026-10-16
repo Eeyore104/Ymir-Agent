@@ -43,7 +43,9 @@ src = ["src", "tests"]
 extend-exclude = ["web", "migrations/versions"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
+# TID252：禁止「父级相对导入」（from ..x）——与 scripts/check_import_graph.py 双保险，
+# 杜绝用相对导入绕过分层护栏（ARCH-15 / QA-15-1）。
+select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W", "TID252"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

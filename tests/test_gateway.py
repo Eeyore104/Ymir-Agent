@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -383,3 +384,56 @@ def test_estimate_tokens_grows_with_content() -> None:
     assert large > small
     # 显式给出输出上限时，估算 = 输入字符/2 + 输出上限
     assert estimate_tokens([{"role": "user", "content": "x" * 100}], 4096) == 50 + 4096
+
+
+# --------------------------------------------------------------------- 配置校验 / 预算估算
+
+def test_duplicate_model_name_across_providers_rejected() -> None:
+    """跨 provider 同名模型在配置校验期报错并指出冲突模型名（QA-07）。"""
+    with pytest.raises(ValidationError) as exc_info:
+        ModelsConfig(
+            version="dup",
+            providers={
+                "a": ProviderSpec(
+                    base_url="http://a.local",
+                    models={"shared": ModelSpec(tier="executor")},
+                ),
+                "b": ProviderSpec(
+                    base_url="http://b.local",
+                    models={"shared": ModelSpec(tier="executor")},
+                ),
+            },
+        )
+    assert "shared" in str(exc_info.value)
+
+
+async def test_budget_estimate_uses_max_candidate_price(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预算前置估算取候选链最大价目（QA-06），避免 fallback 到贵模型时低估。"""
+    monkeypatch.setenv("ALPHA_KEY", "t")
+    monkeypatch.setenv("BETA_KEY", "t")
+    config = ModelsConfig(
+        version="budget-max",
+        providers={
+            "cheap": ProviderSpec(
+                base_url="http://cheap.local",
+                api_key_env="ALPHA_KEY",
+                models={"cheap-exec": ModelSpec(tier="executor", price_in=0.0, price_out=0.0)},
+            ),
+            "pricey": ProviderSpec(
+                base_url="http://pricey.local",
+                api_key_env="BETA_KEY",
+                models={
+                    "pricey-exec": ModelSpec(tier="executor", price_in=0.0, price_out=1_000_000.0)
+                },
+            ),
+        },
+        routing={"executor": ["cheap-exec", "pricey-exec"]},
+        budget=BudgetSpec(per_run_tokens=0, per_day_cost_cny=100.0),
+    )
+    gateway = make_gateway(session_factory, config, behavior=lambda *a: fake_response())
+    # 首选 cheap（0 价）不会超限；按候选链最大价目（pricey）估算则应超限
+    with pytest.raises(BudgetExceededError):
+        await gateway.chat([{"role": "user", "content": "hi"}], tier="executor")

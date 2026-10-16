@@ -11,10 +11,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ymir.models.entities import Approval, PipelineRun, Project
+from ymir.models.entities import DEFAULT_TENANT_ID, Approval, PipelineRun, Project, StageExecution
 from ymir.models.enums import ApprovalStatus, RunMode, RunStatus
-
-DEFAULT_TENANT_ID = "default"
 
 
 def _as_value(value: str | Enum) -> str:
@@ -224,3 +222,26 @@ class ApprovalRepository(BaseRepository[Approval]):
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+
+class StageExecutionRepository(BaseRepository[StageExecution]):
+    """阶段执行记录仓储（ARCH-09：收口「取最新执行记录」重复查询）。"""
+
+    model = StageExecution
+
+    async def latest(
+        self, run_id: str, stage_id: str, tenant_id: str = DEFAULT_TENANT_ID
+    ) -> StageExecution | None:
+        """某 run 某阶段的「最新一条」执行记录（按 attempt 降序）。"""
+        stmt = (
+            select(StageExecution)
+            .where(
+                StageExecution.run_id == run_id,
+                StageExecution.stage_id == stage_id,
+                StageExecution.tenant_id == tenant_id,
+            )
+            .order_by(StageExecution.attempt.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()

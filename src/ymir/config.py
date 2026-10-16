@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     default_page_size: int = 50
     max_page_size: int = 200
 
+    # --- 运行期可调参数（ARCH-12；默认值与原硬编码常量一致，env 可覆盖）---
+    sse_heartbeat_seconds: float = 15.0  # SSE 心跳间隔（原 events/sse.py:SSE_HEARTBEAT_SECONDS）
+    event_queue_size: int = 1000  # SSE 订阅队列上限（原 events/bus.py:_SUBSCRIBER_QUEUE_SIZE）
+    approval_waiting_grace_seconds: float = 2.0  # 审批等待窗口（原 hitl/engine.py 常量）
+
     @property
     def resolved_db_path(self) -> Path:
         """将相对 db_path 解析为基于仓库根目录的绝对路径。"""

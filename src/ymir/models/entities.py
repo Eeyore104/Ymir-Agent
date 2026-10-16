@@ -75,6 +75,8 @@ class PipelineRun(Base):
     current_stage_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     context: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: 失败/暂停对应的业务错误码（§6.3，如 1004 预算 / 1005 沙箱 / 1006 模型；PM-10）
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     tenant_id: Mapped[str] = mapped_column(
@@ -320,7 +322,9 @@ class Pipeline(Base):
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     version: Mapped[str] = mapped_column(String(32), primary_key=True)
     definition: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    #: tenant_id 纳入复合主键（QA-B3-01）：同 (id, version) 可依租户各存一行，
+    #: 与 sync_pipeline 的 upsert 定位键保持一致，杜绝跨租户互相覆盖。
     tenant_id: Mapped[str] = mapped_column(
-        String(64), nullable=False, default=DEFAULT_TENANT_ID, index=True
+        String(64), nullable=False, default=DEFAULT_TENANT_ID, primary_key=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow, nullable=False)
