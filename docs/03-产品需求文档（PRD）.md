@@ -137,7 +137,7 @@ SOP（标准作业程序，此处指可配置的流水线定义）、关卡 Gate
 | ID | 需求 | 验收标准 |
 |---|---|---|
 | F5.1 | Artifact / ArtifactVersion 模型：内容进文件系统、元数据 + hash 进库；版本不可变、带血缘（parent_version） | 再生成必为新版本；历史永久可溯 |
-| F5.2 | diff：逐文件 unified diff，前端按文件分组渲染 | `/artifacts/{id}/diff?from=&to=` 可用 |
+| F5.2 | diff：逐文件 unified diff，前端按文件分组渲染 | `/artifacts/{id}/diff?v1=&v2=` 可用 |
 | F5.3 | zip 导出：整库导出（PRD/设计/代码/评测报告 + manifest.json） | 导出包可还原项目全貌 |
 | F5.4 | 备份策略：`data/` 目录定期 git 快照备份（使用手册给出命令） | 手册含备份/恢复步骤 |
 
