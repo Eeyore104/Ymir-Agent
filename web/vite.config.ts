@@ -6,6 +6,9 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+// docker-compose 场景经 YMIR_API_TARGET 指向 backend 服务；未设置时同本地默认（行为不变）
+const API_TARGET = process.env.YMIR_API_TARGET ?? 'http://127.0.0.1:8000'
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
@@ -52,8 +55,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/health': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/api': { target: API_TARGET, changeOrigin: true },
+      '/health': { target: API_TARGET, changeOrigin: true },
     },
   },
   // L7：前端单测（vitest，纯逻辑模块级；不碰 DOM 渲染）。

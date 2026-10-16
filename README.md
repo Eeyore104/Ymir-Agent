@@ -92,6 +92,9 @@ cd web && npm install && npm run dev
 
 # 一键起（后端 + 前端，Ctrl+C 一并退出）—— Windows Git Bash / macOS / Linux 通用
 bash scripts/dev.sh
+
+# 或：容器化一键启动（本机无需 Python/Node，详见 docs/04）
+docker compose up -d    # 后端 :8000 + 前端 :5173；`down` 停止，`down -v` 连数据卷一并清除
 ```
 
 ### 单跑演示（真实编排链路）

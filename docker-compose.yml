@@ -1,0 +1,63 @@
+# ymir-agent 一键启动（可选，dev.sh 的容器化版本；面向「换机 / 分享」体验）
+#
+#   docker compose up -d          # 启动 backend(8000) + frontend(5173)
+#   docker compose logs -f backend
+#   docker compose down           # 停止并移除容器（数据卷保留）
+#   docker compose down -v        # ⚠️ 连数据卷一起删（会清空 DB/产物与 Linux 依赖缓存）
+#
+# 说明：
+# - 不新建 Dockerfile：直接用官方镜像 + 启动命令（python:3.12-slim / node:20-slim）。
+# - 仓库根 `.env` 随 `.:/app` 挂载，应用按 PROJECT_ROOT 读取（无需 env_file）。
+# - 依赖与数据落在**命名卷**里，避免污染宿主机（Windows 的 .venv / node_modules 与
+#   Linux 容器不兼容，必须隔离）：
+#     ymir-venv           -> /app/.venv            （Linux venv）
+#     ymir-data           -> /app/data             （SQLite + 产物，持久化）
+#     ymir-web-node_modules -> /app/web/node_modules（Linux 依赖）
+# - 首次 `up` 需拉镜像并在容器内装依赖，耗时数分钟（uv.lock 已锁定清华源，速度较快）。
+name: ymir-agent
+
+services:
+  backend:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+      - ymir-venv:/app/.venv # 隔离 Linux venv，绝不覆盖宿主 Windows .venv
+      - ymir-data:/app/data # DB + 产物持久化
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内无 docker socket：用 LocalSandbox，避免 auto 探测等待（见下方注释可切回 Docker）
+      YMIR_SANDBOX_BACKEND: local
+    # 就绪链：装 uv（清华源）-> 按 lock 装依赖 -> 迁移 -> 起服务
+    command: >-
+      sh -c "pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+      && uv sync --frozen
+      && uv run alembic upgrade head
+      && uv run uvicorn ymir.api.app:app --host 0.0.0.0 --port 8000"
+    # 若要在容器内启用真 Docker 沙箱（需 YMIR_SANDBOX_BACKEND=auto/docker）：
+    #   volumes 追加 - /var/run/docker.sock:/var/run/docker.sock
+    #   （默认不启用：避免宿主 socket 暴露与 Windows 路径差异）
+
+  frontend:
+    image: node:20-slim
+    working_dir: /app/web
+    volumes:
+      - .:/app
+      - ymir-web-node_modules:/app/web/node_modules # 隔离 Linux 依赖，不污染宿主 node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      # vite proxy 目标：容器网络内指向 backend 服务
+      YMIR_API_TARGET: http://backend:8000
+    depends_on:
+      - backend
+    # 必须跑 dev server：`/api` 与 `/health` 的代理只在 vite dev 生效（build/preview 不带 proxy）
+    command: >-
+      sh -c "npm ci --registry=https://registry.npmmirror.com
+      && npm run dev -- --host 0.0.0.0"
+
+volumes:
+  ymir-venv:
+  ymir-data:
+  ymir-web-node_modules:
