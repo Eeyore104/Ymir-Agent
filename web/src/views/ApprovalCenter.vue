@@ -1,22 +1,21 @@
 <!--
   审批中心（/approvals）：跨 run 的审批列表（待审批 / 已通过 / 已驳回）。
 
-  列表项聚合 run 摘要；卡片级历史反馈链按需拉取详情（并行，数量可控）。
+  列表项已内联 run 摘要与历史反馈链（后端聚合，PM-12），无需再逐条拉详情；
+  待审产物点击经共享 ArtifactViewDialog 查看内容（PM-08）。
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 
 import ApprovalCard from '@/components/ApprovalCard.vue'
+import ArtifactViewDialog from '@/components/ArtifactViewDialog.vue'
 import { useApprovalsStore } from '@/stores/approvals'
-import type { ApprovalDetail, ApprovalStatus } from '@/api/types'
+import type { Approval, ApprovalStatus, ArtifactRef } from '@/api/types'
 
 const router = useRouter()
 const approvalsStore = useApprovalsStore()
 
-/** 详情富化后的卡片列表。 */
-const details = ref<ApprovalDetail[]>([])
 const activeFilter = ref<ApprovalStatus | 'all'>('pending')
 
 const FILTERS: Array<{ value: ApprovalStatus | 'all'; label: string }> = [
@@ -26,7 +25,14 @@ const FILTERS: Array<{ value: ApprovalStatus | 'all'; label: string }> = [
   { value: 'all', label: '全部' },
 ]
 
+const items = computed<Approval[]>(() => approvalsStore.items)
 const pendingCount = computed(() => approvalsStore.pendingCount)
+
+/** 待审产物查看对话框。 */
+const dialogVisible = ref(false)
+const dialogArtifactId = ref('')
+const dialogVersion = ref<number | null>(null)
+const dialogTitle = ref('')
 
 onMounted(async () => {
   await load()
@@ -36,14 +42,6 @@ async function load(): Promise<void> {
   await approvalsStore.loadApprovals({
     status: activeFilter.value === 'all' ? '' : activeFilter.value,
   })
-  // 并行拉取详情（含历史反馈链）；失败项退化为列表数据
-  const rich = await Promise.all(
-    approvalsStore.items.map(async (item) => {
-      const detail = await approvalsStore.loadApproval(item.id)
-      return detail ?? ({ ...item, feedback_history: [] } as ApprovalDetail)
-    }),
-  )
-  details.value = rich
 }
 
 async function onFilterChange(value: ApprovalStatus | 'all'): Promise<void> {
@@ -51,7 +49,10 @@ async function onFilterChange(value: ApprovalStatus | 'all'): Promise<void> {
   await load()
 }
 
-async function onDecide(payload: { decision: 'approve' | 'reject'; feedback?: string }, approvalId: string): Promise<void> {
+async function onDecide(
+  payload: { decision: 'approve' | 'reject'; feedback?: string },
+  approvalId: string,
+): Promise<void> {
   try {
     await approvalsStore.decide(approvalId, payload)
     ElMessage.success(payload.decision === 'approve' ? '已通过' : '已驳回，将带反馈回退重跑')
@@ -63,6 +64,18 @@ async function onDecide(payload: { decision: 'approve' | 'reject'; feedback?: st
 
 function onGotoRun(runId: string): void {
   void router.push(`/runs/${runId}`)
+}
+
+/** 查看待审产物内容（PM-08）。 */
+function onSelectArtifact(artifactId: string, approval: Approval): void {
+  const ref = (approval.artifact_refs as ArtifactRef[]).find(
+    (item) => String(item.artifact_id) === artifactId,
+  )
+  const name = ref?.name ?? artifactId
+  dialogArtifactId.value = artifactId
+  dialogVersion.value = typeof ref?.version === 'number' ? ref.version : null
+  dialogTitle.value = ref?.version ? `${name} v${ref.version}` : name
+  dialogVisible.value = true
 }
 </script>
 
@@ -81,20 +94,28 @@ function onGotoRun(runId: string): void {
     </div>
 
     <div v-loading="approvalsStore.loading" class="card-list">
-      <template v-if="details.length > 0">
-        <div v-for="detail in details" :key="detail.id" class="card-wrapper">
+      <template v-if="items.length > 0">
+        <div v-for="item in items" :key="item.id" class="card-wrapper">
           <ApprovalCard
-            :approval="detail"
+            :approval="item"
             :deciding="approvalsStore.deciding"
-            @decide="(payload) => onDecide(payload, detail.id)"
+            @decide="(payload) => onDecide(payload, item.id)"
+            @select-artifact="(id) => onSelectArtifact(id, item)"
           />
-          <el-button link type="primary" size="small" class="goto-run" @click="onGotoRun(detail.run_id)">
+          <el-button link type="primary" size="small" class="goto-run" @click="onGotoRun(item.run_id)">
             前往运行详情 →
           </el-button>
         </div>
       </template>
       <el-empty v-else description="暂无审批记录" :image-size="80" />
     </div>
+
+    <ArtifactViewDialog
+      v-model:visible="dialogVisible"
+      :artifact-id="dialogArtifactId"
+      :version="dialogVersion"
+      :title="dialogTitle"
+    />
   </div>
 </template>
 

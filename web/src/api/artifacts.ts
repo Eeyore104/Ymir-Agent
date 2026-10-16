@@ -2,7 +2,7 @@
  * 产物库 API（§6.1、§3.6：项目产物列表 / 详情 / 版本内容 / 版本 diff）。
  */
 
-import { request, type PageData } from './client'
+import client, { request, type PageData } from './client'
 import type { Artifact, ArtifactContent, ArtifactDetail, ArtifactDiff } from './types'
 
 /** 项目产物列表（信封 data 为 PageData：{items, total}）。 */
@@ -41,4 +41,15 @@ export function fetchArtifactDiff(
     url: `/artifacts/${artifactId}/diff`,
     params: { v1, v2 },
   })
+}
+
+/** 整库导出（GET /projects/{id}/export -> zip blob；PM-02）。 */
+export async function exportProjectZip(projectId: string): Promise<Blob> {
+  // 直接走 client（responseType=blob）：zip 非信封响应，绕开 request 的 data 解包
+  const response = await client.request<Blob>({
+    method: 'get',
+    url: `/projects/${projectId}/export`,
+    responseType: 'blob',
+  })
+  return response.data
 }

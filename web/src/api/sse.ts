@@ -91,8 +91,11 @@ export function useRunEvents(runId: string, options: UseRunEventsOptions): RunEv
   const open = (): void => {
     if (disposed) return
     source?.close()
-    // 浏览器自动携带 Last-Event-ID（= 最后帧 id）；首连为全量重放
-    const es = new EventSource(`/api/v1/runs/${runId}/events`)
+    // 断点续传（QA-05）：主动重建会新建 EventSource，浏览器不会为「新实例」携带
+    // Last-Event-ID，故显式以 after_seq=lastSeq 让后端从断点重放（首连 lastSeq=0
+    // 即全量重放）；同一实例的原生自动重连仍由浏览器携带 Last-Event-ID 处理。
+    const suffix = lastSeq.value > 0 ? `?after_seq=${lastSeq.value}` : ''
+    const es = new EventSource(`/api/v1/runs/${runId}/events${suffix}`)
     source = es
     setStatus('connecting')
     for (const type of EVENT_TYPES) {

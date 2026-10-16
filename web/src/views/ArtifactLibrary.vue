@@ -8,6 +8,7 @@ import { useRoute } from 'vue-router'
 
 import DiffView from '@/components/DiffView.vue'
 import MarkdownView from '@/components/MarkdownView.vue'
+import { exportProjectZip } from '@/api/artifacts'
 import { useArtifactsStore } from '@/stores/artifacts'
 import { useProjectsStore } from '@/stores/projects'
 import type { Artifact, ArtifactVersion } from '@/api/types'
@@ -88,20 +89,60 @@ function formatSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
+
+/** 导出项目整库 zip（PM-02：GET /projects/{id}/export）。 */
+const exporting = ref(false)
+
+async function onExport(): Promise<void> {
+  if (!projectId.value) return
+  exporting.value = true
+  try {
+    const blob = await exportProjectZip(projectId.value)
+    downloadBlob(blob, `ymir-${projectId.value.slice(0, 8)}.zip`)
+    ElMessage.success('导出完成')
+  } catch (e) {
+    ElMessage.error(`导出失败：${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    exporting.value = false
+  }
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
 </script>
 
 <template>
   <div class="artifact-library">
     <div class="library-header">
       <h2 class="library-title">产物库</h2>
-      <el-select v-model="projectId" placeholder="选择项目" style="width: 280px">
-        <el-option
-          v-for="project in projectsStore.items"
-          :key="project.id"
-          :label="project.name"
-          :value="project.id"
-        />
-      </el-select>
+      <div class="header-actions">
+        <el-select v-model="projectId" placeholder="选择项目" style="width: 280px">
+          <el-option
+            v-for="project in projectsStore.items"
+            :key="project.id"
+            :label="project.name"
+            :value="project.id"
+          />
+        </el-select>
+        <el-button
+          size="small"
+          type="primary"
+          plain
+          :disabled="!projectId"
+          :loading="exporting"
+          @click="onExport"
+        >
+          导出 zip
+        </el-button>
+      </div>
     </div>
 
     <div class="library-body">
@@ -237,6 +278,12 @@ function formatSize(bytes: number): string {
   font-weight: 600;
   color: #303133;
   margin: 0;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .library-body {

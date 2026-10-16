@@ -7,13 +7,15 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
 import * as systemApi from '@/api/system'
-import type { HealthData, ModelsOut, UsageOut } from '@/api/types'
+import { fetchSandboxes } from '@/api/sandboxes'
+import type { HealthData, ModelsOut, SandboxSession, UsageOut } from '@/api/types'
 import { messageOf } from './projects'
 
 export const useSystemStore = defineStore('system', () => {
   const health = ref<HealthData | null>(null)
   const models = ref<ModelsOut | null>(null)
   const usage = ref<UsageOut | null>(null)
+  const sandboxes = ref<SandboxSession[]>([])
   const healthLoading = ref(false)
   const healthError = ref<string | null>(null)
   const usageScope = ref<'global' | 'run' | 'project'>('global')
@@ -43,6 +45,15 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
+  /** 沙箱会话状态（PM-09；可按 run 过滤）。 */
+  async function loadSandboxes(runId?: string): Promise<void> {
+    try {
+      sandboxes.value = await fetchSandboxes(runId)
+    } catch (e) {
+      healthError.value = messageOf(e)
+    }
+  }
+
   /** 用量统计（默认 global；可传 run / project 口径）。 */
   async function loadUsage(
     scope: 'global' | 'run' | 'project' = usageScope.value,
@@ -56,5 +67,17 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
-  return { health, models, usage, healthLoading, healthError, usageScope, probeHealth, loadModels, loadUsage }
+  return {
+    health,
+    models,
+    usage,
+    sandboxes,
+    healthLoading,
+    healthError,
+    usageScope,
+    probeHealth,
+    loadModels,
+    loadSandboxes,
+    loadUsage,
+  }
 })

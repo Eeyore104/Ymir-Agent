@@ -16,6 +16,7 @@ const usageProjectId = ref('')
 onMounted(async () => {
   await systemStore.probeHealth()
   await systemStore.loadModels()
+  await systemStore.loadSandboxes()
   await refreshUsage()
 })
 
@@ -29,6 +30,12 @@ async function refreshUsage(): Promise<void> {
 
 function formatCost(cost: number): string {
   return `¥${cost.toFixed(4)}`
+}
+
+function formatTime(iso: string | null): string {
+  if (!iso) return '-'
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false })
 }
 </script>
 
@@ -107,6 +114,57 @@ function formatCost(cost: number): string {
           </el-table-column>
         </el-table>
       </template>
+    </el-card>
+
+    <!-- 路由候选链 / 预算红线（PM-09） -->
+    <el-card shadow="never" class="panel">
+      <template #header><strong>路由候选链 / 预算红线</strong></template>
+      <template v-if="systemStore.models">
+        <div class="muted section-sub">路由候选链（tier → 模型，按降级优先级）</div>
+        <div v-for="(chain, tier) in systemStore.models.routing" :key="tier" class="routing-row">
+          <el-tag size="small" effect="plain">{{ tier }}</el-tag>
+          <span class="routing-chain">{{ chain.join(' → ') }}</span>
+        </div>
+        <div v-if="Object.keys(systemStore.models.routing).length === 0" class="muted">（未配置路由）</div>
+
+        <div class="muted section-sub">预算红线</div>
+        <div class="budget-grid">
+          <div class="budget-item">
+            <div class="budget-value">{{ systemStore.models.budget.per_run_tokens }}</div>
+            <div class="budget-label">单 run token 上限</div>
+          </div>
+          <div class="budget-item">
+            <div class="budget-value">¥{{ systemStore.models.budget.per_day_cost_cny }}</div>
+            <div class="budget-label">全局日成本上限</div>
+          </div>
+        </div>
+      </template>
+      <el-empty v-else description="暂无网关配置" :image-size="60" />
+    </el-card>
+
+    <!-- 沙箱状态（PM-09） -->
+    <el-card shadow="never" class="panel">
+      <template #header>
+        <div class="card-header">
+          <strong>沙箱状态</strong>
+          <el-button size="small" @click="systemStore.loadSandboxes()">刷新</el-button>
+        </div>
+      </template>
+      <el-table v-if="systemStore.sandboxes.length > 0" :data="systemStore.sandboxes" border size="small">
+        <el-table-column prop="image" label="镜像 / 后端" min-width="150" show-overflow-tooltip />
+        <el-table-column label="隔离后端" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.image === 'local'" size="small" type="warning">Local 降级</el-tag>
+            <el-tag v-else size="small" type="success">Docker</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="status" label="状态" width="110" />
+        <el-table-column prop="run_id" label="Run" min-width="150" show-overflow-tooltip />
+        <el-table-column label="创建时间" width="180">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-else description="暂无沙箱会话" :image-size="60" />
     </el-card>
 
     <!-- 用量 -->
@@ -196,6 +254,49 @@ function formatCost(cost: number): string {
 
 .model-tag {
   margin: 2px 4px 2px 0;
+}
+
+.section-sub {
+  margin: 10px 0 6px;
+  font-weight: 600;
+}
+
+.routing-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+
+.routing-chain {
+  font-size: 13px;
+  color: #303133;
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+}
+
+.budget-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.budget-item {
+  padding: 14px;
+  background: #f5f7fa;
+  border-radius: 6px;
+  text-align: center;
+}
+
+.budget-value {
+  font-size: 20px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.budget-label {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #909399;
 }
 
 .usage-controls {

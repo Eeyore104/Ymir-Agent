@@ -40,6 +40,8 @@ export interface Run {
   current_stage_id: string | null
   context: Record<string, unknown>
   error: string | null
+  /** 失败/暂停业务错误码（§6.3：1004 预算 / 1005 沙箱 / 1006 模型…；PM-10）。 */
+  error_code?: number | null
   started_at: string | null
   finished_at: string | null
   created_at: string
@@ -143,7 +145,7 @@ export interface RunBrief {
   current_stage_id: string | null
 }
 
-/** 审批记录（列表项，含 run 摘要）。 */
+/** 审批记录（列表项，含 run 摘要 + 历史反馈链）。 */
 export interface Approval {
   id: string
   run_id: string
@@ -157,6 +159,8 @@ export interface Approval {
   decided_at: string | null
   created_at: string
   run?: RunBrief
+  /** 历史反馈链（列表接口已内联；PM-12）。 */
+  feedback_history?: FeedbackItem[]
 }
 
 /** 历史反馈链条目。 */
@@ -262,6 +266,8 @@ export interface EvalDimension {
   evidence: EvalEvidence[]
   cost_cny: number
   tokens: number
+  /** 该维度是否降级（评估器异常 / 沙箱不可用，分数不可信；QA-10）。 */
+  degraded?: boolean
 }
 
 /** 单任务评测结果。 */
@@ -294,4 +300,15 @@ export interface EvaluationReport {
   cost_cny: number
   total_tokens: number
   wall_time_ms: number
+}
+
+/** 沙箱会话（GET /sandboxes；§3.5）。 */
+export interface SandboxSession {
+  id: string
+  run_id: string
+  container_id: string | null
+  image: string
+  status: string
+  created_at: string
+  destroyed_at: string | null
 }

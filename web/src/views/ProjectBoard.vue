@@ -4,7 +4,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 
 import { useProjectsStore } from '@/stores/projects'
 import { useRunsStore } from '@/stores/runs'

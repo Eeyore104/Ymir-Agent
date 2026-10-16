@@ -26,6 +26,11 @@ export function fetchProjectEvaluations(projectId: string): Promise<EvaluationSu
   }).then((data) => data?.items ?? [])
 }
 
+/** 评测报告详情（GET /evaluations/{id}，按报告产物 ID 读取四维报告）。 */
+export function fetchEvaluationDetail(artifactId: string): Promise<EvaluationReport> {
+  return request<EvaluationReport>({ method: 'get', url: `/evaluations/${artifactId}` })
+}
+
 /** 发起评测（对项目某产物版本跑套件）。 */
 export function runEvaluation(
   projectId: string,

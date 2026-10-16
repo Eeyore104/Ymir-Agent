@@ -1,39 +1,72 @@
 <!--
   评测报告（/evaluation）：四维评分 + 证据链 + 通过判定（§12.3）。
 
-  数据源：后端评测报告一等产物（``type=report``）。列表经 ``/evaluations``（全局）
-  或 ``/projects/{id}/evaluations``（项目）；正文经产物内容接口读取
-  ``evaluation_report.json`` 结构化渲染。
+  数据源：后端评测报告一等产物（§12.4）。列表经 ``/evaluations``（全局）或
+  ``/projects/{id}/evaluations``（项目）；**详情经 ``GET /evaluations/{id}``**。
+  工具栏 / 空态可「发起四维评测」（POST /projects/{id}/evaluations，PM-07）。
+
+  降级维度（degraded=true，评估器异常 / 沙箱不可用）显著标记（QA-10 / PM-07）。
 -->
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 
-import { fetchVersionContent } from '@/api/artifacts'
-import { fetchEvaluations, fetchProjectEvaluations } from '@/api/evaluations'
+import {
+  fetchEvaluationDetail,
+  fetchEvaluations,
+  fetchProjectEvaluations,
+  runEvaluation,
+} from '@/api/evaluations'
+import { useProjectsStore } from '@/stores/projects'
 import type { EvaluationReport, EvaluationSummary } from '@/api/types'
 
 const route = useRoute()
 const router = useRouter()
+const projectsStore = useProjectsStore()
 
-const projectId = typeof route.query.project_id === 'string' ? route.query.project_id : ''
+/** 路由携带的项目上下文（有则列表按项目、发起评测锁定该项目）。 */
+const scopedProjectId = typeof route.query.project_id === 'string' ? route.query.project_id : ''
 
 const summaries = ref<EvaluationSummary[]>([])
 const loading = ref(false)
 const detail = ref<EvaluationReport | null>(null)
 const selected = ref<EvaluationSummary | null>(null)
+const detailLoading = ref(false)
+const detailError = ref<string | null>(null)
 
-onMounted(loadList)
+/** 发起评测弹窗。 */
+const dialogVisible = ref(false)
+const submitting = ref(false)
+const form = ref({
+  projectId: scopedProjectId,
+  artifactName: 'code',
+  suiteId: 'default',
+  version: '',
+})
+
+/** 报告中是否存在降级维度（分数不可信，需前端提示）。 */
+const anyDegraded = computed<boolean>(
+  () =>
+    detail.value?.tasks.some((task) => task.dimensions.some((dim) => dim.degraded)) ?? false,
+)
+
+onMounted(async () => {
+  await projectsStore.loadProjects()
+  if (!form.value.projectId) form.value.projectId = projectsStore.items[0]?.id ?? ''
+  await loadList()
+})
 
 async function loadList(): Promise<void> {
   loading.value = true
   try {
-    summaries.value = projectId
-      ? await fetchProjectEvaluations(projectId)
+    summaries.value = scopedProjectId
+      ? await fetchProjectEvaluations(scopedProjectId)
       : await fetchEvaluations()
     if (summaries.value.length > 0) {
       await open(summaries.value[0])
+    } else {
+      detail.value = null
+      selected.value = null
     }
   } catch (e) {
     ElMessage.error(`加载评测列表失败：${e instanceof Error ? e.message : String(e)}`)
@@ -42,15 +75,53 @@ async function loadList(): Promise<void> {
   }
 }
 
+/** 打开报告详情（GET /evaluations/{id}；失败 -> 内联错误态 + 重试）。 */
 async function open(row: EvaluationSummary): Promise<void> {
   selected.value = row
+  detailLoading.value = true
+  detailError.value = null
   try {
-    const content = await fetchVersionContent(row.artifact_id, row.version, 'evaluation_report.json')
-    const raw = content.content ?? ''
-    detail.value = raw ? (JSON.parse(raw) as EvaluationReport) : null
+    detail.value = await fetchEvaluationDetail(row.artifact_id)
   } catch (e) {
     detail.value = null
-    ElMessage.error(`加载报告正文失败：${e instanceof Error ? e.message : String(e)}`)
+    detailError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+function retryDetail(): void {
+  if (selected.value) void open(selected.value)
+}
+
+function openDialog(): void {
+  form.value.projectId = form.value.projectId || projectsStore.items[0]?.id || ''
+  dialogVisible.value = true
+}
+
+/** 发起四维评测（POST /projects/{id}/evaluations）。 */
+async function submitEvaluation(): Promise<void> {
+  if (!form.value.projectId) {
+    ElMessage.warning('请先选择项目')
+    return
+  }
+  submitting.value = true
+  try {
+    const report = await runEvaluation(form.value.projectId, {
+      suite_id: form.value.suiteId.trim() || 'default',
+      artifact_name: form.value.artifactName.trim() || 'code',
+      version: form.value.version.trim() ? Number(form.value.version) : null,
+      save: true,
+    })
+    ElMessage.success(
+      `评测完成：总分 ${report.total_score.toFixed(2)}（${report.passed ? '通过' : '未通过'}）`,
+    )
+    dialogVisible.value = false
+    await loadList()
+  } catch (e) {
+    ElMessage.error(`发起评测失败：${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    submitting.value = false
   }
 }
 
@@ -61,7 +132,7 @@ function formatTime(iso: string | null): string {
 }
 
 function gotoArtifacts(): void {
-  void router.push(projectId ? `/artifacts?project_id=${projectId}` : '/artifacts')
+  void router.push(scopedProjectId ? `/artifacts?project_id=${scopedProjectId}` : '/artifacts')
 }
 </script>
 
@@ -69,14 +140,18 @@ function gotoArtifacts(): void {
   <div v-loading="loading" class="eval-report">
     <div class="page-header">
       <h2 class="page-title">评测报告</h2>
-      <el-button size="small" @click="loadList">刷新</el-button>
+      <div class="header-actions">
+        <el-button type="primary" size="small" @click="openDialog">发起四维评测</el-button>
+        <el-button size="small" @click="loadList">刷新</el-button>
+      </div>
     </div>
 
     <el-empty
       v-if="summaries.length === 0"
-      description="暂无评测报告（在项目看板发起运行后，或对产物发起评测）"
+      description="暂无评测报告（可对项目产物发起评测）"
     >
-      <el-button type="primary" @click="gotoArtifacts">前往产物库</el-button>
+      <el-button type="primary" @click="openDialog">立即评测</el-button>
+      <el-button @click="gotoArtifacts">前往产物库</el-button>
     </el-empty>
 
     <template v-else>
@@ -101,7 +176,30 @@ function gotoArtifacts(): void {
         </el-table>
       </el-card>
 
+      <!-- 详情加载失败：内联错误态 + 重试（PM-11） -->
+      <el-alert
+        v-if="detailError"
+        type="error"
+        :closable="false"
+        show-icon
+        title="加载报告详情失败"
+        :description="detailError"
+      >
+        <template #default>
+          <el-button size="small" type="primary" @click="retryDetail">重试</el-button>
+        </template>
+      </el-alert>
+
       <template v-if="detail">
+        <el-alert
+          v-if="anyDegraded"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="存在降级维度"
+          description="部分维度因评估器异常或沙箱不可用而降级（标记「降级」），其分数仅供参考。"
+        />
+
         <el-card shadow="never" class="panel">
           <template #header>
             <div class="card-header">
@@ -154,6 +252,7 @@ function gotoArtifacts(): void {
               />
               <span class="dimension-score">{{ dim.score.toFixed(2) }}</span>
               <el-tag size="small" effect="plain">权重 {{ (dim.weight * 100).toFixed(0) }}%</el-tag>
+              <el-tag v-if="dim.degraded" size="small" type="warning" effect="dark">降级</el-tag>
             </div>
             <div class="dimension-rationale">{{ dim.rationale }}</div>
             <ul class="evidence-list">
@@ -167,6 +266,40 @@ function gotoArtifacts(): void {
         </el-card>
       </template>
     </template>
+
+    <!-- 发起评测弹窗 -->
+    <el-dialog v-model="dialogVisible" title="发起四维评测" width="520px">
+      <el-form label-width="90px">
+        <el-form-item label="项目">
+          <el-select
+            v-model="form.projectId"
+            :disabled="!!scopedProjectId"
+            placeholder="选择项目"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="project in projectsStore.items"
+              :key="project.id"
+              :label="project.name"
+              :value="project.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="目标产物">
+          <el-input v-model="form.artifactName" placeholder="code" />
+        </el-form-item>
+        <el-form-item label="评测套件">
+          <el-input v-model="form.suiteId" placeholder="default" />
+        </el-form-item>
+        <el-form-item label="版本">
+          <el-input v-model="form.version" placeholder="留空 = 最新版本" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="submitting" @click="submitEvaluation">发起评测</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -181,6 +314,11 @@ function gotoArtifacts(): void {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .page-title {

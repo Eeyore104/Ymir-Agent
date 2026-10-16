@@ -9,7 +9,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
-import type { ApprovalDecision, ApprovalDetail, ArtifactRef } from '@/api/types'
+import type { Approval, ApprovalDecision, ArtifactRef, FeedbackItem } from '@/api/types'
 import {
   APPROVAL_STATUS_LABELS,
   APPROVAL_STATUS_TAG_TYPES,
@@ -19,8 +19,8 @@ import {
 } from '@/constants'
 
 interface Props {
-  /** 审批详情（含 run 摘要与历史反馈链）；null 时渲染空态。 */
-  approval: ApprovalDetail | null
+  /** 审批记录（含 run 摘要与历史反馈链）；null 时渲染空态。 */
+  approval: Approval | null
   /** 决策请求进行中（父组件 Store 的 deciding）。 */
   deciding?: boolean
 }
@@ -99,9 +99,12 @@ function formatTime(iso: string | null): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false })
 }
 
-function feedbackFrom(item: ApprovalDetail['feedback_history'][number]): string {
+function feedbackFrom(item: FeedbackItem): string {
   return `${item.from_role ?? '-'} → ${item.to_role ?? '-'}`
 }
+
+/** 历史反馈链（列表接口已内联；缺省空数组）。 */
+const feedbackHistory = computed<FeedbackItem[]>(() => props.approval?.feedback_history ?? [])
 </script>
 
 <template>
@@ -149,11 +152,11 @@ function feedbackFrom(item: ApprovalDetail['feedback_history'][number]): string 
     </div>
 
     <!-- 历史反馈链（历次驳回 -> 修订 的轨迹） -->
-    <div v-if="approval.feedback_history.length > 0" class="section">
+    <div v-if="feedbackHistory.length > 0" class="section">
       <div class="section-title">历史反馈链</div>
       <el-timeline>
         <el-timeline-item
-          v-for="item in approval.feedback_history"
+          v-for="item in feedbackHistory"
           :key="item.id"
           size="normal"
           :timestamp="formatTime(item.created_at)"

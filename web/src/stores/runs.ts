@@ -7,6 +7,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import * as runsApi from '@/api/runs'
+import { BizError } from '@/api/client'
 import type { RunEvent } from '@/api/sse'
 import type { Run, RunAction, RunCreatePayload, RunMessage } from '@/api/types'
 import { STAGE_META, type StageState } from '@/constants'
@@ -42,6 +43,8 @@ export const useRunsStore = defineStore('runs', () => {
   const stageArtifacts = ref<Record<string, StageArtifact[]>>({})
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** 最近一次加载失败的业务码（PM-11：区分「run 不存在 1002」与其它失败）。 */
+  const errorCode = ref<number | null>(null)
 
   /** 阶段看板（STAGE_META × 实时状态 × 产物）。 */
   const stages = computed<StageView[]>(() =>
@@ -101,6 +104,7 @@ export const useRunsStore = defineStore('runs', () => {
   async function loadRun(runId: string): Promise<Run | null> {
     loading.value = true
     error.value = null
+    errorCode.value = null
     try {
       const run = await runsApi.fetchRun(runId)
       // 切换 run 才重置看板与日志并做首帧回填（同一 run 的重复刷新不清空，
@@ -117,6 +121,7 @@ export const useRunsStore = defineStore('runs', () => {
       return run
     } catch (e) {
       error.value = messageOf(e)
+      errorCode.value = e instanceof BizError ? e.code : null
       return null
     } finally {
       loading.value = false
@@ -148,8 +153,10 @@ export const useRunsStore = defineStore('runs', () => {
     }
   }
 
-  /** 消费一条 SSE 事件：追加日志 + 推进阶段看板。 */
+  /** 消费一条 SSE 事件：按 seq 去重后追加日志 + 推进阶段看板。 */
   function ingestEvent(event: RunEvent): void {
+    // 去重（QA-05）：断线重建后「全量重放 × 实时帧」可能重复投递同 seq 事件
+    if (events.value.some((e) => e.seq === event.seq)) return
     events.value = [...events.value, event].slice(-EVENT_LOG_LIMIT)
     const payload = event.payload ?? {}
     const stageId = typeof payload.stage_id === 'string' ? payload.stage_id : null
@@ -214,6 +221,7 @@ export const useRunsStore = defineStore('runs', () => {
     messages.value = []
     resetStageBoard()
     error.value = null
+    errorCode.value = null
   }
 
   return {
@@ -222,6 +230,7 @@ export const useRunsStore = defineStore('runs', () => {
     events,
     loading,
     error,
+    errorCode,
     stages,
     isTerminal,
     loadRun,

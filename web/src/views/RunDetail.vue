@@ -8,23 +8,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessage } from 'element-plus'
 
 import ApprovalCard from '@/components/ApprovalCard.vue'
+import ArtifactViewDialog from '@/components/ArtifactViewDialog.vue'
 import LogStream from '@/components/LogStream.vue'
-import MarkdownView from '@/components/MarkdownView.vue'
 import StageStepper from '@/components/StageStepper.vue'
 import { useRunEvents, type RunEvent, type SseStatus } from '@/api/sse'
 import { useApprovalsStore } from '@/stores/approvals'
-import { useArtifactsStore } from '@/stores/artifacts'
 import { useRunsStore } from '@/stores/runs'
 import { RUN_MODE_LABELS, RUN_STATUS_LABELS, RUN_STATUS_TAG_TYPES } from '@/constants'
-import type { ApprovalDetail, ArtifactContent, RunAction, RunMessage } from '@/api/types'
+import type { ApprovalDetail, RunAction, RunMessage } from '@/api/types'
 
 const route = useRoute()
 const runsStore = useRunsStore()
 const approvalsStore = useApprovalsStore()
-const artifactsStore = useArtifactsStore()
 
 const runId = String(route.params.id)
 
@@ -145,33 +142,36 @@ async function onAction(action: RunAction): Promise<void> {
   }
 }
 
-/** 阶段产物查看对话框。 */
+/** 阶段产物查看对话框（共享 ArtifactViewDialog；PM-08）。 */
 const artifactDialogVisible = ref(false)
+const artifactDialogId = ref('')
+const artifactDialogVersion = ref<number | null>(null)
 const artifactDialogTitle = ref('')
-const selectedPath = ref<string | null>(null)
 
-async function onSelectArtifact(artifactId: string): Promise<void> {
+function onSelectArtifact(artifactId: string): void {
   const artifact = runsStore.stages
     .flatMap((s) => s.artifacts)
     .find((a) => a.artifact_id === artifactId)
+  artifactDialogId.value = artifactId
+  artifactDialogVersion.value = artifact?.version ?? null
   artifactDialogTitle.value = artifact ? `${artifact.name} v${artifact.version}` : artifactId
-  selectedPath.value = null
   artifactDialogVisible.value = true
-  if (artifact) {
-    await artifactsStore.loadVersionContent(artifactId, artifact.version)
-  }
 }
 
-async function onSelectFile(path: string): Promise<void> {
-  const artifact = runsStore.stages
-    .flatMap((s) => s.artifacts)
-    .find((a) => a.artifact_id === artifactsStore.content?.artifact_id)
-  if (!artifact) return
-  selectedPath.value = path
-  await artifactsStore.loadVersionContent(artifact.artifact_id, artifact.version, path)
+/** 业务错误码中文标签（PM-10：run 失败码透传展示）。 */
+const ERROR_CODE_LABELS: Record<number, string> = {
+  1001: '参数错误',
+  1002: '资源不存在',
+  1003: '状态冲突',
+  1004: '预算超限',
+  1005: '沙箱错误',
+  1006: '模型调用失败',
+  500: '服务端错误',
 }
 
-const content = computed<ArtifactContent | null>(() => artifactsStore.content)
+function errorCodeLabel(code: number): string {
+  return `${code} · ${ERROR_CODE_LABELS[code] ?? '未知错误'}`
+}
 
 function formatTime(iso: string | null): string {
   if (!iso) return '-'
@@ -182,6 +182,17 @@ function formatTime(iso: string | null): string {
 
 <template>
   <div v-loading="runsStore.loading" class="run-detail">
+    <!-- 加载错误横幅（PM-11：区分「run 不存在」与「运行失败」） -->
+    <el-alert
+      v-if="runsStore.error"
+      class="run-load-error"
+      :type="runsStore.errorCode === 1002 ? 'warning' : 'error'"
+      :closable="false"
+      show-icon
+      :title="runsStore.errorCode === 1002 ? '运行不存在' : '加载运行失败'"
+      :description="runsStore.error"
+    />
+
     <!-- 头部：状态 + 动作 -->
     <div class="run-header">
       <div class="run-title">
@@ -211,7 +222,12 @@ function formatTime(iso: string | null): string {
       <el-descriptions-item label="启动时间">{{ formatTime(run.started_at) }}</el-descriptions-item>
       <el-descriptions-item label="结束时间">{{ formatTime(run.finished_at) }}</el-descriptions-item>
       <el-descriptions-item v-if="run.error" label="错误" :span="2">
-        <span class="run-error">{{ run.error }}</span>
+        <div class="run-error-row">
+          <el-tag v-if="run.error_code" size="small" type="danger" effect="dark">
+            {{ errorCodeLabel(run.error_code) }}
+          </el-tag>
+          <span class="run-error">{{ run.error }}</span>
+        </div>
       </el-descriptions-item>
     </el-descriptions>
 
@@ -261,30 +277,13 @@ function formatTime(iso: string | null): string {
       </el-timeline>
     </el-card>
 
-    <!-- 阶段产物查看 -->
-    <el-dialog v-model="artifactDialogVisible" :title="artifactDialogTitle" width="720px">
-      <div class="artifact-dialog">
-        <div class="file-list">
-          <div class="file-list-title">文件清单</div>
-          <div v-if="!content?.files?.length" class="panel-empty">（空产物）</div>
-          <el-button
-            v-for="file in content?.files ?? []"
-            :key="file"
-            link
-            :type="selectedPath === file ? 'primary' : 'info'"
-            @click="onSelectFile(file)"
-          >
-            {{ file }}
-          </el-button>
-        </div>
-        <div class="file-content">
-          <div class="file-list-title">
-            {{ selectedPath ? `内容：${selectedPath}` : '选择文件查看内容' }}
-          </div>
-          <MarkdownView :content="selectedPath ? content?.content ?? '' : ''" :loading="artifactsStore.loading" />
-        </div>
-      </div>
-    </el-dialog>
+    <!-- 阶段产物查看（共享对话框） -->
+    <ArtifactViewDialog
+      v-model:visible="artifactDialogVisible"
+      :artifact-id="artifactDialogId"
+      :version="artifactDialogVersion"
+      :title="artifactDialogTitle"
+    />
   </div>
 </template>
 
@@ -330,6 +329,17 @@ function formatTime(iso: string | null): string {
   word-break: break-all;
 }
 
+.run-error-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.run-load-error {
+  margin-bottom: 4px;
+}
+
 .panel {
   margin-top: 4px;
 }
@@ -358,32 +368,5 @@ function formatTime(iso: string | null): string {
   color: #303133;
   white-space: pre-wrap;
   word-break: break-all;
-}
-
-.artifact-dialog {
-  display: grid;
-  grid-template-columns: 220px 1fr;
-  gap: 16px;
-  max-height: 60vh;
-}
-
-.file-list {
-  border-right: 1px solid #ebeef5;
-  padding-right: 12px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.file-list-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: #606266;
-  margin-bottom: 8px;
-}
-
-.file-content {
-  overflow-y: auto;
 }
 </style>
