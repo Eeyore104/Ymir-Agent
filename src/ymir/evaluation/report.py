@@ -1,8 +1,18 @@
-"""评测报告一等产物（架构设计 §12.3、§12.4）。
+"""评测报告一等产物（架构设计 §12.3、§12.4；docs/07 §4.1.4 增量）。
 
 ``EvaluationReport`` 作为一等产物入库：``type=report``、带版本、可 diff
 （两次报告分数对比）。序列化为 ``evaluation_report.md``（人读）+
 ``evaluation_report.json``（机读，供前端 / 回归对比消费）。
+
+v1.1 增量（全部带缺省值，旧报告 JSON 缺字段仍可解析）：
+
+- ``TaskOut.status`` / ``skip_reason``：区分「未执行」与「未通过」，未执行任务
+  不进通过率分母（docs/07 §4.1.4、§14 跳过原因）；
+- ``TaskOut.scenario`` / ``project_id`` / ``run_id``：追溯与按场景聚合；
+- ``EvaluationReport.run_id`` / ``artifact_version`` / ``repair_round`` /
+  ``verdict_source``：报告追溯字段（R6 追溯纪律）；
+- ``executed`` / ``skipped`` 口径 + ``executed_count`` / ``skipped_count`` /
+  ``first_pass_rate`` / ``final_pass_rate``（分母 0 时为 ``None``，不返回 0）。
 """
 
 from __future__ import annotations
@@ -10,7 +20,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +29,19 @@ from ymir.evaluation.suite import Thresholds
 
 REPORT_ARTIFACT_NAME = "evaluation_report"
 REPORT_ARTIFACT_TYPE = "report"
+
+#: 任务执行状态（docs/07 §4.1.4）。``skipped`` 不算失败、不进通过率分母。
+STATUS_EVALUATED: str = "evaluated"
+STATUS_SKIPPED: str = "skipped"
+
+#: 跳过原因（docs/07 §14「跳过原因」唯一口径：unbound_task | missing_artifact | budget | not_run）
+SKIP_UNBOUND_TASK: str = "unbound_task"
+SKIP_MISSING_ARTIFACT: str = "missing_artifact"
+SKIP_BUDGET: str = "budget"
+SKIP_NOT_RUN: str = "not_run"
+
+TaskStatus = Literal["evaluated", "skipped"]
+VerdictSource = Literal["harness", "llm_qa"]
 
 
 def _utcnow_iso() -> str:
@@ -63,9 +86,19 @@ class DimensionOut(BaseModel):
 
 
 class TaskOut(BaseModel):
-    """单任务评测结果。"""
+    """单任务评测结果。
+
+    ``status="skipped"`` 表示该任务**未执行**（未绑定产物 / 产物缺失 / 预算耗尽），
+    此时 ``dimensions`` 为空、``total_score`` / ``runnability`` / ``cost_cny`` /
+    ``tokens`` 全为 0，且**不计入**通过率分母。
+    """
 
     id: str
+    scenario: str = ""
+    status: TaskStatus = STATUS_EVALUATED
+    skip_reason: str | None = None
+    project_id: str | None = None
+    run_id: str | None = None
     requirement: str = ""
     artifact_ref: dict[str, Any] = Field(default_factory=dict)
     dimensions: list[DimensionOut] = Field(default_factory=list)
@@ -83,6 +116,44 @@ class TaskOut(BaseModel):
                 return item
         return None
 
+    @property
+    def executed(self) -> bool:
+        """该任务是否真的执行过（``skipped`` 为未执行）。"""
+        return self.status == STATUS_EVALUATED
+
+    @classmethod
+    def skipped_task(
+        cls,
+        task_id: str,
+        *,
+        reason: str,
+        requirement: str = "",
+        scenario: str = "",
+        project_id: str | None = None,
+        run_id: str | None = None,
+        thresholds: dict[str, float] | None = None,
+        wall_time_ms: int = 0,
+    ) -> TaskOut:
+        """构造「未执行」任务结果（无沙箱、无 judge、零成本）。"""
+        return cls(
+            id=task_id,
+            scenario=scenario,
+            status=STATUS_SKIPPED,
+            skip_reason=reason,
+            project_id=project_id,
+            run_id=run_id,
+            requirement=requirement,
+            artifact_ref={"artifact_id": None, "name": None, "version": None},
+            dimensions=[],
+            total_score=0.0,
+            runnability=0.0,
+            passed=False,
+            thresholds=dict(thresholds or {}),
+            wall_time_ms=wall_time_ms,
+            cost_cny=0.0,
+            tokens=0,
+        )
+
 
 class EvaluationReport(BaseModel):
     """一次评测的完整报告（一等产物）。"""
@@ -90,6 +161,11 @@ class EvaluationReport(BaseModel):
     suite_id: str
     suite_version: str = "1.0"
     project_id: str | None = None
+    # --- 追溯字段（R6）：哪个 run、哪个产物版本、第几轮修复、裁决来源 ---
+    run_id: str | None = None
+    artifact_version: int | None = None
+    repair_round: int | None = None
+    verdict_source: VerdictSource = "harness"
     generated_at: str = Field(default_factory=_utcnow_iso)
     weights: dict[str, float] = Field(default_factory=dict)
     thresholds: dict[str, float] = Field(default_factory=dict)
@@ -100,6 +176,47 @@ class EvaluationReport(BaseModel):
     cost_cny: float = 0.0
     total_tokens: int = 0
     wall_time_ms: int = 0
+    # --- 汇总口径（分母 = executed；分母 0 时为 None，避免「0% 通过率」误读）---
+    executed_count: int = 0
+    skipped_count: int = 0
+    first_pass_rate: float | None = None
+    #: 派生字段，勿手写；单次报告 ``first_pass_rate == final_pass_rate``
+    #: （单次只评一个产物版本）；批量口径见 BaselineTable
+    final_pass_rate: float | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """构造后按 ``tasks`` 归算执行/跳过计数与通过率（派生字段，始终一致）。"""
+        self.refresh_summary()
+
+    def refresh_summary(self) -> None:
+        """按当前 ``tasks`` 重算汇总口径：恒重算，派生字段唯一写入口。
+
+        通过率**无条件**由 ``tasks`` 派生（分母 0 -> ``None``）：不允许任何调用方
+        预设数值，否则会出现 ``tasks[].passed=false`` 却 ``final_pass_rate=1.0``
+        的自相矛盾报告（违反 R6「任何分数必须可追溯」）。
+        """
+        executed = self.executed
+        self.executed_count = len(executed)
+        self.skipped_count = len(self.skipped)
+        if not executed:
+            self.first_pass_rate = None
+            self.final_pass_rate = None
+            return
+        rate = round(sum(1 for task in executed if task.passed) / len(executed), 6)
+        self.first_pass_rate = rate
+        self.final_pass_rate = rate
+
+    # ------------------------------------------------------------------ 口径
+
+    @property
+    def executed(self) -> list[TaskOut]:
+        """已执行任务（``status == evaluated``，通过率分母）。"""
+        return [task for task in self.tasks if task.status == STATUS_EVALUATED]
+
+    @property
+    def skipped(self) -> list[TaskOut]:
+        """未执行任务（``status == skipped``，不算失败、不进分母）。"""
+        return [task for task in self.tasks if task.status == STATUS_SKIPPED]
 
     # ------------------------------------------------------------------ 组装
 
@@ -114,15 +231,23 @@ class EvaluationReport(BaseModel):
         thresholds: Thresholds,
         tasks: Sequence[TaskOut],
         wall_time_ms: int,
+        run_id: str | None = None,
+        artifact_version: int | None = None,
+        repair_round: int | None = None,
+        verdict_source: VerdictSource = "harness",
     ) -> EvaluationReport:
-        """汇总报告：报告级总分 = 各任务均值；双门槛在报告级复核。"""
+        """汇总报告：报告级总分 = 各**已执行**任务均值；双门槛在报告级复核。
+
+        全为 ``evaluated`` 时与 v1.0 逐字节等价（分母集合不变）。
+        """
         task_list = list(tasks)
-        total = _mean([task.total_score for task in task_list])
-        runnability = _mean([task.runnability for task in task_list])
+        executed = [task for task in task_list if task.status == STATUS_EVALUATED]
+        total = _mean([task.total_score for task in executed])
+        runnability = _mean([task.runnability for task in executed])
         cost = round(sum(task.cost_cny for task in task_list), 6)
         tokens = sum(task.tokens for task in task_list)
         passed = (
-            bool(task_list)
+            bool(executed)
             and total >= thresholds.total
             and runnability >= thresholds.runnability
         )
@@ -130,6 +255,10 @@ class EvaluationReport(BaseModel):
             suite_id=suite_id,
             suite_version=suite_version,
             project_id=project_id,
+            run_id=run_id,
+            artifact_version=artifact_version,
+            repair_round=repair_round,
+            verdict_source=verdict_source,
             weights=weights,
             thresholds={"total": thresholds.total, "runnability": thresholds.runnability},
             tasks=task_list,
@@ -144,7 +273,11 @@ class EvaluationReport(BaseModel):
     # ------------------------------------------------------------------ 序列化
 
     def to_markdown(self) -> str:
-        """渲染为 Markdown 报告（维度分 + 证据链 + 通过判定）。"""
+        """渲染为 Markdown 报告（维度分 + 证据链 + 通过判定）。
+
+        「未执行」任务单独标注 ``skip_reason``，不与「未通过」混写；
+        未执行计数行仅在存在未执行任务时输出（全执行时与 v1.0 逐字节一致）。
+        """
         verdict = "✅ 通过" if self.passed else "❌ 未通过"
         lines: list[str] = [
             f"# 评测报告（{verdict}）",
@@ -160,8 +293,17 @@ class EvaluationReport(BaseModel):
             f"- 权重：{self._weights_text()}",
             "",
         ]
+        if self.skipped_count:
+            lines += [
+                f"- 已执行/未执行：{self.executed_count} / {self.skipped_count}"
+                f"（未执行不计入通过率分母）",
+                "",
+            ]
         for task in self.tasks:
-            state = "通过" if task.passed else "未通过"
+            if task.status == STATUS_SKIPPED:
+                state = f"未执行：{task.skip_reason or SKIP_NOT_RUN}"
+            else:
+                state = "通过" if task.passed else "未通过"
             lines += [
                 f"## 任务 `{task.id}`（{state}，总分 {task.total_score:.2f}）",
                 "",

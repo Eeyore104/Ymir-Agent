@@ -2,6 +2,9 @@
 
 纪律：judge 用 FakeJudge（0 真实调用）；沙箱用 FakeSandbox（不依赖 Docker）；
 套件用真实 ``evals/suites/default.yaml``（顺带回归套件结构）。
+
+v1.1（docs/07 §4.1 / T1.1）追加：任务 ↔ 产物绑定与「未执行」语义
+（``single`` 模式逐条回归 v1.0，``per_task`` 模式不跨项目取材）。
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from ymir.artifacts.store import ArtifactStore
 from ymir.common.errors import NotFoundError
@@ -32,6 +36,7 @@ from ymir.evaluation import (
     EvalTask,
     EvaluationHarness,
     EvaluationReport,
+    TaskOut,
     aggregate,
     normalize_weights,
     run_batch,
@@ -849,3 +854,525 @@ class TestArchitectureGraphAnalysis:
         )
         assert score.score == pytest.approx(94.0)
         assert any("分层违规" in item.detail for item in score.evidence)
+
+
+# --------------------------------------------------------------------- T1.1 绑定与跳过
+
+
+class SpyArtifactStore:
+    """产物库代理：记录 ``list_artifacts`` / ``load`` 调用（断言不跨项目取材）。
+
+    只代理 harness 用到的两个读方法，其余行为完全透传真实
+    :class:`ArtifactStore`，保证既有语义（版本不可变、血缘）不被测试替身改变。
+    """
+
+    def __init__(self, store: ArtifactStore) -> None:
+        self._store = store
+        self.listed: list[str] = []
+        self.loaded: list[str] = []
+
+    async def list_artifacts(self, project_id: str, **kwargs: Any) -> list[Any]:
+        self.listed.append(project_id)
+        return await self._store.list_artifacts(project_id, **kwargs)
+
+    async def load(self, artifact_id: str, version: int | None = None, **kwargs: Any) -> Any:
+        self.loaded.append(artifact_id)
+        return await self._store.load(artifact_id, version, **kwargs)
+
+
+def _limit() -> Any:
+    """默认双门槛（延迟导入，避免顶部 import 顺序变动）。"""
+    from ymir.evaluation.suite import Thresholds
+
+    return Thresholds()
+
+
+def _write_suite(directory: Path, suite_id: str, tasks: list[dict[str, Any]]) -> Path:
+    """落一个 per_task 套件到临时目录（结构同 ``benchmark-12``，2 条检查）。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{suite_id}.yaml"
+    payload = {
+        "id": suite_id,
+        "version": "1.1",
+        "description": "per_task 绑定语义回归用",
+        "binding_mode": "per_task",
+        "weights": {
+            REQUIREMENT: 0.3,
+            RUNNABILITY: 0.3,
+            CONVENTION: 0.2,
+            ARCHITECTURE: 0.2,
+        },
+        "thresholds": {"total": 75, "runnability": 60},
+        "tasks": tasks,
+    }
+    path.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return path
+
+
+def _task_spec(
+    task_id: str, *, project_id: str | None, scenario: str = "rest_crud"
+) -> dict[str, Any]:
+    """构造一条 per_task 任务声明（未绑定 -> 不写 project_id）。"""
+    spec: dict[str, Any] = {
+        "id": task_id,
+        "scenario": scenario,
+        "requirement": f"{task_id} 的需求",
+    }
+    if project_id is not None:
+        spec["project_id"] = project_id
+    spec["checks"] = [
+        {"type": "command", "run": "python -m pytest -q", "weight": 0.7},
+        {"type": "command", "run": "ruff check .", "weight": 0.3},
+    ]
+    return spec
+
+
+async def _new_project(session_factory, name: str) -> str:
+    async with session_factory() as session:
+        project = await ProjectRepository(session).create(name=name)
+        await session.commit()
+    return project.id
+
+
+class TestPerTaskBinding:
+    """``per_task`` 绑定语义（docs/07 §4.1.2）：不跨项目、不回退、不虚跑。"""
+
+    async def test_missing_artifact_skipped_without_cross_project(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_a = await _seed_project(store, session_factory)  # 有 code / prd / design
+        project_b = await _new_project(session_factory, "无 code 的项目")
+        await store.save(
+            project_id=project_b, name="prd", artifact_type="prd", files={"prd.json": PRD_JSON}
+        )
+        spy = SpyArtifactStore(store)
+        provider = FakeSandboxProvider()
+        judge = FakeJudge()
+        harness = EvaluationHarness(
+            store=spy, judge=judge, sandbox_provider=provider, session_factory=session_factory
+        )
+        suites_dir = tmp_path / "suites"
+        _write_suite(
+            suites_dir,
+            "per-task-demo",
+            [
+                _task_spec("t-a", project_id=project_a),
+                _task_spec("t-b", project_id=project_b, scenario="cli_tool"),
+            ],
+        )
+
+        report = await harness.run_suite(
+            "per-task-demo", project_id=project_a, suites_dir=suites_dir
+        )
+
+        first, second = report.tasks
+        # A 任务：用自己的产物正常评测
+        assert first.status == "evaluated"
+        assert first.artifact_ref["name"] == "code"
+        assert first.project_id == project_a
+        # B 任务：有绑定但无 code 产物 -> 未执行（不得借用 A 项目的产物）
+        assert second.status == "skipped"
+        assert second.skip_reason == "missing_artifact"
+        assert second.artifact_ref["name"] is None
+        assert second.artifact_ref["artifact_id"] is None
+        assert second.project_id == project_b
+        assert second.dimensions == []
+        assert second.total_score == 0.0
+        assert second.cost_cny == 0.0
+        assert second.tokens == 0
+        # spy：每任务恰取一次产物，且 project_id 与任务绑定一致（run_suite 的
+        # project_id 不参与解析 —— 否则 B 任务会取到 A 项目的 code）
+        assert spy.listed == [project_a, project_b]
+        assert report.executed_count == 1
+        assert report.skipped_count == 1
+        assert len(report.executed) == 1
+        assert len(report.skipped) == 1
+
+    async def test_unbound_task_skips_sandbox_judge_and_lookup(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_a = await _seed_project(store, session_factory)
+        spy = SpyArtifactStore(store)
+        provider = FakeSandboxProvider()
+        judge = FakeJudge()
+        harness = EvaluationHarness(
+            store=spy, judge=judge, sandbox_provider=provider, session_factory=session_factory
+        )
+        suites_dir = tmp_path / "suites"
+        _write_suite(suites_dir, "per-task-unbound", [_task_spec("t-x", project_id=None)])
+
+        report = await harness.run_suite(
+            "per-task-unbound", project_id=project_a, suites_dir=suites_dir
+        )
+
+        task = report.tasks[0]
+        assert task.status == "skipped"
+        assert task.skip_reason == "unbound_task"
+        assert task.artifact_ref["name"] is None
+        # 短路证明：不启沙箱 / 不调 judge / 不取任何产物（无跨项目取材）
+        assert provider.started == 0
+        assert judge.calls == []
+        assert spy.listed == []
+        assert task.cost_cny == 0.0
+
+    async def test_all_skipped_report_rates_are_none(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        await _seed_project(store, session_factory)
+        harness = EvaluationHarness(
+            store=store,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        suites_dir = tmp_path / "suites"
+        _write_suite(
+            suites_dir,
+            "per-task-empty",
+            [
+                _task_spec("t-x", project_id=None),
+                _task_spec("t-y", project_id=None, scenario="cli_tool"),
+            ],
+        )
+
+        report = await harness.run_suite("per-task-empty", suites_dir=suites_dir)
+
+        assert [task.skip_reason for task in report.tasks] == ["unbound_task", "unbound_task"]
+        assert report.executed_count == 0
+        assert report.skipped_count == 2
+        # Q3：分母为 0 时必须 None（不能返回 0，避免「0% 通过率」误读）
+        assert report.first_pass_rate is None
+        assert report.final_pass_rate is None
+        assert report.total_score == 0.0
+        assert report.passed is False
+        assert "未执行" in report.to_markdown()
+
+    async def test_task_ids_subset_keeps_suite_order(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_a = await _seed_project(store, session_factory)
+        harness = EvaluationHarness(
+            store=store,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        suites_dir = tmp_path / "suites"
+        _write_suite(
+            suites_dir,
+            "per-task-subset",
+            [
+                _task_spec("t-a", project_id=project_a),
+                _task_spec("t-b", project_id=project_a, scenario="cli_tool"),
+                _task_spec("t-c", project_id=project_a, scenario="data_cleaning"),
+            ],
+        )
+
+        report = await harness.run_suite(
+            "per-task-subset", suites_dir=suites_dir, task_ids=["t-c", "t-a"]
+        )
+
+        assert [task.id for task in report.tasks] == ["t-a", "t-c"]
+
+    async def test_single_mode_keeps_default_artifact_fallback(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        # v1.0 兼容红线：single 模式 artifact_name 未命中 -> 回退 code
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_id = await _seed_project(store, session_factory)
+        harness = EvaluationHarness(
+            store=store,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        single_suite = EvalSuite.load("default")
+
+        single = await harness.evaluate_task(
+            EvalTask(id="s1", requirement="x", artifact_name="no-such-artifact"),
+            project_id=project_id,
+            suite=single_suite,
+        )
+        assert single.status == "evaluated"
+        assert single.artifact_ref["name"] == "code"  # 回退生效（v1.0 行为）
+
+        per_task_suite = EvalSuite(id="tmp-per-task", binding_mode="per_task")
+        strict = await harness.evaluate_task(
+            EvalTask(id="s2", requirement="x", artifact_name="no-such-artifact"),
+            project_id=project_id,
+            suite=per_task_suite,
+        )
+        assert strict.status == "skipped"
+        assert strict.skip_reason == "missing_artifact"  # 永不回退 _DEFAULT_ARTIFACT
+
+    async def test_single_mode_missing_project_artifact_still_evaluates(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        # v1.0 行为：项目里连 code 都没有时仍产出「0 分报告」，不得改成 skipped
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_id = await _new_project(session_factory, "空产物项目")
+        harness = EvaluationHarness(
+            store=store,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        report = await harness.run_suite("default", project_id=project_id)
+        assert report.tasks[0].status == "evaluated"
+        assert report.tasks[0].artifact_ref["name"] is None
+        assert report.skipped_count == 0
+
+
+class TestReportBindingFields:
+    """报告新增字段的兼容性（旧 JSON 缺字段必须能按默认值解析）。"""
+
+    def test_legacy_json_parses_with_defaults(self) -> None:
+        legacy = {
+            "suite_id": "default",
+            "suite_version": "1.0",
+            "project_id": "p1",
+            "tasks": [
+                {
+                    "id": "t1",
+                    "requirement": "x",
+                    "total_score": 80.0,
+                    "runnability": 90.0,
+                    "passed": True,
+                }
+            ],
+            "total_score": 80.0,
+            "runnability": 90.0,
+            "passed": True,
+        }
+        report = EvaluationReport.model_validate(legacy)
+        task = report.tasks[0]
+        assert task.status == "evaluated"
+        assert task.skip_reason is None
+        assert task.scenario == ""
+        assert task.project_id is None
+        assert task.run_id is None
+        assert report.verdict_source == "harness"
+        assert report.run_id is None
+        assert report.artifact_version is None
+        assert report.repair_round is None
+        assert report.executed_count == 1
+        assert report.skipped_count == 0
+        assert report.first_pass_rate == pytest.approx(1.0)
+
+    def test_json_round_trip_keeps_binding_fields(self) -> None:
+        from ymir.evaluation.report import TaskOut
+
+        skipped = TaskOut.skipped_task(
+            "t1",
+            reason="missing_artifact",
+            scenario="rest_crud",
+            project_id="p-b",
+            run_id="run-b",
+        )
+        report = EvaluationReport.build(
+            suite_id="benchmark-12",
+            suite_version="1.1",
+            project_id=None,
+            weights=normalize_weights(None),
+            thresholds=_limit(),
+            tasks=[skipped],
+            wall_time_ms=0,
+            run_id="run-a",
+            artifact_version=2,
+            repair_round=1,
+            verdict_source="llm_qa",
+        )
+        parsed = EvaluationReport.model_validate(json.loads(report.to_json()))
+        assert parsed.run_id == "run-a"
+        assert parsed.artifact_version == 2
+        assert parsed.repair_round == 1
+        assert parsed.verdict_source == "llm_qa"
+        restored = parsed.tasks[0]
+        assert restored.status == "skipped"
+        assert restored.skip_reason == "missing_artifact"
+        assert restored.scenario == "rest_crud"
+        assert restored.project_id == "p-b"
+        assert restored.run_id == "run-b"
+        assert parsed.skipped_count == 1
+        assert parsed.first_pass_rate is None
+
+    def test_pass_rates_always_derived(self) -> None:
+        # 通过率是纯派生字段：即使外部先塞数字，refresh_summary() 必须纠正
+        passed = TaskOut(id="t1", total_score=90.0, runnability=90.0, passed=True)
+        failed = TaskOut(id="t2", total_score=10.0, runnability=10.0, passed=False)
+        report = EvaluationReport.build(
+            suite_id="benchmark-12",
+            suite_version="1.1",
+            project_id=None,
+            weights=normalize_weights(None),
+            thresholds=_limit(),
+            tasks=[passed, failed],
+            wall_time_ms=0,
+        )
+        assert report.executed_count == 2
+        assert report.first_pass_rate == pytest.approx(0.5)
+        assert report.final_pass_rate == pytest.approx(0.5)  # 单次报告两者恒等
+
+        tampered = report.model_copy(update={"first_pass_rate": 1.0, "final_pass_rate": 1.0})
+        assert tampered.first_pass_rate == pytest.approx(1.0)  # 已写入（证明字段可写）
+        tampered.refresh_summary()
+        assert tampered.first_pass_rate == pytest.approx(0.5)  # 被纠正回真值
+        assert tampered.final_pass_rate == pytest.approx(0.5)
+
+    def test_pass_rates_none_when_no_executed(self) -> None:
+        skipped = [
+            TaskOut.skipped_task("t1", reason="unbound_task"),
+            TaskOut.skipped_task("t2", reason="missing_artifact"),
+        ]
+        report = EvaluationReport.build(
+            suite_id="benchmark-12",
+            suite_version="1.1",
+            project_id=None,
+            weights=normalize_weights(None),
+            thresholds=_limit(),
+            tasks=skipped,
+            wall_time_ms=0,
+        )
+        assert report.executed_count == 0
+        assert report.skipped_count == 2
+        # Q3：分母 0 -> None（不得返回 0，避免「0% 通过率」误读）
+        assert report.first_pass_rate is None
+        assert report.final_pass_rate is None
+        report.refresh_summary()
+        assert report.first_pass_rate is None
+        assert report.final_pass_rate is None
+
+    def test_legacy_json_derives_rates(self) -> None:
+        # 旧报告 JSON 无 rates 字段：解析后必须由 tasks 派生（且不报错）
+        legacy = {
+            "suite_id": "default",
+            "suite_version": "1.0",
+            "tasks": [
+                {"id": "t1", "total_score": 90.0, "runnability": 90.0, "passed": True},
+                {"id": "t2", "total_score": 10.0, "runnability": 10.0, "passed": False},
+            ],
+        }
+        report = EvaluationReport.model_validate(legacy)
+        assert report.executed_count == 2
+        assert report.skipped_count == 0
+        assert report.first_pass_rate == pytest.approx(0.5)
+        assert report.final_pass_rate == pytest.approx(0.5)
+        # 与 tasks[].passed 自洽（防止派生值与明细脱钩）
+        passed_ratio = sum(1 for task in report.tasks if task.passed) / len(report.tasks)
+        assert report.first_pass_rate == round(passed_ratio, 6)
+
+    async def test_evaluate_project_shape_unchanged(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        # v1.0 兼容红线：evaluate_project 签名 / 返回 / 双门槛判定不变
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_id = await _seed_project(store, session_factory)
+        harness = EvaluationHarness(
+            store=store,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        report = await harness.evaluate_project(project_id, requirement="实现待办 API")
+        out = report.tasks[0]
+        assert out.id == f"project:{project_id}"
+        assert out.status == "evaluated"
+        assert out.artifact_ref["name"] == "code"
+        assert out.thresholds == {"total": 75.0, "runnability": 60.0}
+        assert report.skipped_count == 0
+        assert set(report.thresholds) == {"total", "runnability"}
+
+
+class TestNoCrossProjectLeakage:
+    """跨项目取材的长期回归保护（docs/07 §4.1.2「永不回退到其它项目」）。
+
+    与 ``TestPerTaskBinding`` 互补：那组验证「有绑定但产物缺失」，本组验证两条
+    更隐蔽的泄漏路径 ——
+
+    1. 任务未绑定却硬写了**别的项目**的 ``artifact_id``：仍须
+       ``unbound_task``，且产物库一次都不被读取（否则等于跨项目取材）；
+    2. ``skipped`` 任务的**整条序列化结果**（不只是 ``artifact_ref``）不得出现
+       其它项目的产物 id 与文件内容（防止将来把 references 写进报告）。
+    """
+
+    async def test_unbound_task_with_foreign_artifact_id_never_touches_store(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_a = await _seed_project(store, session_factory)
+        code_a = await store.latest_by_name(project_a, "code")
+        assert code_a is not None
+        spy = SpyArtifactStore(store)
+        provider = FakeSandboxProvider()
+        judge = FakeJudge()
+        harness = EvaluationHarness(
+            store=spy, judge=judge, sandbox_provider=provider, session_factory=session_factory
+        )
+        suites_dir = tmp_path / "suites"
+        hijacked = _task_spec("t-hijacked", project_id=None)
+        hijacked["artifact_id"] = code_a.artifact.id  # 指向 A 项目的 code（越权取材试探）
+        _write_suite(suites_dir, "per-task-hijacked", [hijacked])
+
+        report = await harness.run_suite(
+            "per-task-hijacked", project_id=project_a, suites_dir=suites_dir
+        )
+
+        out = report.tasks[0]
+        assert out.status == "skipped"
+        assert out.skip_reason == "unbound_task"
+        assert out.project_id is None
+        assert out.artifact_ref == {"artifact_id": None, "name": None, "version": None}
+        # 短路证明：产物库、沙箱、judge 三者均未被触达
+        assert spy.listed == []
+        assert spy.loaded == []
+        assert provider.started == 0
+        assert judge.calls == []
+        dumped = json.dumps(out.model_dump(mode="json"), ensure_ascii=False)
+        assert code_a.artifact.id not in dumped
+        assert "create_todo" not in dumped  # A 项目 code 的内容
+
+    async def test_skipped_task_payload_carries_no_foreign_content(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        project_a = await _seed_project(store, session_factory)  # 有 code
+        project_b = await _new_project(session_factory, "无 code 的项目")
+        await store.save(
+            project_id=project_b, name="prd", artifact_type="prd", files={"prd.json": PRD_JSON}
+        )
+        code_a = await store.latest_by_name(project_a, "code")
+        assert code_a is not None
+        spy = SpyArtifactStore(store)
+        harness = EvaluationHarness(
+            store=spy,
+            judge=FakeJudge(),
+            sandbox_provider=FakeSandboxProvider(),
+            session_factory=session_factory,
+        )
+        suites_dir = tmp_path / "suites"
+        _write_suite(
+            suites_dir,
+            "per-task-leak-check",
+            [
+                _task_spec("t-a", project_id=project_a),
+                _task_spec("t-b", project_id=project_b, scenario="cli_tool"),
+            ],
+        )
+
+        report = await harness.run_suite(
+            "per-task-leak-check", project_id=project_a, suites_dir=suites_dir
+        )
+
+        # 每任务只读自己的项目（run_suite 传入的 A 不参与 B 的解析）
+        assert spy.listed == [project_a, project_b]
+        skipped = report.tasks[1]
+        dumped = json.dumps(skipped.model_dump(mode="json"), ensure_ascii=False)
+        assert code_a.artifact.id not in dumped
+        for fragment in ("create_todo", "CODE_MAIN", "routes.py"):
+            assert fragment not in dumped

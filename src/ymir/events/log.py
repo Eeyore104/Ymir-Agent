@@ -31,3 +31,7 @@ class EventType(StrEnum):
     BUDGET_EXCEEDED = "budget.exceeded"
     # 评测（T05）
     EVALUATION_COMPLETED = "evaluation.completed"
+    # 裁决与修复（v1.1，docs/07 §4.6.1；T5.1 补齐其余三类）
+    EVALUATION_FAILED = "evaluation.failed"
+    REPAIR_STARTED = "repair.started"
+    REPAIR_EXHAUSTED = "repair.exhausted"

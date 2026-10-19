@@ -4,6 +4,11 @@
 - ``truncate_pipeline``：截断至目标阶段（单角色调试 / 分步演示）；
 - ``sync_pipeline``：定义快照版本化入 ``pipelines`` 表（id+version+tenant 幂等 upsert），
   为 v1.x 可视化编排留数据基础。
+
+v1.1 护栏（任务 #7）：YAML 1.1 会把**裸键** ``on`` 解析成布尔键 ``True``，导致流转边
+的事件名静默回退成缺省 ``stage_completed``（v1.0 因全部边都是主链事件而从未暴露）。
+加载期先做「非字符串键」检查并给出加引号提示，再交给 Pydantic（``extra="forbid"``
+兜住纯多余键），双层拒绝而不是静默修正 —— 配置错误必须显式报出来。
 """
 
 from __future__ import annotations
@@ -23,6 +28,31 @@ from ymir.sop.validator import SopDefinitionError, SopValidator
 
 DEFAULT_PIPELINES_DIR = PROJECT_ROOT / "config" / "pipelines"
 
+#: 非字符串键的提示（YAML 1.1 布尔字面量：on/off/yes/no 作为键会被解析成 bool）
+_QUOTE_HINT = "事件键 on 需加引号（YAML 1.1 会将裸 on 解析为布尔键）"
+
+
+def _reject_non_string_transition_keys(raw: object, pipeline_id: str) -> None:
+    """拒绝 ``transitions`` 里的非字符串键（YAML 1.1 布尔键护栏，任务 #7 第一层）。
+
+    典型触发：``- { from: evaluation, on: evaluation_failed, to: coding }`` ——
+    ``on`` 被 PyYAML 解析为 ``True``，``TransitionSpec.on`` 静默回退缺省值。
+    """
+    if not isinstance(raw, dict):
+        return
+    transitions = raw.get("transitions")
+    if not isinstance(transitions, list):
+        return
+    for index, item in enumerate(transitions):
+        if not isinstance(item, dict):
+            continue
+        for key in item:
+            if not isinstance(key, str):
+                raise SopDefinitionError(
+                    f"流水线定义结构非法（{pipeline_id}）: "
+                    f"transitions[{index}] 出现非字符串键 {key!r}；{_QUOTE_HINT}"
+                )
+
 
 def load_pipeline(
     pipeline_id: str,
@@ -40,6 +70,7 @@ def load_pipeline(
     if not path.exists():
         raise NotFoundError(f"流水线定义不存在: {pipeline_id}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    _reject_non_string_transition_keys(raw, pipeline_id)
     try:
         definition = PipelineDefinition.model_validate(raw)
     except ValidationError as exc:

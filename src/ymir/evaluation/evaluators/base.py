@@ -119,10 +119,24 @@ class EvalCheck(BaseModel):
 
 
 class EvalTask(BaseModel):
-    """一个待评测任务（§12.2 tasks 条目）。"""
+    """一个待评测任务（§12.2 tasks 条目）。
+
+    绑定字段说明（docs/07 §4.1.1）：
+
+    - ``scenario``：场景类别短标识（``rest_crud`` / ``cli_tool`` …），供基准表
+      按场景聚合，缺省空串（v1.0 套件不声明）；
+    - ``project_id``：任务 ↔ 产物绑定。``binding_mode=per_task`` 时必填，
+      用来指定「本任务那次运行产出的项目」；``single`` 模式下忽略
+      （沿用 ``run_suite(project_id=...)``），保证 v1.0 行为不变；
+    - ``run_id``：来源 run 标识（追溯 + judge 成本归属），缺省 ``None``；
+    - ``artifact_name`` 缺省 ``"code"``（v1.0 兼容，不得改缺省值）。
+    """
 
     id: str
     requirement: str = ""
+    scenario: str = ""
+    project_id: str | None = None
+    run_id: str | None = None
     artifact_id: str | None = None
     artifact_name: str | None = "code"
     version: int | None = None  # None = latest

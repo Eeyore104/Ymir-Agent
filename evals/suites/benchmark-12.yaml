@@ -1,0 +1,127 @@
+# benchmark-12 · 基准套件（docs/07 §4.1 / T1.2；内容来源 `.workbuddy/tmp/benchmark12_tasks.md`）
+#
+# 用途：为「引擎能否端到端交付一个真实需求」给出可复现的机器可读基线
+# （四维加权分 + 双门槛 + 逐条检查证据）。真实跑分只走 scripts/run_benchmark.py；
+# CI 只验「套件可加载 + 结构合法 + 无联网 / 无第三方依赖」（tests/test_benchmark.py）。
+#
+# 字段边界（严格 4 字段）：任务只声明 id / scenario / requirement / checks。
+# 不写 project_id / run_id / artifact_id / version —— 绑定由 T2 批量脚本为每个任务
+# 单独建 run 后注入（binding_mode: per_task，docs/07 §4.1.2）。
+#
+# 依赖白名单：任务实现与检查只用 标准库 + pytest + ruff（镜像预装 ≠ 允许使用）。
+# 数据约束：需要外部数据的任务一律在 requirement 文本中内嵌字符串，无 URL、无夹具。
+# 退出码口径（docs/07 §4.2.6）：pytest 无测试时退出码 5 判 check_failed（未写测试的关键信号）。
+
+id: benchmark-12
+version: "1.1"
+description: 12 任务基准套件（12 类场景，覆盖 REST/CLI/数据/解析/算法/状态机/校验/SQL/转换）
+binding_mode: per_task
+
+weights:
+  requirement_conformance: 0.3
+  runnability: 0.3
+  convention: 0.2
+  architecture: 0.2
+
+thresholds:
+  total: 75
+  runnability: 60
+
+tasks:
+  # 1 · REST CRUD：标准库 http.server 内存待办 API（难度 中）
+  - id: task-rest-crud-01
+    scenario: rest_crud
+    requirement: "用标准库 http.server 实现内存待办 REST API，禁用第三方框架与数据库。GET /todos 按 id 升序；POST /todos 缺 title 返回 400；DELETE /todos/{id} 不存在返回 404。附 pytest 测试，随机端口起服务并用 urllib 断言。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 2 · CLI 工具：python -m notes 三子命令 + JSON 落盘（难度 低）
+  - id: task-cli-notes-02
+    scenario: cli_tool
+    requirement: "用标准库实现命令行笔记工具，入口 python -m notes，数据存当前目录 JSON。支持 add、list（无笔记仅输出 EMPTY 且退出码 0，有笔记按 id 升序逐行输出）、done <id>（不存在输出 not found 且退出码 1）。附带 pytest 测试覆盖三子命令与退出码。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.6 }
+      - { type: command, run: "python -m notes list", weight: 0.2 }
+      - { type: command, run: "ruff check .", weight: 0.2 }
+
+  # 3 · 数据清洗：CSV 字符串去重 / 脏行跳过 / 缺失填 unknown（难度 中）
+  - id: task-data-clean-03
+    scenario: data_cleaning
+    requirement: "实现 CSV 清洗函数，输入为内嵌 CSV 字符串（表头 name,age,city，行数不少于 8）：去除完全重复行；age 非整数或缺失的行丢弃；city 缺失填 unknown；name 去首尾空格。返回清洗后记录列表与统计（保留数、丢弃数）。附带 pytest 测试，覆盖空输入与全为非法行两种边界。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 4 · 文件批处理：扩展名分组 + 安全重命名 + manifest（难度 中）
+  - id: task-file-batch-04
+    scenario: file_batch
+    requirement: "实现目录文件批处理模块：给定目录路径，按扩展名分组统计文件数；把文件名转为小写并用下划线替换空格与非法字符；生成 manifest.json 记录原名、新名与字节大小；新名冲突时追加三位序号。附带 pytest 测试，用临时目录自行造文件，覆盖空目录与同名冲突两种边界。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 5 · 解析（HTML，内嵌字符串）：取标题/链接/表格，忽略注释与 script（难度 高）
+  - id: task-parse-html-05
+    scenario: html_parsing
+    requirement: "实现 HTML 内容抽取函数，输入为内嵌的一段 HTML 字符串（含 title、三个以上链接、一个表格、注释与 script）：仅用标准库解析，返回标题文本、链接列表（href 与文字）、表格二维数组；注释与 script 内容不得出现在结果中。附带 pytest 测试，覆盖缺失 title 与空表格两种边界。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 6 · 简单算法库：LRU 缓存 + TopK 排序口径（难度 低）
+  - id: task-algo-lru-06
+    scenario: algo_lib
+    requirement: "实现 LRU 缓存类与 TopK 函数：缓存容量固定，get 命中时刷新最近使用顺序，超容量淘汰最久未使用项，容量为 0 时 put 不抛错且 get 返回 None；TopK 返回出现次数最高的 K 个元素，次数降序、次数相同按元素升序。附带 pytest 测试覆盖淘汰顺序与容量为 0。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 7 · 配置解析：自研 INI 风格 + ${a.b} 引用 + 行号报错（难度 高）
+  - id: task-config-ini-07
+    scenario: config_parsing
+    requirement: "实现配置解析器：支持 [section] 分段、key=value、# 与 ; 注释、双引号值、${section.key} 引用替换；语法错误抛异常并带行号。提供 python -m configkit --help（退出码 0）与 --check <文件路径> 入口。附带 pytest 测试。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.6 }
+      - { type: command, run: "python -m configkit --help", weight: 0.2 }
+      - { type: command, run: "ruff check .", weight: 0.2 }
+
+  # 8 · 文本处理：中英混排词频（英文分词 + 中文二元组 + 停用词）（难度 中）
+  - id: task-text-wordcount-08
+    scenario: text_processing
+    requirement: "实现中英文混排词频统计函数：英文按空白与标点切分后转小写，中文按连续汉字切二元组，支持传入停用词列表过滤，返回出现次数最高的 N 个词及次数（N 由参数指定，次数相同按词升序）。附带 pytest 测试，覆盖纯标点文本与一万字符以上长文本两种边界。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 9 · 状态机：订单状态迁移 + 非法迁移抛错 + 记录前后状态（难度 中）
+  - id: task-state-order-09
+    scenario: state_machine
+    requirement: "实现订单状态机：状态为 created/paid/shipped/closed/cancelled；允许 created→paid/cancelled、paid→shipped/cancelled、shipped→closed；非法迁移抛异常且状态不变；成功迁移记录前后状态。附 pytest 测试，覆盖合法与非法迁移。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 10 · 校验器：三字段校验，结构化错误列表（多错齐返）（难度 低）
+  - id: task-validator-form-10
+    scenario: validator
+    requirement: "实现表单字段校验器：username 为 3 到 20 位字母数字下划线；email 含 @ 与点且不含空白；age 为 0 到 150 的整数。返回结构化错误列表（字段名、错误码、中文说明），全部通过返回空列表，多字段同时出错需全部返回。附带 pytest 测试，覆盖空字符串与超长输入两种边界。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 11 · SQL 查询（sqlite3 内存库）：客户聚合 / 分页 / 状态计数（难度 中）
+  - id: task-sql-query-11
+    scenario: sql_query
+    requirement: "使用标准库 sqlite3 内存库实现订单查询：建 customers 与 orders 表并写入不少于 10 行种子数据；提供按客户汇总金额（金额降序、同额按客户名升序）、按金额区间分页（page、size）、按状态计数三个函数，返回字典列表。附带 pytest 测试，覆盖空结果与非法分页参数。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }
+
+  # 12 · 数据转换：嵌套订单 JSON 扁平化 + 按客户聚合 + 脏数据计数（难度 高）
+  - id: task-json-transform-12
+    scenario: json_transform
+    requirement: "实现嵌套 JSON 扁平化与聚合：输入为内嵌订单 JSON 字符串（含客户名与明细数组）；输出每个客户的订单数与总金额（按总金额降序），并返回明细扁平化列表（订单号、商品、数量、单价）；明细缺失或金额为字符串时跳过该行并计入异常计数。附带 pytest 测试，覆盖空明细与脏数据类型。"
+    checks:
+      - { type: command, run: "python -m pytest -q", weight: 0.7 }
+      - { type: command, run: "ruff check .", weight: 0.3 }

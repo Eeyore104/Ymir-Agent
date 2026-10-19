@@ -1,11 +1,19 @@
-"""评测 harness（架构设计 §3.7、§12.2）：四维评估的编排层。
+"""评测 harness（架构设计 §3.7、§12.2；docs/07 §4.1 增量）：四维评估的编排层。
 
-``run_suite(suite_id, artifact_refs)`` 批量 / ``evaluate(task, artifacts)`` 单任务：
+``run_suite(suite_id, project_id=...)`` 批量 / ``evaluate_task(task, project_id=...)`` 单任务：
 
 1. 加载套件（``EvalSuite.load``）与待评产物（``ArtifactStore``）；
 2. 每个 task 独立沙箱会话（保证隔离与可复现），把产物写入工作区；
 3. 四维评估器并行调度（``asyncio.gather``）；
 4. :func:`~ymir.evaluation.aggregator.aggregate` 加权总分 + 双门槛 + 证据链。
+
+绑定语义（docs/07 §4.1.2 唯一权威表）：
+
+- ``binding_mode="single"``（缺省，v1.0）：用 ``run_suite(project_id=...)`` 的项目，
+  ``artifact_name`` 未命中时回退 ``code``（保持 v1.0 行为逐字节一致）；
+- ``binding_mode="per_task"``（基准套件）：用任务自己的 ``project_id``，**永不回退**
+  到其它项目、**永不回退** ``_DEFAULT_ARTIFACT``；未绑定 / 产物缺失的任务
+  直接短路为 ``status="skipped"``（不启沙箱、不调 judge、``cost_cny=0``）。
 
 沙箱经 :class:`SandboxProvider` 抽象注入：单测注入假 provider（0 Docker、0 费用）；
 judge 经 :class:`~ymir.evaluation.evaluators.base.Judge` 抽象注入。
@@ -33,7 +41,14 @@ from ymir.evaluation.evaluators.base import (
     Judge,
     LLMJudge,
 )
-from ymir.evaluation.report import DimensionOut, EvaluationReport, TaskOut
+from ymir.evaluation.report import (
+    SKIP_MISSING_ARTIFACT,
+    SKIP_UNBOUND_TASK,
+    STATUS_EVALUATED,
+    DimensionOut,
+    EvaluationReport,
+    TaskOut,
+)
 from ymir.evaluation.suite import EvalSuite
 from ymir.sandbox.base import NetworkPolicy, Sandbox, SandboxSession
 from ymir.sandbox.factory import build_sandbox
@@ -150,19 +165,47 @@ class EvaluationHarness:
         self,
         task: EvalTask,
         *,
-        project_id: str,
+        project_id: str | None,
         version_override: int | None = None,
         suite: EvalSuite | None = None,
     ) -> TaskOut:
-        """评测单个任务：加载产物 -> 建沙箱 -> 四维并行 -> 聚合。"""
-        started = time.perf_counter()
-        workdir, artifact_ref, references = await self._load_task(
-            task, project_id, version_override
-        )
+        """评测单个任务：加载产物 -> 建沙箱 -> 四维并行 -> 聚合。
 
-        scores = await self._run_evaluators(
-            task, project_id, workdir, references
+        ``project_id is None`` 且为 ``per_task`` 套件 -> 未绑定（``unbound_task``）；
+        ``per_task`` 下产物缺失 -> ``missing_artifact``。两种短路均**不启沙箱、
+        不调 judge、零成本**。``single`` 模式沿用 v1.0 行为（含 ``code`` 回退）。
+        """
+        started = time.perf_counter()
+        allow_default_fallback = not _is_per_task(suite)
+        if not allow_default_fallback and project_id is None:
+            logger.info("评测任务未绑定产物，跳过：task=%s", task.id)
+            return self._skipped(
+                task,
+                reason=SKIP_UNBOUND_TASK,
+                suite=suite,
+                project_id=None,
+                started=started,
+            )
+
+        workdir, artifact_ref, references = await self._load_task(
+            task, project_id, version_override, allow_default_fallback=allow_default_fallback
         )
+        if not allow_default_fallback and artifact_ref.get("name") is None:
+            logger.info(
+                "评测任务产物缺失，跳过：task=%s project=%s artifact=%s",
+                task.id,
+                project_id,
+                task.artifact_name,
+            )
+            return self._skipped(
+                task,
+                reason=SKIP_MISSING_ARTIFACT,
+                suite=suite,
+                project_id=project_id,
+                started=started,
+            )
+
+        scores = await self._run_evaluators(task, project_id, workdir, references)
         limits = suite.thresholds if suite is not None else None
         weights = suite.weights if suite is not None else None
         result = aggregate(scores, weights=weights, thresholds=limits)
@@ -174,6 +217,11 @@ class EvaluationHarness:
         wall_time_ms = int((time.perf_counter() - started) * 1000)
         return TaskOut(
             id=task.id,
+            scenario=task.scenario,
+            status=STATUS_EVALUATED,
+            skip_reason=None,
+            project_id=project_id,
+            run_id=task.run_id,
             requirement=task.requirement,
             artifact_ref=artifact_ref,
             dimensions=dimensions,
@@ -189,10 +237,35 @@ class EvaluationHarness:
             tokens=sum(score.tokens for score in scores),
         )
 
+    def _skipped(
+        self,
+        task: EvalTask,
+        *,
+        reason: str,
+        suite: EvalSuite | None,
+        project_id: str | None,
+        started: float,
+    ) -> TaskOut:
+        """构造「未执行」任务结果（零沙箱、零 judge、零成本）。"""
+        limits = suite.thresholds if suite is not None else None
+        return TaskOut.skipped_task(
+            task.id,
+            reason=reason,
+            requirement=task.requirement,
+            scenario=task.scenario,
+            project_id=project_id,
+            run_id=task.run_id,
+            thresholds={
+                "total": (limits.total if limits else 75.0),
+                "runnability": (limits.runnability if limits else 60.0),
+            },
+            wall_time_ms=int((time.perf_counter() - started) * 1000),
+        )
+
     async def _run_evaluators(
         self,
         task: EvalTask,
-        project_id: str,
+        project_id: str | None,
         workdir: dict[str, str],
         references: dict[str, dict[str, str]],
     ) -> list[EvalScore]:
@@ -256,19 +329,28 @@ class EvaluationHarness:
         self,
         suite_id: str,
         *,
-        project_id: str,
+        project_id: str | None = None,
         version_override: int | None = None,
         suites_dir: Any = None,
+        task_ids: Sequence[str] | None = None,
     ) -> EvaluationReport:
-        """批量评测套件内全部任务，产出汇总报告。"""
+        """批量评测套件内全部（或 ``task_ids`` 指定子集）任务，产出汇总报告。
+
+        ``task_ids`` 用于限量校准 / 续跑（只评子集，保持套件内声明顺序）；
+        ``per_task`` 模式下每个任务用自己的 ``project_id``，``project_id`` 参数
+        仅作报告级记录，**不用于**产物解析（docs/07 §4.1.2）。
+        """
         suite = EvalSuite.load(suite_id, suites_dir=suites_dir)
         harness = self.with_evaluators(default_evaluators(suite.weights))
         started = time.perf_counter()
         tasks: list[TaskOut] = []
-        for task in suite.tasks:
+        for task in _select_tasks(suite, task_ids):
             tasks.append(
                 await harness.evaluate_task(
-                    task, project_id=project_id, version_override=version_override, suite=suite
+                    task,
+                    project_id=_bound_project_id(suite, task, project_id),
+                    version_override=version_override,
+                    suite=suite,
                 )
             )
         wall_time_ms = int((time.perf_counter() - started) * 1000)
@@ -321,9 +403,19 @@ class EvaluationHarness:
     # ------------------------------------------------------------------ 加载
 
     async def _load_task(
-        self, task: EvalTask, project_id: str, version_override: int | None
+        self,
+        task: EvalTask,
+        project_id: str | None,
+        version_override: int | None,
+        *,
+        allow_default_fallback: bool = True,
     ) -> tuple[dict[str, str], dict[str, Any], dict[str, dict[str, str]]]:
-        artifacts = await self._store.list_artifacts(project_id)
+        """加载任务产物（``allow_default_fallback=False`` 时禁止回退 ``code``）。
+
+        返回值第三项为「同项目其它产物」引用集（四维交叉引用用）；
+        产物未命中时返回 ``artifact_ref={"name": None, ...}``，由调用方决定短路。
+        """
+        artifacts = await self._store.list_artifacts(project_id) if project_id else []
         references: dict[str, dict[str, str]] = {}
         by_name: dict[str, Any] = {}
         for artifact in artifacts:
@@ -331,7 +423,9 @@ class EvaluationHarness:
             references[artifact.name] = loaded.files
             by_name[artifact.name] = artifact
 
-        target = self._resolve_target(task, by_name)
+        target = self._resolve_target(
+            task, by_name, allow_default_fallback=allow_default_fallback
+        )
         if target is None:
             return {}, {"name": None, "version": None}, references
 
@@ -345,15 +439,27 @@ class EvaluationHarness:
         return loaded.files, artifact_ref, references
 
     @staticmethod
-    def _resolve_target(task: EvalTask, by_name: Mapping[str, Any]) -> Any | None:
+    def _resolve_target(
+        task: EvalTask,
+        by_name: Mapping[str, Any],
+        *,
+        allow_default_fallback: bool = True,
+    ) -> Any | None:
+        """解析任务目标产物。
+
+        ``allow_default_fallback=False``（``per_task``）时**禁止**回退
+        ``_DEFAULT_ARTIFACT``，且按 ID 直取失败时返回 ``None``（不再伪造引用）。
+        """
         if task.artifact_id is not None:
             for artifact in by_name.values():
                 if artifact.id == task.artifact_id:
                     return artifact
+            if not allow_default_fallback:
+                return None
             return _Ref(task.artifact_id, task.artifact_name or "artifact")
         if task.artifact_name and task.artifact_name in by_name:
             return by_name[task.artifact_name]
-        if _DEFAULT_ARTIFACT in by_name:
+        if allow_default_fallback and _DEFAULT_ARTIFACT in by_name:
             return by_name[_DEFAULT_ARTIFACT]
         return None
 
@@ -387,6 +493,38 @@ class _Ref:
     def __init__(self, artifact_id: str, name: str) -> None:
         self.id = artifact_id
         self.name = name
+
+
+def _is_per_task(suite: EvalSuite | None) -> bool:
+    """套件是否按任务绑定产物（``None`` 视为既有单项目路径）。"""
+    return suite is not None and suite.is_per_task
+
+
+def _bound_project_id(
+    suite: EvalSuite, task: EvalTask, project_id: str | None
+) -> str | None:
+    """解析任务的实际取材项目。
+
+    - ``per_task``：**只用**任务自己的 ``project_id``（未绑定 -> ``None`` ->
+      ``unbound_task``；永不回退到 ``run_suite`` 传入的项目，避免跨项目取材）；
+    - ``single``：沿用 ``run_suite(project_id=...)``（v1.0 行为不变）。
+    """
+    if suite.is_per_task:
+        return task.project_id
+    return project_id
+
+
+def _select_tasks(suite: EvalSuite, task_ids: Sequence[str] | None) -> list[EvalTask]:
+    """按 ``task_ids`` 取子集（保持套件声明顺序）；``None`` 表示全部。"""
+    if task_ids is None:
+        return list(suite.tasks)
+    wanted = list(dict.fromkeys(task_ids))
+    known = {task.id for task in suite.tasks}
+    unknown = [task_id for task_id in wanted if task_id not in known]
+    if unknown:
+        logger.warning("套件 %s 中不存在这些任务，已忽略：%s", suite.id, unknown)
+    selected = set(wanted)
+    return [task for task in suite.tasks if task.id in selected]
 
 
 def _normalized(weights: Mapping[str, float]) -> dict[str, float]:

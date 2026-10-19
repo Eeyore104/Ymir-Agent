@@ -1,0 +1,164 @@
+%% v1.1 增量类图（源文件，配套 docs/07-增量设计与任务列表-v1.1.md §6）
+%% 仅表达新增 / 变更的模型与接口；v1.0 全量类图见 docs/class-diagram.mermaid（未覆盖）
+classDiagram
+    class EvalTask {
+        +str id
+        +str requirement
+        +str scenario
+        +str project_id
+        +str run_id
+        +str artifact_id
+        +str artifact_name
+        +int version
+        +list~EvalCheck~ checks
+    }
+    class EvalSuite {
+        +str id
+        +str version
+        +str binding_mode
+        +dict weights
+        +Thresholds thresholds
+        +list~EvalTask~ tasks
+        +load(suite_id, suites_dir)$ EvalSuite
+    }
+    class TaskOut {
+        +str id
+        +str scenario
+        +str status
+        +str skip_reason
+        +str project_id
+        +str run_id
+        +dict artifact_ref
+        +float total_score
+        +float runnability
+        +bool passed
+        +float cost_cny
+        +int wall_time_ms
+    }
+    class EvaluationReport {
+        +str suite_id
+        +str run_id
+        +int artifact_version
+        +int repair_round
+        +str verdict_source
+        +list~TaskOut~ tasks
+        +bool passed
+        +executed() list~TaskOut~
+        +skipped() list~TaskOut~
+        +build(...)$ EvaluationReport
+        +save(store, project_id, run_id, name) Artifact
+    }
+    class EvaluationHarness {
+        +run_suite(suite_id, project_id, task_ids) EvaluationReport
+        +evaluate_task(task, project_id, suite) TaskOut
+        +_load_task(task, project_id, allow_default_fallback) tuple
+        +_resolve_target(task, by_name, allow_default_fallback) Artifact
+        +_bound_judge(task) Judge
+    }
+    class EvaluationGate {
+        <<protocol>>
+        +evaluate(run, stage, attempt) EvalVerdict
+    }
+    class HarnessEvaluationGate {
+        +harness EvaluationHarness
+        +default_suite str
+        +evaluate(run, stage, attempt) EvalVerdict
+        +_resolve_task(run, definition) EvalTask
+    }
+    class EvalVerdict {
+        <<frozen>>
+        +str status
+        +bool passed
+        +float total_score
+        +float runnability
+        +tuple failed_checks
+        +str failure_class
+        +bool degraded
+    }
+    class ApprovalContext {
+        <<frozen>>
+        +str phase
+        +bool repair_active
+        +int repair_round
+        +bool is_final
+    }
+    class RepairSpec {
+        +bool enabled
+        +int max_rounds
+        +str stage
+        +str on_failure
+        +RepairEvalSpec eval
+        +RepairContextSpec context
+    }
+    class PipelineDefinition {
+        +RepairSpec repair
+        +next_stage(stage_id, on) str
+        +outgoing(stage_id, on) list
+        +downstream_of(stage_id, on) list
+        +eval_stage_id() str
+        +repair_active() bool
+    }
+    class SopValidator {
+        +validate() list~ValidationIssue~
+        +_check_repair() list~ValidationIssue~
+        +_fwd_adjacency() dict
+    }
+    class RepairController {
+        +budget_probe Callable
+        +should_evaluate(definition, stage) bool
+        +record_verdict(run_id, verdict) dict
+        +decide(run, definition, verdict, attempt) str
+        +rewind_to_repair(run_id, definition, reason) None
+        +request_extend(run_id, definition) None
+        +request_accept_best(run_id) None
+    }
+    class OrchestrationEngine {
+        +eval_gate EvaluationGate
+        +repair RepairController
+        +_process_stage(run, definition, stage) str
+        +_advance(run_id, definition, stage, on) str
+        +_fail_run(run_id, error, error_code, stop_reason) None
+        +_final_gate(run, definition) bool
+        +request_accept_best(run_id) PipelineRun
+        +request_extend_repair(run_id) PipelineRun
+    }
+    class ApprovalEngine {
+        +on_stage_completed(run, stage, ctx) bool
+        +decide(approval_id, decision, feedback) Approval
+        +_request_approval(run, stage, policy) Approval
+    }
+    class BenchmarkRunner {
+        +BenchmarkOptions options
+        +run(options) BaselineTable
+        +_run_one(task, state) BaselineRow
+        +_wait_terminal(run_id, timeout_s) PipelineRun
+        +_classify(row) str
+    }
+    class BaselineTable {
+        +dict meta
+        +list~BaselineRow~ rows
+        +int executed_count
+        +int skipped_count
+        +to_markdown() str
+        +to_json() str
+    }
+
+    EvalSuite "1" o-- "*" EvalTask
+    EvaluationHarness ..> EvalSuite : loads
+    EvaluationHarness ..> EvaluationReport : builds
+    EvaluationReport "1" o-- "*" TaskOut
+    HarnessEvaluationGate ..|> EvaluationGate : implements
+    HarnessEvaluationGate --> EvaluationHarness
+    HarnessEvaluationGate ..> EvalVerdict : produces
+    HarnessEvaluationGate ..> EvaluationReport : saves as eval_verdict
+    OrchestrationEngine --> EvaluationGate : injected
+    OrchestrationEngine --> RepairController : injected
+    RepairController ..> EvalVerdict : consumes
+    RepairController ..> ApprovalContext : builds
+    OrchestrationEngine --> ApprovalEngine : approval_hook
+    ApprovalEngine ..> ApprovalContext : reads
+    PipelineDefinition "1" *-- "0..1" RepairSpec
+    SopValidator --> PipelineDefinition : validates
+    BenchmarkRunner --> EvaluationHarness
+    BenchmarkRunner --> OrchestrationEngine : launch / wait
+    BenchmarkRunner ..> BaselineTable : produces

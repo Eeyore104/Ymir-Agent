@@ -12,6 +12,10 @@
 - :mod:`ymir.evaluation.suite`：``EvalSuite``（``evals/suites/*.yaml``）加载与校验；
 - :mod:`ymir.evaluation.harness`：单任务 / 套件编排（沙箱生命周期、四维并行调度）；
 - :mod:`ymir.evaluation.runner`：批量跑分与性价比对比。
+
+v1.1（docs/07 §4.1）：任务 ↔ 产物绑定（``EvalSuite.binding_mode``）与「未执行」
+语义（``TaskOut.status`` / ``skip_reason``），基准套件的跳过原因常量一并导出供
+runner / 基线表复用。
 """
 
 from ymir.evaluation.aggregator import AggregateResult, aggregate, normalize_weights
@@ -44,29 +48,55 @@ from ymir.evaluation.harness import (
     SandboxProvider,
     build_eval_harness,
 )
-from ymir.evaluation.report import DimensionOut, EvaluationReport, EvidenceOut, TaskOut
+from ymir.evaluation.report import (
+    SKIP_BUDGET,
+    SKIP_MISSING_ARTIFACT,
+    SKIP_NOT_RUN,
+    SKIP_UNBOUND_TASK,
+    STATUS_EVALUATED,
+    STATUS_SKIPPED,
+    DimensionOut,
+    EvaluationReport,
+    EvidenceOut,
+    TaskOut,
+)
 from ymir.evaluation.runner import (
     BatchEntry,
     BatchReport,
     BatchTarget,
     run_batch,
 )
-from ymir.evaluation.suite import EvalSuite, Thresholds
+from ymir.evaluation.suite import (
+    BINDING_MODE_PER_TASK,
+    BINDING_MODE_SINGLE,
+    BindingMode,
+    EvalSuite,
+    Thresholds,
+)
 
 __all__ = [
     "ARCHITECTURE",
+    "BINDING_MODE_PER_TASK",
+    "BINDING_MODE_SINGLE",
     "CONVENTION",
     "DEFAULT_WEIGHTS",
     "DIMENSION_LABELS",
     "DIMENSION_ORDER",
     "REQUIREMENT",
     "RUNNABILITY",
+    "SKIP_BUDGET",
+    "SKIP_MISSING_ARTIFACT",
+    "SKIP_NOT_RUN",
+    "SKIP_UNBOUND_TASK",
+    "STATUS_EVALUATED",
+    "STATUS_SKIPPED",
     "AggregateResult",
     "ArchitectureEvaluator",
     "BackendSandboxProvider",
     "BatchEntry",
     "BatchReport",
     "BatchTarget",
+    "BindingMode",
     "ConventionEvaluator",
     "DimensionOut",
     "EvalCheck",

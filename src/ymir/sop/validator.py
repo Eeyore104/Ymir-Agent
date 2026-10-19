@@ -1,4 +1,4 @@
-"""SopValidator：流水线定义静态校验（架构设计 §3.2）。
+"""SopValidator：流水线定义静态校验（架构设计 §3.2；docs/07 §4.3.3 增量）。
 
 加载时校验（错误级）：
 - 阶段 ID 唯一 / 阶段集非空；
@@ -6,9 +6,16 @@
 - 从入口可达所有阶段、且每个可达阶段都能到达终点；
 - 每个阶段的 ``inputs`` 可被上游 ``outputs``（或外部 ``requirement``）满足；
 - ``gate.on_reject_target`` 指向存在的阶段；
+- 回边（``repair``）声明合法：目标阶段存在、回边事件非保留字、边与声明一致、
+  回边不指向入口、轮次非负；
 - ``known_roles`` 提供时，阶段角色必须已注册。
 
-警示级：多入口（引擎冻结约定取首个声明阶段为入口）。
+警示级：多入口（引擎冻结约定取首个声明阶段为入口）、回边被关闭却留有回边边、
+``max_rounds=0``（行为退回线性）、其它非主链边永不触发。
+
+设计说明（§4.3.3）：「非法」与「关闭」严格分离 —— 指向不存在的阶段 / 轮次为负 /
+边缺失 = error（加载期拒绝，run 不启动）；``enabled: false`` 或 ``max_rounds: 0``
+= warning（**不报错**），运行期退化为 v1.0 线性行为。
 """
 
 from __future__ import annotations
@@ -17,7 +24,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ymir.common.errors import InvalidParamError
-from ymir.sop.models import END_TOKEN, ENTRY_INPUT, PipelineDefinition
+from ymir.sop.models import (
+    END_TOKEN,
+    ENTRY_INPUT,
+    MAIN_EVENT,
+    RESERVED_EVENTS,
+    PipelineDefinition,
+    TransitionSpec,
+)
 
 
 class SopDefinitionError(InvalidParamError):
@@ -51,6 +65,7 @@ class SopValidator:
         issues.extend(self._check_reachability())
         issues.extend(self._check_inputs())
         issues.extend(self._check_gates())
+        issues.extend(self._check_repair())
         issues.extend(self._check_roles())
         return issues
 
@@ -108,7 +123,7 @@ class SopValidator:
         stage_ids = set(self._def.stage_ids())
         adj: dict[str, set[str]] = {sid: set() for sid in stage_ids}
         for trans in self._def.transitions:
-            if trans.on != "stage_completed":
+            if trans.on != MAIN_EVENT:
                 continue
             if trans.from_ in stage_ids and (trans.to == END_TOKEN or trans.to in stage_ids):
                 adj[trans.from_].add(trans.to)
@@ -216,6 +231,127 @@ class SopValidator:
                         f"阶段 {spec.id} 的驳回目标 {gate.on_reject_target} 不存在",
                     )
                 )
+        return issues
+
+    def _check_repair(self) -> list[ValidationIssue]:
+        """回边（``repair``）声明校验：6 条 error + 3 条 warning（§4.3.3）。
+
+        「非法」（error，加载期拒绝）与「关闭」（warning，运行期退回线性）严格分离：
+        ``enabled: false`` / ``max_rounds: 0`` 一律**不报错**，B-05① 要求。
+        """
+        issues: list[ValidationIssue] = []
+        repair = self._def.repair
+        if repair is None:
+            # 无 repair 块时，任何非主链边都不会被触发 -> 提示为「永不触发的边」
+            issues.extend(self._check_foreign_edges(allowed_event=None))
+            return issues
+
+        stage_ids = set(self._def.stage_ids())
+        entry_id = self._def.initial_stage().id if self._def.stages else None
+
+        # ① 目标阶段必须存在（B-05 ③）
+        if repair.stage not in stage_ids:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "repair-target-missing",
+                    f"回边目标阶段 {repair.stage} 不存在于 stages",
+                )
+            )
+        # ② 回边事件名不得占用主链保留字
+        if repair.on_failure in RESERVED_EVENTS:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "repair-event-reserved",
+                    f"回边事件名 {repair.on_failure} 属保留事件（禁止挪用主链事件）",
+                )
+            )
+        # ③ 回边不得指向入口阶段（否则等于无限重做上游）
+        if entry_id is not None and repair.stage == entry_id:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "repair-target-is-entry",
+                    f"回边目标阶段 {repair.stage} 是流程入口，回边不得指向入口",
+                )
+            )
+        # ④ 轮次为负（pydantic 已拦，此处兜底：防御绕过模型校验的直接赋值）
+        if repair.max_rounds < 0:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "repair-max-rounds-invalid",
+                    f"repair.max_rounds 不能为负: {repair.max_rounds}",
+                )
+            )
+
+        repair_edges = self._edges_on(repair.on_failure)
+        # ⑤ 回边生效但缺边：必须能从评估阶段回到目标阶段
+        if self._def.repair_active() and not repair_edges:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    "repair-edge-missing",
+                    f"回边已生效但缺少 on={repair.on_failure} 的流转边",
+                )
+            )
+        # ⑥ 回边的 to 必须与声明一致
+        for edge in repair_edges:
+            if edge.to != repair.stage:
+                issues.append(
+                    ValidationIssue(
+                        "error",
+                        "repair-edge-target-mismatch",
+                        f"回边 {edge.from_} --{repair.on_failure}--> {edge.to} "
+                        f"与 repair.stage={repair.stage} 不一致",
+                    )
+                )
+
+        # ⑦ 关闭开关却留着回边：合法但会被忽略（不报错）
+        if not repair.enabled and self._non_main_edges():
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    "repair-disabled-ignored",
+                    "repair.enabled=false：回边被忽略，运行期退回 v1.0 线性行为",
+                )
+            )
+        # ⑧ 0 轮却留着回边：行为退回线性（不报错，B-05①）
+        if repair.max_rounds == 0 and self._non_main_edges():
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    "repair-zero-rounds",
+                    "repair.max_rounds=0：不发起修复，运行期退回 v1.0 线性行为",
+                )
+            )
+        # ⑨ 其它非主链边（事件名与 on_failure 不一致）：永不触发
+        issues.extend(self._check_foreign_edges(allowed_event=repair.on_failure))
+        return issues
+
+    def _non_main_edges(self) -> list[TransitionSpec]:
+        """所有非主链边（``on`` 不是 ``stage_completed``）。"""
+        return [trans for trans in self._def.transitions if trans.on != MAIN_EVENT]
+
+    def _edges_on(self, event: str) -> list[TransitionSpec]:
+        """指定事件的全部流转边。"""
+        return [trans for trans in self._def.transitions if trans.on == event]
+
+    def _check_foreign_edges(self, *, allowed_event: str | None) -> list[ValidationIssue]:
+        """非主链边中事件名不等于回边事件的部分：提示「永不触发」。"""
+        issues: list[ValidationIssue] = []
+        for edge in self._non_main_edges():
+            if allowed_event is not None and edge.on == allowed_event:
+                continue
+            issues.append(
+                ValidationIssue(
+                    "warning",
+                    "foreign-event-edge",
+                    f"边 {edge.from_} --{edge.on}--> {edge.to} 的事件名不是回边事件，"
+                    "该边永不触发",
+                )
+            )
         return issues
 
     def _check_roles(self) -> list[ValidationIssue]:

@@ -33,9 +33,10 @@ from ymir.models.base import utcnow
 from ymir.models.entities import PipelineRun, StageExecution
 from ymir.models.enums import RunStatus, StageStatus
 from ymir.orchestrator.executor import StageExecutor, StageOutcome
+from ymir.orchestrator.repair import EvaluationGate, RepairController
 from ymir.orchestrator.transitions import ensure_run_transition
 from ymir.sop.loader import load_pipeline
-from ymir.sop.models import END_TOKEN, PipelineDefinition, StageSpec
+from ymir.sop.models import END_TOKEN, MAIN_EVENT, PipelineDefinition, StageSpec
 from ymir.storage.repositories import RunRepository, StageExecutionRepository
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,18 @@ def _biz_code_of(exc: BaseException) -> int | None:
     return int(code) if code is not None else None
 
 
+def _repair_event(definition: PipelineDefinition) -> str:
+    """回边事件名（``definition.repair.on_failure``；无 repair 块时退回主链事件）。"""
+    repair = definition.repair
+    return repair.on_failure if repair is not None else MAIN_EVENT
+
+
+def _rounds_text(total_score: float, thresholds: dict[str, float]) -> str:
+    """轮次耗尽的人读原因（§4.5.2 文案口径）。"""
+    limit = thresholds.get("total", 75.0)
+    return f"轮次耗尽，仍未通过（total={total_score:.1f}<{limit:g}）"
+
+
 class OrchestrationEngine:
     """自研轻量状态机引擎（约千行级内核的核心部分）。"""
 
@@ -62,6 +75,8 @@ class OrchestrationEngine:
         executor: StageExecutor | None = None,
         approval_hook: ApprovalHook | None = None,
         definition_loader: Callable[[str], PipelineDefinition] | None = None,
+        eval_gate: EvaluationGate | None = None,
+        repair: RepairController | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._events = events
@@ -69,6 +84,10 @@ class OrchestrationEngine:
         self._executor = executor or StageExecutor()
         self._approval_hook = approval_hook
         self._definition_loader = definition_loader or load_pipeline
+        # v1.1 回边（docs/07 §4.3.6）：两者同时注入才进入裁决分叉；
+        # 任一为 None（含单角色 / 截断流水线）时行为与 v1.0 完全一致。
+        self._eval_gate = eval_gate
+        self._repair = repair
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._wakeups: dict[str, asyncio.Event] = {}
 
@@ -292,14 +311,44 @@ class OrchestrationEngine:
             EventType.STAGE_COMPLETED,
             {**payload_common, "output_refs": outcome.output_refs},
         )
-        await self._publish_stage_message(run_id, definition, stage, outcome)
+
+        # 裁决分叉（v1.1，docs/07 §4.3.6）：在审批之前、消息之后决定推进事件
+        event = MAIN_EVENT
+        if (
+            self._repair is not None
+            and self._eval_gate is not None
+            and self._repair.should_evaluate(definition, stage)
+        ):
+            verdict = await self._eval_gate.evaluate(run=run, stage=stage, attempt=attempt)
+            await self._repair.record_verdict(run_id, verdict)
+            decision = await self._repair.decide(run, definition, verdict, attempt)
+            if decision == "repair":
+                event = _repair_event(definition)
+            elif decision == "exhausted":
+                await self._fail_run(
+                    run_id,
+                    f"评测未达标：{_rounds_text(verdict.total_score, verdict.thresholds)}",
+                    stop_reason="rounds_exhausted",
+                )
+                return "failed"
+            elif decision == "budget_blocked":
+                await self._fail_run(
+                    run_id,
+                    "修复未发起：预算预检未通过（已用达上限或预检故障）",
+                    error_code=int(BizCode.BUDGET_EXCEEDED),
+                    stop_reason="budget_exceeded",
+                )
+                return "failed"
+
+        # 消息去向与推进边使用**同一个** event（否则前端消息流与真实路径错位）
+        await self._publish_stage_message(run_id, definition, stage, outcome, on=event)
 
         # 审批挂点（T02 无 hook 直接推进；T04 接入三关与审批记录）
         if self._approval_hook is not None and await self._approval_hook(run, stage):
             await self._enter_waiting_approval(run_id)
             return "halted"
 
-        result = await self._advance(run_id, definition, stage)
+        result = await self._advance(run_id, definition, stage, on=event)
         if result == "finished":
             await self._events.emit(run_id, EventType.RUN_COMPLETED, {"status": "completed"})
         elif result == "invalid":
@@ -308,14 +357,19 @@ class OrchestrationEngine:
         return result
 
     async def _advance(
-        self, run_id: str, definition: PipelineDefinition, stage: StageSpec
+        self,
+        run_id: str,
+        definition: PipelineDefinition,
+        stage: StageSpec,
+        *,
+        on: str = MAIN_EVENT,
     ) -> str:
         """阶段完成后的状态推进（事务内校验状态未被外部改动）。"""
         async with self._session_factory() as session:
             run = await self._require_run(session, run_id)
             if run.status != RunStatus.RUNNING.value:
                 return "halted"  # 外部暂停 / 取消：不推进
-            next_id = definition.next_stage(stage.id)
+            next_id = definition.next_stage(stage.id, on=on)
             if next_id is None:
                 return "invalid"
             if next_id == END_TOKEN:
@@ -335,9 +389,11 @@ class OrchestrationEngine:
         definition: PipelineDefinition,
         stage: StageSpec,
         outcome: StageOutcome,
+        *,
+        on: str = MAIN_EVENT,
     ) -> None:
         """阶段产物消息（to_role=下游阶段角色；终点阶段为广播）。"""
-        next_id = definition.next_stage(stage.id)
+        next_id = definition.next_stage(stage.id, on=on)
         to_role: str | None = None
         if next_id not in (None, END_TOKEN):
             next_stage = definition.stage(next_id)
@@ -393,7 +449,20 @@ class OrchestrationEngine:
         async with self._session_factory() as session:
             return await StageExecutionRepository(session).latest(run_id, stage_id)
 
-    async def _fail_run(self, run_id: str, error: str, *, error_code: int | None = None) -> None:
+    async def _fail_run(
+        self,
+        run_id: str,
+        error: str,
+        *,
+        error_code: int | None = None,
+        stop_reason: str | None = None,
+    ) -> None:
+        """标记 run 失败；``stop_reason`` 写入 ``context["repair"].stop_reason``。
+
+        两种终态可区分（§4.5.2）：``rounds_exhausted``（质量未达标，error_code=None）
+        与 ``budget_exceeded``（预算中断，error_code=1004）。写入走「读 -> 复制 ->
+        整体赋值 -> commit」，禁止原地改 JSON 列。
+        """
         async with self._session_factory() as session:
             run = await self._require_run(session, run_id)
             if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value):
@@ -402,11 +471,22 @@ class OrchestrationEngine:
             run.error = error
             run.error_code = error_code
             run.finished_at = utcnow()
+            if stop_reason is not None:
+                context = dict(run.context or {})
+                repair = dict(context.get("repair") or {})
+                repair["stop_reason"] = stop_reason
+                context["repair"] = repair
+                run.context = context
             await session.commit()
         await self._events.emit(
             run_id,
             EventType.RUN_FAILED,
-            {"status": "failed", "error": error, "error_code": error_code},
+            {
+                "status": "failed",
+                "error": error,
+                "error_code": error_code,
+                "stop_reason": stop_reason,
+            },
         )
 
     async def _pause_for_budget(self, run_id: str, error: str) -> None:

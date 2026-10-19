@@ -1,0 +1,61 @@
+%% v1.1 增量时序图（源文件，配套 docs/07-增量设计与任务列表-v1.1.md §7）
+%% 场景：一次「首轮未过 → 定向修复 1 轮 → 通过 → 终局审批 → completed」全链路
+%% v1.0 全量时序图见 docs/sequence-diagram.mermaid（未覆盖）
+sequenceDiagram
+    autonumber
+    participant CLI as scripts/run_benchmark.py
+    participant ENG as OrchestrationEngine
+    participant EXE as RoleStageExecutor
+    participant GATE as HarnessEvaluationGate
+    participant HAR as EvaluationHarness
+    participant RC as RepairController
+    participant MSG as MessagePublisher
+    participant HITL as ApprovalEngine
+    participant DB as SQLite (runs/events/messages/artifacts)
+
+    CLI->>DB: ProjectRepository.create(bench-…) + RunRepository.create(mode=batch, context.benchmark)
+    CLI->>ENG: launch(run_id)
+    ENG->>EXE: execute(prd) → execute(architecture) → execute(coding, attempt=1)
+    EXE->>DB: ArtifactStore.save(code, v1) + artifact.created
+    ENG->>ENG: _advance(on="stage_completed") → evaluation
+    Note over EXE: QA(LLM) 只出叙事报告，不参与通过判定
+    ENG->>EXE: execute(evaluation, attempt=1)
+    EXE->>DB: save(evaluation_report, v1)
+    Note over ENG: 阶段产物完成 → 进入确定性裁决分叉
+    ENG->>GATE: evaluate(run, evaluation_stage, attempt)
+    GATE->>HAR: evaluate_task(task{project_id, run_id, checks=该任务 checks})
+    HAR-->>GATE: TaskOut{total=62.4, runnability=48.0, passed=false, failed_checks=[pytest]}
+    GATE->>DB: save(eval_verdict, v1)（run_id / artifact_version=1 / verdict_source=harness）
+    GATE-->>ENG: EvalVerdict{status=fail, failed_checks=[…]}
+    ENG->>RC: record_verdict() → context.repair.history += {round:0, fail}
+    ENG-->>DB: event evaluation.failed{repair_round:0, max_rounds:2}
+    ENG->>RC: decide() → "repair"
+    RC->>DB: context.repair.round=1（整体赋值 patch）
+    RC->>DB: 作废 coding/completed + evaluation/completed → failed（复用补推进机制）
+    RC->>MSG: publish(feedback, to_role=engineer, payload.source=auto_repair, failed_checks, previous=v1)
+    ENG-->>DB: event repair.started{repair_round:1, target_stage:coding, artifact_version:1}
+    ENG->>ENG: _advance(on="evaluation_failed") → coding
+    ENG->>HITL: on_stage_completed(run, coding, ApprovalContext(phase=stage_completed, repair_active=true))
+    HITL-->>DB: event approval.deferred{stage_id:coding, repair_round:1}（不建卡片）
+    ENG->>EXE: execute(coding, attempt=2)
+    EXE->>DB: 读最新 auto_repair feedback + code v1 → StageInput.repair_context / previous_output
+    EXE->>DB: save(code, v2, parent=v1) + artifact.created
+    ENG->>ENG: _advance(on="stage_completed") → evaluation
+    ENG->>GATE: evaluate(run, evaluation_stage, attempt=2)
+    GATE->>HAR: evaluate_task(...) → total=81.3, runnability=80.0, passed=true
+    HAR-->>GATE: TaskOut{passed=true}
+    GATE-->>ENG: EvalVerdict{status=pass, artifact_version=2}
+    ENG->>RC: record_verdict() → history += {round:1, pass}
+    ENG-->>DB: event evaluation.completed{passed:true, total:81.3}
+    Note over ENG: next_stage(on="stage_completed") == __end__ → 终局裁决前审批
+    ENG->>HITL: on_stage_completed(run, coding, ApprovalContext(phase=final_candidate, is_final=true, repair_round=1))
+    HITL->>DB: 建 1 张 pending Approval{stage_id:coding, artifact_refs=[code v2]}
+    HITL-->>DB: event approval.requested
+    ENG->>DB: run.status = waiting_approval
+    Note over HITL: 人工 approve（POST /approvals/{id}/decision）
+    HITL->>ENG: request_resume(run_id)
+    ENG->>ENG: _advance → __end__ → run.completed
+    ENG-->>DB: event run.completed
+    CLI->>DB: 读 context.repair.history + sum(model_calls.cost_cny) + (finished_at-started_at)
+    CLI->>CLI: BaselineRow(first=62.4/❌, final=81.3/✅, rounds=1, cost=实测, wall=…)
+    CLI->>CLI: 写 data/benchmark/state-*.json（原子 replace）+ baseline-*.md/.json

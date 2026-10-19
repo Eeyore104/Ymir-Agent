@@ -12,12 +12,15 @@
 - :func:`dump_structured`：结构化序列化（落 ``<out>.json``），``tools/doc_writer``
   与 ``roles`` 共用；
 - :class:`RoleOutputError`：角色输出解析 / 校验失败错误（``roles.runtime`` 与
-  :mod:`ymir.common.jsonx` 共用）。
+  :mod:`ymir.common.jsonx` 共用）；
+- :class:`EvalVerdict` / :class:`FailedCheck`（v1.1，docs/07 §4.4.2）：**裁决合同**。
+  编排层只认这份不可变快照，`evaluation` 负责产出、`orchestrator` 负责消费 ——
+  任何自动化分支（回边 / 终态 / 基线）只读它，绝不读 QA 的 LLM 叙事输出。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -56,6 +59,70 @@ class CodeBundle(BaseModel):
         default_factory=list, description="冒烟/自测命令（在沙箱内执行）"
     )
     notes: str = Field(default="", description="实现说明与未决事项")
+
+
+# --------------------------------------------------------------------- 裁决合同（v1.1）
+
+
+@dataclass(frozen=True)
+class FailedCheck:
+    """一条失败检查（定向修复的输入单元，docs/07 §4.4.2）。
+
+    ``output`` 已按 ``repair.context.max_detail_chars`` 截断（RK7 成本控制：
+    修复输入只含失败检查 + 错误摘要 + 上一版产物 + 指令）。
+    """
+
+    command: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    output: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """消息 payload 用的字典形态（字段名与 §4.4.4 一致）。"""
+        return {
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+            "output": self.output,
+        }
+
+
+@dataclass(frozen=True)
+class EvalVerdict:
+    """确定性裁决结果（跨层合同：``evaluation`` 产出、``orchestrator`` 消费）。
+
+    ``status``：``pass`` | ``fail`` | ``unknown``。``unknown`` = 降级
+    （套件加载失败 / 产物缺失 / 沙箱降级 / harness 异常），**不回边、不阻断流水线**，
+    退回 v1.0 线性行为并在事件与基线表里披露。
+    """
+
+    status: str
+    passed: bool = False
+    total_score: float = 0.0
+    runnability: float = 0.0
+    thresholds: dict[str, float] = field(default_factory=dict)
+    suite_id: str = ""
+    suite_version: str = ""
+    artifact_name: str = "code"
+    artifact_version: int | None = None
+    failed_checks: tuple[FailedCheck, ...] = ()
+    failure_class: str | None = None
+    cost_cny: float = 0.0
+    wall_time_ms: int = 0
+    degraded: bool = False
+    reason: str = ""
+
+    @property
+    def is_pass(self) -> bool:
+        return self.status == "pass"
+
+    @property
+    def is_fail(self) -> bool:
+        return self.status == "fail"
+
+    @property
+    def is_unknown(self) -> bool:
+        return self.status == "unknown"
 
 
 def dump_structured(model: BaseModel) -> dict[str, Any]:

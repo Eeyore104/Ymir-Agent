@@ -7,10 +7,13 @@
 # - thresholds：total ≥ 75 且 runnability ≥ 60（双门槛，防「分高但跑不起来」）
 # - tasks[].checks：可复现的确定性检查（在沙箱内执行的命令，按权重计入可运行率）
 # - tasks[].artifact_name：目标产物名（解析为项目内该产物指定版本，version 缺省为 latest）
+# - binding_mode：single（缺省）= 全部任务用 run_suite(project_id=...) 的项目产物，
+#   artifact_name 未命中时回退 code（v1.0 行为，docs/07 §4.1.2 唯一权威表）
 
 id: default
 version: "1.0"
 description: v1.0 默认评测套件（四维 + 双门槛 + 证据链）
+binding_mode: single
 
 weights:
   requirement_conformance: 0.3

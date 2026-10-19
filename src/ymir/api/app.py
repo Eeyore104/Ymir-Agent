@@ -37,7 +37,7 @@ from ymir.api.routers import (
     usage,
 )
 from ymir.api.schemas import ApiResponse, HealthData
-from ymir.bootstrap import build_approval_stack, build_execution_stack
+from ymir.bootstrap import build_approval_stack, build_execution_stack, build_repair_stack
 from ymir.common.errors import BizCode
 from ymir.common.logging import setup_logging
 from ymir.config import Settings, get_settings, load_env_file
@@ -78,14 +78,6 @@ def create_app(
         stack.message_publisher,
         waiting_grace_seconds=settings.approval_waiting_grace_seconds,
     )
-    orchestrator = OrchestrationEngine(
-        session_factory=session_factory,
-        events=stack.event_publisher,
-        messages=stack.message_publisher,
-        executor=stack.executor,
-        approval_hook=build_approval_hook(approval_stack.engine),
-    )
-    approval_stack.engine.bind_orchestrator(orchestrator)
 
     # T05：评测 harness（四维 + 双门槛 + 证据链）；judge 经网关、沙箱惰性构建
     eval_harness = build_eval_harness(
@@ -94,6 +86,25 @@ def create_app(
         gateway=stack.gateway,
         session_factory=session_factory,
     )
+    # v1.1：回边栈（确定性裁决闸门 + 回边控制器），预算预检复用既有预算设施
+    repair_stack = build_repair_stack(
+        session_factory=session_factory,
+        events=stack.event_publisher,
+        messages=stack.message_publisher,
+        harness=eval_harness,
+        store=stack.artifact_store,
+        per_run_tokens=stack.gateway.registry.config.budget.per_run_tokens,
+    )
+    orchestrator = OrchestrationEngine(
+        session_factory=session_factory,
+        events=stack.event_publisher,
+        messages=stack.message_publisher,
+        executor=stack.executor,
+        approval_hook=build_approval_hook(approval_stack.engine),
+        eval_gate=repair_stack.gate,
+        repair=repair_stack.controller,
+    )
+    approval_stack.engine.bind_orchestrator(orchestrator)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
