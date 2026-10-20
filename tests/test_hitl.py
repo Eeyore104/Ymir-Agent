@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.artifacts.store import ArtifactStore
+from ymir.common.contracts import ApprovalContext, EvalVerdict, FailedCheck
 from ymir.common.errors import InvalidParamError, NotFoundError, StateConflictError
 from ymir.events.bus import EventPublisher
 from ymir.hitl.engine import ApprovalEngine
@@ -27,7 +28,15 @@ from ymir.models.enums import RunMode
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.orchestrator.executor import StageExecutor, StageOutcome
 from ymir.orchestrator.gates import build_approval_hook
-from ymir.sop.models import END_TOKEN, GateSpec, PipelineDefinition, StageSpec, TransitionSpec
+from ymir.orchestrator.repair import BudgetSnapshot, RepairController
+from ymir.sop.models import (
+    END_TOKEN,
+    GateSpec,
+    PipelineDefinition,
+    RepairSpec,
+    StageSpec,
+    TransitionSpec,
+)
 from ymir.storage.repositories import ProjectRepository, RunRepository
 
 # --------------------------------------------------------------------- 工具
@@ -825,3 +834,354 @@ async def test_reject_to_upstream_cascades_downstream_rerun(
     run = await _wait_status(session_factory, run_id, {"completed"})
     assert run.status == "completed"
     await engine.shutdown()
+
+
+# --------------------------------------------------------------------- v1.1 终局第三关（T4.2）
+
+REPAIR_EVENT = "evaluation_failed"
+
+
+def _repair_definition(
+    *, max_rounds: int = 2, with_repair: bool = True
+) -> PipelineDefinition:
+    """``prd -> coding -> evaluation`` 主链；仅 coding 带人工关卡（聚焦第三关语义）。"""
+    repair = RepairSpec(enabled=True, max_rounds=max_rounds) if with_repair else None
+    stages = [
+        StageSpec(id="prd", role="pm", inputs=["requirement"], outputs=["prd"]),
+        StageSpec(
+            id="coding",
+            role="engineer",
+            inputs=["prd"],
+            outputs=["code"],
+            gate=GateSpec(name="代码合并前评审", on_reject_target="coding"),
+        ),
+        StageSpec(
+            id="evaluation",
+            role="qa",
+            inputs=["prd", "code"],
+            outputs=["evaluation_report"],
+        ),
+    ]
+    transitions = [
+        TransitionSpec(**{"from": "prd", "on": "stage_completed", "to": "coding"}),
+        TransitionSpec(**{"from": "coding", "on": "stage_completed", "to": "evaluation"}),
+        TransitionSpec(**{"from": "evaluation", "on": "stage_completed", "to": END_TOKEN}),
+    ]
+    if with_repair:
+        transitions.append(
+            TransitionSpec(**{"from": "evaluation", "on": REPAIR_EVENT, "to": "coding"})
+        )
+    return PipelineDefinition(
+        id="hitl-repair-test",
+        version="1.1",
+        description="终局第三关测试流水线",
+        repair=repair,
+        stages=stages,
+        transitions=transitions,
+    )
+
+
+class ScriptedVerdictGate:
+    """脚本化裁决闸门（按调用顺序返回状态；artifact_version 取最新 code 版本）。"""
+
+    def __init__(self, store: ArtifactStore, statuses: list[str]) -> None:
+        self._store = store
+        self._statuses = statuses
+        self.calls: list[int] = []
+
+    async def evaluate(self, *, run, stage, attempt: int) -> EvalVerdict:
+        index = len(self.calls)
+        self.calls.append(attempt)
+        status = self._statuses[min(index, len(self._statuses) - 1)]
+        loaded = await self._store.latest_by_name(run.project_id, "code")
+        passed = status == "pass"
+        return EvalVerdict(
+            status=status,
+            passed=passed,
+            total_score=88.0 if passed else 62.4,
+            runnability=90.0 if passed else 48.0,
+            thresholds={"total": 75.0, "runnability": 60.0},
+            suite_id="default",
+            suite_version="1.0",
+            artifact_version=loaded.version if loaded is not None else None,
+            failed_checks=()
+            if passed
+            else (
+                FailedCheck(
+                    command="python -m pytest -q",
+                    exit_code=1,
+                    timed_out=False,
+                    output="FAILED tests/test_main.py",
+                ),
+            ),
+            failure_class=None if passed else "check_failed",
+            reason="" if passed else "脚本化未达标",
+        )
+
+
+def _make_third_gate_stack(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    definition: PipelineDefinition,
+    executor: Any,
+    gate: Any,
+) -> tuple[OrchestrationEngine, ApprovalEngine]:
+    """装配「引擎（含回边 + 裁决）+ 审批引擎」，与 bootstrap 同构。"""
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    loader = lambda _pid: definition  # noqa: E731 - 测试内联 loader
+    approval_engine = ApprovalEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        definition_loader=loader,
+    )
+
+    async def budget_probe(_run_id: str) -> BudgetSnapshot:
+        return BudgetSnapshot(used_tokens=0, limit_tokens=500_000)
+
+    controller = RepairController(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        budget_probe=budget_probe,
+    )
+    engine = OrchestrationEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        executor=executor,
+        approval_hook=build_approval_hook(approval_engine),
+        eval_gate=gate,
+        repair=controller,
+        definition_loader=loader,
+    )
+    approval_engine.bind_orchestrator(engine)
+    return engine, approval_engine
+
+
+async def _event_types(
+    session_factory: async_sessionmaker[AsyncSession], run_id: str, event_type: str
+) -> list[Event]:
+    async with session_factory() as s:
+        return list(
+            (
+                await s.execute(
+                    select(Event).where(Event.run_id == run_id, Event.type == event_type)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _pending_count(
+    session_factory: async_sessionmaker[AsyncSession], run_id: str
+) -> int:
+    rows = await _list_approvals(session_factory, run_id)
+    return len([row for row in rows if row.status == "pending"])
+
+
+async def test_two_round_repair_defers_intermediate_and_reviews_final_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """2 轮修复 + 第三次 pass：coding 只审 1 条（指向 v3），中间候选只 defer 不建卡片。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    run_id = await _new_run(session, mode="key_node")
+    definition = _repair_definition(max_rounds=2)
+    executor = ArtifactSavingExecutor(store)
+    gate = ScriptedVerdictGate(store, ["fail", "fail", "pass"])
+    engine, approval_engine = _make_third_gate_stack(
+        session_factory, definition=definition, executor=executor, gate=gate
+    )
+
+    await engine.launch(run_id)
+
+    # 只有最后候选会建卡片（且指向 v3）
+    approval = await _wait_pending_approval(session_factory, run_id)
+    assert approval.stage_id == "coding"
+    assert approval.gate_name == "代码合并前评审"
+    assert approval.artifact_refs[0]["version"] == 3
+
+    coding_approvals = list(await _list_approvals(session_factory, run_id))
+    assert len(coding_approvals) == 1  # 一次 run 内第三关恰 1 条
+
+    deferred = await _event_types(session_factory, run_id, "approval.deferred")
+    # 每次 coding 完成都会 defer（3 次修复后的候选也由终局补审，不再单建卡片）
+    assert len(deferred) == 3
+    assert {row.payload["stage_id"] for row in deferred} == {"coding"}
+    assert {row.payload["reason"] for row in deferred} == {"repair_candidate"}
+
+    await approval_engine.decide(approval.id, decision="approve")
+    run = await _wait_status(session_factory, run_id, {"completed"})
+    assert run.status == "completed"
+    assert await _pending_count(session_factory, run_id) == 0
+    assert [a for a in executor.calls if a[0] == "coding"] == [
+        ("coding", 1),
+        ("coding", 2),
+        ("coding", 3),
+    ]
+    await engine.shutdown()
+
+
+async def test_reject_at_final_gate_reruns_coding_without_bumping_round(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """终局第三关驳回：coding attempt+1、产物新版本、feedback 进上下文、``round`` 不变。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    run_id = await _new_run(session, mode="key_node")
+    definition = _repair_definition(max_rounds=2)
+    executor = ArtifactSavingExecutor(store)
+    gate = ScriptedVerdictGate(store, ["fail", "pass"])
+    engine, approval_engine = _make_third_gate_stack(
+        session_factory, definition=definition, executor=executor, gate=gate
+    )
+
+    await engine.launch(run_id)
+
+    first = await _wait_pending_approval(session_factory, run_id)
+    assert first.stage_id == "coding"
+    assert first.artifact_refs[0]["version"] == 2
+
+    run_before = await _get_run(session_factory, run_id)
+    round_before = int((run_before.context or {})["repair"]["round"])
+
+    await approval_engine.decide(
+        first.id, decision="reject", feedback="请补充输入校验与错误处理"
+    )
+
+    # 再次进入终局（新版本 v3）且「人工驳回不计入自动修复轮次」
+    second = await _wait_pending_approval(session_factory, run_id)
+    assert second.id != first.id
+    assert second.stage_id == "coding"
+    assert second.artifact_refs[0]["version"] == 3
+    run_after = await _get_run(session_factory, run_id)
+    assert int((run_after.context or {})["repair"]["round"]) == round_before
+
+    # coding attempt=1(fail 轮)/2(终局驳回) 被作废，attempt=3 是新一次重跑
+    execs = await _latest_stage_execs(session_factory, run_id, "coding")
+    assert [(row.attempt, row.status) for row in execs][-1] == (3, "completed")
+
+    # feedback 进入 engineer 上下文
+    async with session_factory() as s:
+        feedbacks = list(
+            (
+                await s.execute(
+                    select(Message)
+                    .where(Message.run_id == run_id, Message.type == "feedback")
+                    .order_by(Message.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    manual = [m for m in feedbacks if (m.payload or {}).get("source") != "auto_repair"]
+    assert any("错误处理" in (m.summary or "") for m in manual)
+    assert all(m.to_role == "engineer" for m in manual)
+
+    await approval_engine.decide(second.id, decision="approve")
+    run = await _wait_status(session_factory, run_id, {"completed"})
+    assert run.status == "completed"
+    await engine.shutdown()
+
+
+async def test_repair_disabled_reviews_coding_immediately(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """回边关闭（``repair=None``）：coding 完成即审（v1.0 断言），无 defer 事件。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    run_id = await _new_run(session, mode="key_node")
+    definition = _repair_definition(with_repair=False)
+    executor = ArtifactSavingExecutor(store)
+    engine, approval_engine = _make_third_gate_stack(
+        session_factory,
+        definition=definition,
+        executor=executor,
+        gate=ScriptedVerdictGate(store, ["pass"]),
+    )
+
+    await engine.launch(run_id)
+
+    approval = await _wait_pending_approval(session_factory, run_id)
+    assert approval.stage_id == "coding"
+    assert await _event_types(session_factory, run_id, "approval.deferred") == []
+
+    await approval_engine.decide(approval.id, decision="approve")
+    run = await _wait_status(session_factory, run_id, {"completed"})
+    assert run.status == "completed"
+    await engine.shutdown()
+
+
+async def test_rounds_exhausted_never_enters_final_gate(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    temp_settings,
+) -> None:
+    """轮次耗尽：直接 failed，**不建**终局审批卡片（无 pending）。"""
+    store = ArtifactStore(session_factory, temp_settings.artifacts_dir)
+    run_id = await _new_run(session, mode="key_node")
+    definition = _repair_definition(max_rounds=2)
+    engine, _approval_engine = _make_third_gate_stack(
+        session_factory,
+        definition=definition,
+        executor=ArtifactSavingExecutor(store),
+        gate=ScriptedVerdictGate(store, ["fail", "fail", "fail"]),
+    )
+
+    await engine.launch(run_id)
+    run = await _wait_status(session_factory, run_id, {"failed"})
+
+    assert run.status == "failed"
+    assert (run.context or {})["repair"]["stop_reason"] == "rounds_exhausted"
+    assert await _list_approvals(session_factory, run_id) == []
+    assert await _pending_count(session_factory, run_id) == 0
+    await engine.shutdown()
+
+
+async def test_final_gate_reuses_pending_and_recreates_after_reject(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """去重：连续两次 final_candidate 只 1 条 pending；驳回后再终局才新建 1 条。
+
+    白盒：直接调挂点（不跑引擎），聚焦「防刷屏」这一条语义（§4.5.1）。
+    """
+    run_id = await _new_run(session, mode="key_node")
+    definition = _repair_definition()
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    approval_engine = ApprovalEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        definition_loader=lambda _pid: definition,
+    )
+    async with session_factory() as s:
+        run = await RunRepository(s).get(run_id)
+    coding = definition.stage("coding")
+    assert coding is not None
+    final_ctx = ApprovalContext(
+        phase="final_candidate", repair_active=True, repair_round=1, is_final=True
+    )
+
+    assert await approval_engine.on_stage_completed(run, coding, final_ctx) is True
+    assert await approval_engine.on_stage_completed(run, coding, final_ctx) is True
+    approvals = await _list_approvals(session_factory, run_id)
+    assert len(approvals) == 1  # 复用，不重复建卡
+    requested = await _event_types(session_factory, run_id, "approval.requested")
+    assert len(requested) == 1  # 也不重复发事件
+
+    # 人工驳回后再次终局 -> 新建 1 条（R8③：人工判定是新一轮）
+    async with session_factory() as s:
+        row = await s.get(Approval, approvals[0].id)
+        row.status = "rejected"
+        await s.commit()
+    assert await approval_engine.on_stage_completed(run, coding, final_ctx) is True
+    approvals_after = await _list_approvals(session_factory, run_id)
+    assert len(approvals_after) == 2
+    assert await _pending_count(session_factory, run_id) == 1

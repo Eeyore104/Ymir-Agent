@@ -2,13 +2,19 @@
 
 ``StageExecutor.execute`` 契约不变（引擎无感切换），职责：
 1. 收集输入：``run.context.requirement`` + 上游产物（``stage.inputs`` 中非
-   ``requirement`` 的名字 → 项目内最新版本）+ 反馈消息（``type=feedback``）；
+   ``requirement`` 的名字 → 项目内最新版本）+ 反馈消息（``type=feedback``）
+   + **定向修复上下文**（v1.1，``payload.source=auto_repair`` 的消息）；
 2. 调 :class:`~ymir.roles.runtime.RoleRuntime` 执行角色产出；
 3. coding 阶段（``use_sandbox=true``）：产物写入沙箱执行 ``run_commands`` 冒烟，
    结果并入 ``smoke_report.json``（冒烟失败不阻断阶段，仅记录）；
 4. 产物落 :class:`~ymir.artifacts.store.ArtifactStore` 成新版本 + 发
    ``artifact.created`` 事件；
 5. 返回 :class:`~ymir.orchestrator.executor.StageOutcome`（output_refs = 产物引用）。
+
+v1.1 定向修复（docs/07 §4.4.4 / B-01③）：自动修复消息**不进** ``feedback`` 列表
+（避免双份注入），而是解析成 :class:`~ymir.roles.io.RepairContext`，并按
+``previous.artifact_name/version`` 加载**上一版自身产物**填 ``previous_output``
+（加载失败只告警、``previous_output=None``，绝不让阶段失败）。
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ from ymir.events.log import EventType
 from ymir.models.entities import Message, PipelineRun
 from ymir.models.enums import ArtifactType, MessageType
 from ymir.orchestrator.executor import StageOutcome
-from ymir.roles.io import StageInput, StageOutput
+from ymir.roles.io import RepairContext, StageInput, StageOutput, UpstreamArtifact
 from ymir.roles.runtime import RoleRuntime
 from ymir.sandbox.base import NetworkPolicy
 from ymir.sandbox.session import SandboxService
@@ -51,6 +57,12 @@ _SMOKE_STREAM_LIMIT = 4000
 
 #: 单阶段冒烟命令数上限（防滥用）
 _SMOKE_MAX_COMMANDS = 5
+
+#: 自动修复消息的来源标识（与 ``RepairController`` 发出的 ``payload.source`` 一致）
+_AUTO_REPAIR_SOURCE = "auto_repair"
+
+#: 失败检查 output 摘要的缺省总长上限（与 ``RepairContextSpec`` 缺省一致）
+_DEFAULT_DETAIL_CHARS = 1200
 
 
 class RoleStageExecutor:
@@ -164,16 +176,33 @@ class RoleStageExecutor:
             )
 
         feedback = await self._collect_feedback(run.id, stage.role)
+        repair_context, previous_output = await self._collect_repair_context(run, stage.role)
         return StageInput(
             requirement=requirement,
             project_name=project_name,
             upstream=upstream,
             feedback=feedback,
             attempt=attempt,
+            repair_context=repair_context,
+            previous_output=previous_output,
         )
 
     async def _collect_feedback(self, run_id: str, role_id: str) -> list[str]:
-        """反馈消息（T04 驳回产生；此处已按「目标角色 = 本阶段角色」过滤）。"""
+        """反馈消息（T04 驳回产生；此处已按「目标角色 = 本阶段角色」过滤）。
+
+        v1.1：自动修复消息（``payload.source=auto_repair``）在 **Python 侧过滤掉** ——
+        它已由 :meth:`_collect_repair_context` 解析成结构化修复上下文，若同时并入
+        ``feedback`` 会把同一份失败信息注入两遍（成本翻倍且语义重复）。
+        """
+        rows = await self._feedback_messages(run_id, role_id)
+        return [
+            row.summary or ""
+            for row in rows
+            if row.summary and not _is_auto_repair(row)
+        ]
+
+    async def _feedback_messages(self, run_id: str, role_id: str) -> list[Message]:
+        """某 run 指向某角色的全部反馈消息（按 seq 升序）。"""
         stmt = (
             select(Message)
             .where(
@@ -184,8 +213,70 @@ class RoleStageExecutor:
             .order_by(Message.seq.asc())
         )
         async with self._session_factory() as session:
-            rows = list((await session.execute(stmt)).scalars().all())
-        return [row.summary or "" for row in rows if row.summary]
+            return list((await session.execute(stmt)).scalars().all())
+
+    async def _collect_repair_context(
+        self, run: PipelineRun, role_id: str
+    ) -> tuple[RepairContext | None, UpstreamArtifact | None]:
+        """解析最新一条自动修复消息（v1.1，docs/07 §4.4.4）。
+
+        返回 ``(RepairContext | None, 上一版自身产物 | None)``；无该消息时双 ``None``
+        （v1.0 行为不变）。上一版产物加载失败只告警，绝不阻断阶段。
+        """
+        rows = await self._feedback_messages(run.id, role_id)
+        auto_repair = [row for row in rows if _is_auto_repair(row)]
+        if not auto_repair:
+            return None, None
+
+        message = auto_repair[-1]  # seq 升序的末条 = 最新一轮
+        payload = message.payload if isinstance(message.payload, dict) else {}
+        context = payload.get("context")
+        context = context if isinstance(context, dict) else {}
+        previous = payload.get("previous")
+        previous = dict(previous) if isinstance(previous, dict) else None
+
+        repair_context = RepairContext(
+            repair_round=_as_int(payload.get("repair_round"), 0),
+            max_rounds=_as_int(payload.get("max_rounds"), 0),
+            verdict=_as_dict(payload.get("verdict")),
+            failed_checks=_as_check_list(payload.get("failed_checks")),
+            previous=previous,
+            directive=str(payload.get("directive") or ""),
+            max_detail_chars=_as_int(
+                context.get("max_detail_chars"), _DEFAULT_DETAIL_CHARS
+            ),
+        )
+        previous_output = await self._load_previous_output(run, repair_context)
+        return repair_context, previous_output
+
+    async def _load_previous_output(
+        self, run: PipelineRun, repair_context: RepairContext
+    ) -> UpstreamArtifact | None:
+        """按 ``previous.artifact_name/version`` 加载上一版自身产物（失败仅告警）。"""
+        previous = repair_context.previous
+        if not previous:
+            return None
+        name = str(previous.get("artifact_name") or "code")
+        version = previous.get("version")
+        version_int = version if isinstance(version, int) else None
+        try:
+            latest = await self._store.latest_by_name(run.project_id, name)
+            if latest is None:
+                return None
+            loaded = await self._store.load(latest.artifact.id, version_int)
+        except Exception:  # noqa: BLE001 - 上一版缺失/加载失败不影响本轮执行
+            logger.warning(
+                "定向修复：上一版产物加载失败，按未提供处理（run=%s name=%s version=%s）",
+                run.id,
+                name,
+                version,
+                exc_info=True,
+            )
+            return None
+        repair_context.previous.setdefault("file_count", len(loaded.files))
+        return UpstreamArtifact(
+            name=name, version=loaded.version, files=loaded.files
+        )
 
     # ------------------------------------------------------------------ 沙箱冒烟
 
@@ -254,3 +345,32 @@ class RoleStageExecutor:
             except Exception:  # noqa: BLE001 - 销毁失败仅告警
                 logger.exception("沙箱会话销毁失败（run %s）", run.id)
         return report
+
+
+# --------------------------------------------------------------------- 消息解包工具
+
+
+def _is_auto_repair(message: Message) -> bool:
+    """是否为自动修复消息（``payload.source == "auto_repair"``）。"""
+    payload = message.payload
+    return isinstance(payload, dict) and payload.get("source") == _AUTO_REPAIR_SOURCE
+
+
+def _as_int(value: Any, default: int) -> int:
+    """安全转 int（脏 payload 不炸阶段，例如字符串 / None / 浮点）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """安全转 dict（非 dict 返回空字典副本）。"""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_check_list(value: Any) -> list[dict[str, Any]]:
+    """安全转「失败检查列表」（非列表 / 非 dict 元素一律丢弃）。"""
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]

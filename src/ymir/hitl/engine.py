@@ -38,6 +38,7 @@ from typing import Protocol, runtime_checkable
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ymir.common.contracts import ApprovalContext
 from ymir.common.errors import InvalidParamError, NotFoundError, StateConflictError
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
@@ -56,9 +57,9 @@ from ymir.messages.bus import MessagePublisher
 from ymir.messages.schema import SUMMARY_MAX_LENGTH, MessageCreate
 from ymir.models.base import utcnow
 from ymir.models.entities import Approval, PipelineRun, StageExecution
-from ymir.models.enums import ApprovalStatus, MessageType, RunStatus, StageStatus
+from ymir.models.enums import ApprovalStatus, MessageType, RunMode, RunStatus, StageStatus
 from ymir.sop.loader import load_pipeline
-from ymir.sop.models import END_TOKEN, PipelineDefinition, StageSpec
+from ymir.sop.models import PipelineDefinition, StageSpec
 from ymir.storage.repositories import (
     ApprovalRepository,
     RunRepository,
@@ -91,20 +92,11 @@ def _downstream_stage_ids(definition: PipelineDefinition, stage_id: str) -> list
 
     用于驳回回退到上游阶段时的「下游级联重跑」判定（QA-01）：目标阶段的
     下游（可达链上的）阶段需与新一次上游产出保持一致，不能沿用旧产物。
+
+    v1.1：实现**委托** :meth:`PipelineDefinition.downstream_of` —— 与引擎回边
+    共用同一套闭包语义（此前是两份私有实现，容易漂移）。
     """
-    downstream: list[str] = []
-    seen: set[str] = set()
-    frontier: list[str] = [stage_id]
-    while frontier:
-        current = frontier.pop()
-        for edge in definition.outgoing(current, on="stage_completed"):
-            nxt = edge.to
-            if nxt == END_TOKEN or nxt in seen:
-                continue
-            seen.add(nxt)
-            downstream.append(nxt)
-            frontier.append(nxt)
-    return downstream
+    return definition.downstream_of(stage_id)
 
 
 class ApprovalEngine:
@@ -138,14 +130,35 @@ class ApprovalEngine:
 
     # ------------------------------------------------------------------ 挂点
 
-    async def on_stage_completed(self, run: PipelineRun, stage: StageSpec) -> bool:
+    async def on_stage_completed(
+        self,
+        run: PipelineRun,
+        stage: StageSpec,
+        ctx: ApprovalContext | None = None,
+    ) -> bool:
         """``ApprovalHook`` 实现：返回 True 表示阶段完成后进入 waiting_approval。
 
+        - **v1.1 defer**（§4.5.1）：``key_node`` 模式下，回边生效且该阶段属于修复闭环
+          （``[repair.stage .. eval_stage]``）时，中间候选**不建卡片**，只发
+          ``approval.deferred`` 并放行；最终候选由引擎的「终局第三关」补审 1 次。
+          ``batch``（自动通过轨迹）与 ``debug``（全步骤人审）保持 v1.0 语义不变；
         - key_node：人工关卡阶段 -> 建 pending 审批并阻断；
         - debug：所有阶段 -> 建 pending 审批并阻断（关卡名缺省为阶段 ID）；
         - batch：人工关卡阶段 -> 落自动通过记录（审计轨迹）后放行。
         """
         policy = ApprovalPolicy.for_run(run)
+        if ctx is not None and self._should_defer(run, stage, policy, ctx):
+            await self._events.emit(
+                run.id,
+                EventType.APPROVAL_DEFERRED,
+                {
+                    "stage_id": stage.id,
+                    "gate_name": gate_name_of(stage),
+                    "repair_round": ctx.repair_round,
+                    "reason": "repair_candidate",
+                },
+            )
+            return False
         if not policy.requires_approval(stage):
             if policy.mode.value == "batch" and is_human_gate(stage):
                 await self._record_auto_approval(run, stage)
@@ -153,13 +166,49 @@ class ApprovalEngine:
         await self._request_approval(run, stage, policy)
         return True
 
+    def _should_defer(
+        self,
+        run: PipelineRun,
+        stage: StageSpec,
+        policy: ApprovalPolicy,
+        ctx: ApprovalContext,
+    ) -> bool:
+        """是否对「修复闭环内的中间候选」跳过第三关（仅 key_node）。
+
+        取 key_node 限定是刻意的：``batch`` 需要落自动通过审计轨迹、``debug`` 是
+        用户显式的全步骤人审，两者都不该被回边语义悄悄改掉（v1.0 断言不变）。
+        """
+        if ctx.phase != "stage_completed" or not ctx.repair_active:
+            return False
+        if policy.mode is not RunMode.KEY_NODE or not is_human_gate(stage):
+            return False
+        try:
+            definition = self._definition_loader(run.pipeline_id)
+        except Exception:  # noqa: BLE001 - 定义不可读时退回 v1.0 行为（照常审）
+            logger.warning("defer 判定：流水线定义不可读 %s", run.pipeline_id, exc_info=True)
+            return False
+        spec = definition.repair
+        if spec is None or not definition.repair_active():
+            return False
+        scope = {spec.stage, *definition.downstream_of(spec.stage)}
+        return stage.id in scope
+
     async def _request_approval(
         self, run: PipelineRun, stage: StageSpec, policy: ApprovalPolicy
     ) -> Approval:
-        """创建 pending 审批并发 ``approval.requested``（引擎随后转入 waiting_approval）。"""
+        """创建 pending 审批并发 ``approval.requested``（引擎随后转入 waiting_approval）。
+
+        v1.1 **防刷屏**（§4.5.1）：同 run + 同 stage 已有 pending 时直接复用，
+        不新建记录、不重复发 ``approval.requested``。人工驳回后该记录已变
+        ``rejected``，下次终局会新建一次（R8③ 语义：人工判定是新一轮）。
+        """
         refs = await self._latest_output_refs(run.id, stage.id)
         async with self._session_factory() as session:
-            approval = await ApprovalRepository(session).create(
+            repo = ApprovalRepository(session)
+            existing = await repo.get_pending(run.id, stage.id)
+            if existing is not None:
+                return existing
+            approval = await repo.create(
                 run_id=run.id,
                 stage_id=stage.id,
                 gate_name=gate_name_of(stage),
@@ -181,7 +230,15 @@ class ApprovalEngine:
         return approval
 
     async def _record_auto_approval(self, run: PipelineRun, stage: StageSpec) -> Approval:
-        """batch 模式审计轨迹：人工关卡自动通过（approved，不阻断）。"""
+        """batch 模式审计轨迹：人工关卡自动通过（approved，不阻断）。
+
+        v1.1 幂等：同一 (run, stage) 已有 batch 自动通过记录时直接复用 ——
+        终局第三关会再次扫到该阶段（``final_candidate``），不得重复落审计记录
+        （否则 batch 的审批条数会多出一条，破坏「一阶段一轨迹」的口径）。
+        """
+        existing = await self._existing_auto_approval(run.id, stage.id)
+        if existing is not None:
+            return existing
         refs = await self._latest_output_refs(run.id, stage.id)
         async with self._session_factory() as session:
             repo = ApprovalRepository(session)
@@ -210,6 +267,21 @@ class ApprovalEngine:
             },
         )
         return approval
+
+    async def _existing_auto_approval(self, run_id: str, stage_id: str) -> Approval | None:
+        """该 (run, stage) 是否已有 batch 自动通过记录（幂等复用）。"""
+        stmt = (
+            select(Approval)
+            .where(
+                Approval.run_id == run_id,
+                Approval.stage_id == stage_id,
+                Approval.status == ApprovalStatus.APPROVED.value,
+                Approval.decided_by == BATCH_DECIDER,
+            )
+            .limit(1)
+        )
+        async with self._session_factory() as session:
+            return (await session.execute(stmt)).scalar_one_or_none()
 
     async def _latest_output_refs(self, run_id: str, stage_id: str) -> list[object]:
         """阶段最新执行记录的产物引用（审批卡片的待审内容）。"""
@@ -381,12 +453,16 @@ class ApprovalEngine:
             if latest is not None and latest.status == StageStatus.COMPLETED.value:
                 latest.status = StageStatus.FAILED.value
                 latest.error = f"被驳回（审批不通过），等待重跑: {approval.gate_name}"
-            if target_stage_id != approval.stage_id:
-                await self._invalidate_downstream(
-                    session, run.id, definition, target_stage_id, approval.gate_name
-                )
-                if run.current_stage_id != target_stage_id:
-                    run.current_stage_id = target_stage_id
+            # v1.1：**无条件**作废下游并把推进指针回退到目标阶段。
+            # 原因：终局第三关的卡片在 evaluation 阶段创建、审的却是 coding 产物
+            # （approval.stage_id == target），若只在「驳回目标 ≠ 卡片阶段」时才级联，
+            # 已被终局审查过的 evaluation 会残留 completed，恢复时被「补推进」直接带到终点，
+            # 驳回形同虚设。中间候选正常驳回时下游尚无 completed 行，本调用是 no-op。
+            await self._invalidate_downstream(
+                session, run.id, definition, target_stage_id, approval.gate_name
+            )
+            if run.current_stage_id != target_stage_id:
+                run.current_stage_id = target_stage_id
             await session.commit()
         return target_stage_id, target_role
 

@@ -18,13 +18,21 @@ run 绑定：从 launch 到终态只有一个任务；``paused`` / ``waiting_app
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ymir.common.errors import BizCode, BudgetExceededError, NotFoundError
+from ymir.common.contracts import ApprovalContext
+from ymir.common.errors import (
+    BizCode,
+    BudgetExceededError,
+    InvalidParamError,
+    NotFoundError,
+    StateConflictError,
+)
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
 from ymir.messages.bus import MessagePublisher
@@ -33,7 +41,12 @@ from ymir.models.base import utcnow
 from ymir.models.entities import PipelineRun, StageExecution
 from ymir.models.enums import RunStatus, StageStatus
 from ymir.orchestrator.executor import StageExecutor, StageOutcome
-from ymir.orchestrator.repair import EvaluationGate, RepairController
+from ymir.orchestrator.repair import (
+    STOP_ACCEPTED,
+    EvaluationGate,
+    RepairController,
+    repair_state,
+)
 from ymir.orchestrator.transitions import ensure_run_transition
 from ymir.sop.loader import load_pipeline
 from ymir.sop.models import END_TOKEN, MAIN_EVENT, PipelineDefinition, StageSpec
@@ -42,7 +55,9 @@ from ymir.storage.repositories import RunRepository, StageExecutionRepository
 logger = logging.getLogger(__name__)
 
 #: T04 审批挂点：返回 True 时该阶段完成后进入 waiting_approval（T02 为 None，不阻断）
-ApprovalHook = Callable[[PipelineRun, StageSpec], Awaitable[bool]]
+#: v1.1：第三参 ``ctx`` 区分「阶段完成 / 终局候选」并携带回边状态（缺省 None，
+#: 既有两参 hook 仍可用 —— 引擎按签名自适应调用，见 ``_hook_passes_context``）。
+ApprovalHook = Callable[..., Awaitable[bool]]
 
 
 def _biz_code_of(exc: BaseException) -> int | None:
@@ -61,6 +76,80 @@ def _rounds_text(total_score: float, thresholds: dict[str, float]) -> str:
     """轮次耗尽的人读原因（§4.5.2 文案口径）。"""
     limit = thresholds.get("total", 75.0)
     return f"轮次耗尽，仍未通过（total={total_score:.1f}<{limit:g}）"
+
+
+def _ensure_failed_for_manual(run: PipelineRun, action: str) -> None:
+    """``accept-best`` / ``extend-repair`` 只允许作用于 ``failed`` 的 run（否则 1003）。
+
+    注意：不能只依赖 ``ensure_run_transition`` —— 迁移表里 ``running -> completed``
+    是合法边（正常完成），若不做前置状态判断，``accept-best`` 会误放行运行中的 run。
+    """
+    if run.status != RunStatus.FAILED.value:
+        raise StateConflictError(
+            f"动作 {action} 仅可作用于 failed 的 run（当前状态 {run.status}）"
+        )
+
+
+def _history_entries(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """``context.repair.history`` 中的合法条目（脏数据一律丢弃）。"""
+    history = state.get("history")
+    if not isinstance(history, list):
+        return []
+    return [entry for entry in history if isinstance(entry, dict)]
+
+
+def _best_history_entry(state: dict[str, Any]) -> dict[str, Any]:
+    """最优未达标轮次：``total`` 最高，并列取 ``round`` 最大（§4.5.3）。"""
+    entries = _history_entries(state)
+    if not entries:
+        raise InvalidParamError("无可接受的历史轮次（context.repair.history 为空）")
+    return max(
+        entries,
+        key=lambda entry: (_as_float(entry.get("total")), _as_int(entry.get("round"))),
+    )
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _hook_passes_context(hook: Any) -> bool:
+    """审批挂点是否接受第三个 ``ctx`` 参数（v1.0 两参 hook 兼容）。
+
+    签名无法内省时按「接受 ctx」处理（我们自己的 :func:`build_approval_hook`
+    就是三参；无法内省通常意味着可调用对象包装，宁可多传）。
+    """
+    if hook is None:
+        return False
+    try:
+        params = inspect.signature(hook).parameters
+    except (TypeError, ValueError):
+        return True
+    positional = [
+        param
+        for param in params.values()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_varargs = any(
+        param.kind is inspect.Parameter.VAR_POSITIONAL for param in params.values()
+    )
+    return has_varargs or len(positional) >= 3
+
+
+def _repair_round(context: dict[str, Any] | None) -> int:
+    """当前修复轮次（0 = 首轮）；``context["repair"]["round"]`` 缺省 0。"""
+    return int(repair_state(context).get("round", 0) or 0)
 
 
 class OrchestrationEngine:
@@ -83,6 +172,8 @@ class OrchestrationEngine:
         self._messages = messages
         self._executor = executor or StageExecutor()
         self._approval_hook = approval_hook
+        # 既有两参 hook（tests/test_orchestrator.py）仍可用：按签名决定是否传 ctx
+        self._hook_takes_ctx = _hook_passes_context(approval_hook)
         self._definition_loader = definition_loader or load_pipeline
         # v1.1 回边（docs/07 §4.3.6）：两者同时注入才进入裁决分叉；
         # 任一为 None（含单角色 / 截断流水线）时行为与 v1.0 完全一致。
@@ -159,6 +250,128 @@ class OrchestrationEngine:
             await session.commit()
         await self._events.emit(
             run_id, EventType.RUN_STARTED, {"status": "running", "retry": True, "mode": run.mode}
+        )
+        self._wake(run_id)
+        return run
+
+    # ------------------------------------------------------------------ 人工介入（v1.1）
+
+    async def request_accept_best(
+        self, run_id: str, *, accepted_by: str = "user"
+    ) -> PipelineRun:
+        """接受「最优未达标版本」：failed -> completed（B-07，docs/07 §4.5.3）。
+
+        前置：``status=failed`` 且 ``context.repair.history`` 非空；取 ``history`` 中
+        ``total`` 最高项（并列取 ``round`` 最大）的 ``artifact_version`` 作为接受版本。
+        写入 ``context.repair.accepted`` 并落 ``repair.accepted`` + ``run.completed
+        {accepted_unqualified: true}`` 两个事件（机器可读原因不新增错误码）。
+        """
+        async with self._session_factory() as session:
+            run = await self._require_run(session, run_id)
+            _ensure_failed_for_manual(run, "accept-best")
+            best = _best_history_entry(repair_state(run.context))
+            version = best.get("artifact_version")
+            if version is None:
+                raise InvalidParamError("最优轮次缺少 artifact_version，无法接受")
+            total = best.get("total")
+            runnability = best.get("runnability")
+            accepted = {
+                "version": version,
+                "total": total,
+                "runnability": runnability,
+                "accepted_by": accepted_by,
+                "at": utcnow().isoformat(),
+            }
+            context = dict(run.context or {})
+            repair = dict(context.get("repair") or {})
+            repair["accepted"] = accepted
+            repair["stop_reason"] = STOP_ACCEPTED
+            context["repair"] = repair
+            run.context = context
+            ensure_run_transition(run.status, RunStatus.COMPLETED)
+            run.status = RunStatus.COMPLETED.value
+            run.error = f"人工接受未达标版本 v{version}（total={total}）"
+            run.error_code = None
+            run.finished_at = utcnow()
+            await session.commit()
+        await self._events.emit(
+            run_id,
+            EventType.REPAIR_ACCEPTED,
+            {
+                "accepted_version": version,
+                "total": total,
+                "runnability": runnability,
+                "accepted_by": accepted_by,
+            },
+        )
+        await self._events.emit(
+            run_id,
+            EventType.RUN_COMPLETED,
+            {"status": "completed", "accepted_unqualified": True},
+        )
+        self._wake(run_id)  # 挂起中的任务需醒来看到终态并退出
+        return run
+
+    async def request_extend_repair(self, run_id: str) -> PipelineRun:
+        """追加 1 轮修复：failed -> running（B-07，docs/07 §4.5.3）。
+
+        前置：``status=failed`` 且 ``history`` 非空；先做**预算预检**（fail-closed，
+        不通过抛 ``BudgetExceededError`` 且 run 保持 failed）。通过后 ``extra_rounds += 1``、
+        ``current_stage_id = repair.stage``（否则恢复会从 evaluation 重跑而不是 coding）、
+        作废 coding 与下游的 completed 执行，最后 ``running`` 并唤醒推进任务。
+        """
+        async with self._session_factory() as session:
+            run = await self._require_run(session, run_id)
+            _ensure_failed_for_manual(run, "extend-repair")
+            state = repair_state(run.context)
+            if not _history_entries(state):
+                raise InvalidParamError("无可追加的修复轮次（context.repair.history 为空）")
+            definition = self._definition_loader(run.pipeline_id)
+            spec = definition.repair
+            if spec is None or not definition.repair_active():
+                raise InvalidParamError("该流水线未启用回边（repair），无法追加修复轮次")
+
+        if self._repair is None:
+            raise InvalidParamError("回边控制器未装配，无法追加修复轮次")
+        if not await self._repair.check_budget(run_id):
+            raise BudgetExceededError(
+                "追加修复被拒绝：预算预检未通过（已用达上限或预检故障）"
+            )
+
+        await self._repair.rewind_to_repair(run_id, definition, reason="manual_extend")
+
+        round_no = int(state.get("round", 0))
+        extra_rounds = max(0, int(state.get("extra_rounds", 0))) + 1
+        limit = spec.max_rounds + extra_rounds
+        async with self._session_factory() as session:
+            run = await self._require_run(session, run_id)
+            ensure_run_transition(run.status, RunStatus.RUNNING)
+            context = dict(run.context or {})
+            repair = dict(context.get("repair") or {})
+            repair["extra_rounds"] = extra_rounds
+            repair["max_rounds"] = limit
+            repair["stage"] = spec.stage
+            repair["stop_reason"] = None
+            context["repair"] = repair
+            run.context = context
+            run.status = RunStatus.RUNNING.value
+            run.error = None
+            run.error_code = None
+            run.finished_at = None
+            run.current_stage_id = spec.stage
+            await session.commit()
+        await self._events.emit(
+            run_id,
+            EventType.REPAIR_STARTED,
+            {
+                "repair_round": round_no,
+                "max_rounds": limit,
+                "target_stage": spec.stage,
+                "from_stage": definition.eval_stage_id(),
+                "artifact_version": None,
+                "manual": True,
+                "directive_digest": "",
+            },
         )
         self._wake(run_id)
         return run
@@ -275,8 +488,14 @@ class OrchestrationEngine:
         latest = await self._latest_stage_exec(run_id, stage.id)
 
         # 恢复场景：进程被杀在「阶段已完成、run 未推进」的间隙 -> 补推进
+        # （终局审批放行后也走这里：evaluation 已完成，补推进到终点）
         if latest is not None and latest.status == StageStatus.COMPLETED.value:
-            return await self._advance(run_id, definition, stage)
+            result = await self._advance(run_id, definition, stage)
+            if result == "finished":
+                await self._events.emit(
+                    run_id, EventType.RUN_COMPLETED, {"status": "completed"}
+                )
+            return result
 
         attempt = (latest.attempt + 1) if latest is not None else 1
         payload_common = {"stage_id": stage.id, "role_id": stage.role, "attempt": attempt}
@@ -344,7 +563,24 @@ class OrchestrationEngine:
         await self._publish_stage_message(run_id, definition, stage, outcome, on=event)
 
         # 审批挂点（T02 无 hook 直接推进；T04 接入三关与审批记录）
-        if self._approval_hook is not None and await self._approval_hook(run, stage):
+        # v1.1：传 ctx（阶段完成 / 回边状态），HITL 引擎据此对中间候选 defer
+        stage_ctx = ApprovalContext(
+            phase="stage_completed",
+            repair_active=definition.repair_active(),
+            repair_round=_repair_round(run.context),
+        )
+        if await self._invoke_hook(run, stage, stage_ctx):
+            await self._enter_waiting_approval(run_id)
+            return "halted"
+
+        # 终局第三关（§4.5.1）：裁决 pass 且即将进入终点时，对最终候选补审 1 次。
+        # exhausted / budget_blocked 已在上面提前 return，不会走到这里。
+        if (
+            event == MAIN_EVENT
+            and definition.repair_active()
+            and definition.next_stage(stage.id) == END_TOKEN
+            and await self._final_gate(run, definition)
+        ):
             await self._enter_waiting_approval(run_id)
             return "halted"
 
@@ -355,6 +591,47 @@ class OrchestrationEngine:
             await self._fail_run(run_id, f"阶段 {stage.id} 无后继路径（定义缺陷）")
             return "failed"
         return result
+
+    async def _invoke_hook(
+        self, run: PipelineRun, stage: StageSpec, ctx: ApprovalContext
+    ) -> bool:
+        """调用审批挂点（按签名自适应：v1.0 两参 hook / v1.1 三参 hook 都支持）。"""
+        hook = self._approval_hook
+        if hook is None:
+            return False
+        if self._hook_takes_ctx:
+            return bool(await hook(run, stage, ctx))
+        return bool(await hook(run, stage))
+
+    async def _final_gate(
+        self, run: PipelineRun, definition: PipelineDefinition
+    ) -> bool:
+        """终局第三关（§4.5.1）：只对**最终候选**补审 1 次（回边生效时）。
+
+        扫描修复闭环内的阶段，仅对声明了人工关卡的阶段调挂点（``phase=final_candidate``）；
+        任一返回 True 即阻断（引擎随后转 waiting_approval）。中间候选已在
+        ``on_stage_completed`` 里 defer，因此这里一个 run 内最多产生 1 条卡片
+        （``_request_approval`` 另有 pending 复用保护）。
+        """
+        if self._approval_hook is None:
+            return False
+        spec = definition.repair
+        if spec is None:
+            return False
+        scope = [spec.stage, *definition.downstream_of(spec.stage)]
+        final_ctx = ApprovalContext(
+            phase="final_candidate",
+            repair_active=True,
+            repair_round=_repair_round(run.context),
+            is_final=True,
+        )
+        for stage_id in scope:
+            gate_stage = definition.stage(stage_id)
+            if gate_stage is None or gate_stage.gate is None:
+                continue  # 只对人工关卡补审
+            if await self._invoke_hook(run, gate_stage, final_ctx):
+                return True
+        return False
 
     async def _advance(
         self,

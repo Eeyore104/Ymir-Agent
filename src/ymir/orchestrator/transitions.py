@@ -35,7 +35,13 @@ RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     ),
     RunStatus.PAUSED.value: frozenset({RunStatus.RUNNING.value, RunStatus.FAILED.value}),
     RunStatus.COMPLETED.value: frozenset(),
-    RunStatus.FAILED.value: frozenset({RunStatus.RUNNING.value}),  # retry-stage
+    # failed -> running：retry-stage / extend-repair；
+    # failed -> completed：**accept-best 专用**（人工接受未达标最优版，§4.5.3）。
+    # 端点白名单保持不变：其余入口（pause/resume/cancel/retry-stage）仍按各自语义
+    # 走 ensure_run_transition，不会因本表放宽而误放行到 completed。
+    RunStatus.FAILED.value: frozenset(
+        {RunStatus.RUNNING.value, RunStatus.COMPLETED.value}
+    ),
 }
 
 #: stage 合法迁移

@@ -47,6 +47,7 @@ Decision = Literal["pass", "skip", "repair", "exhausted", "budget_blocked"]
 #: 跳过原因 / 终止原因（docs/07 §14 唯一口径）
 STOP_ROUNDS_EXHAUSTED = "rounds_exhausted"
 STOP_BUDGET_EXCEEDED = "budget_exceeded"
+STOP_ACCEPTED = "accepted"
 
 #: 自动修复指令原文（§4.4.4；定向修复只动与失败检查相关的实现）
 REPAIR_DIRECTIVE = (
@@ -274,6 +275,14 @@ class RepairController:
         await self._emit_repair_started(run.id, definition, verdict, next_round, limit)
         await self._publish_repair_message(run.id, definition, verdict, next_round, limit)
         return "repair"
+
+    async def check_budget(self, run_id: str) -> bool:
+        """预算预检（``True`` = 可以继续发起修复；供 ``extend-repair`` 复用）。
+
+        与 :meth:`decide` 内的预检同源（:meth:`_budget_blocked`），因此同样 **fail-closed**：
+        探针故障视为不通过（宁可误停不可超支）。
+        """
+        return not await self._budget_blocked(run_id)
 
     async def rewind_to_repair(
         self,

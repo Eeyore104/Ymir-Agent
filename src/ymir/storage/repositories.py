@@ -200,6 +200,31 @@ class ApprovalRepository(BaseRepository[Approval]):
         )
         return await self.add(approval)
 
+    async def get_pending(
+        self,
+        run_id: str,
+        stage_id: str,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> Approval | None:
+        """取某 run 某阶段当前 pending 的审批（防刷屏复用，§4.5.1）。
+
+        「同 run + 同 stage 已有 pending」时不得新建卡片；人工驳回后该记录已变
+        ``rejected``，因此下次终局会正常新建一次（R8③ 语义）。
+        """
+        stmt = (
+            select(Approval)
+            .where(
+                Approval.run_id == run_id,
+                Approval.stage_id == stage_id,
+                Approval.status == ApprovalStatus.PENDING.value,
+                Approval.tenant_id == tenant_id,
+            )
+            .order_by(Approval.created_at.desc(), Approval.id.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_filtered(
         self,
         *,

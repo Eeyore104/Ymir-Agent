@@ -25,11 +25,21 @@ from ymir.api.schemas import (
     RunCreated,
     RunOut,
 )
-from ymir.common.errors import NotFoundError
+from ymir.common.errors import InvalidParamError, NotFoundError
 from ymir.messages.bus import message_summary_of
 from ymir.storage.repositories import ProjectRepository, RunRepository
 
 router = APIRouter(tags=["runs"])
+
+#: 运行控制动作白名单（v1.0 四动作 + v1.1 人工介入两动作，§4.5.3）
+RUN_ACTIONS: tuple[str, ...] = (
+    "pause",
+    "resume",
+    "cancel",
+    "retry-stage",
+    "accept-best",
+    "extend-repair",
+)
 
 
 @router.post(
@@ -80,7 +90,7 @@ async def get_run(
 @router.post(
     "/runs/{run_id}/actions",
     response_model=ApiResponse[RunActionOut],
-    summary="运行控制动作（pause / resume / cancel / retry-stage）",
+    summary="运行控制动作（pause / resume / cancel / retry-stage / accept-best / extend-repair）",
 )
 async def run_action(
     run_id: str,
@@ -97,8 +107,15 @@ async def run_action(
         "resume": orchestrator.request_resume,
         "cancel": orchestrator.request_cancel,
         "retry-stage": orchestrator.request_retry_stage,
+        "accept-best": orchestrator.request_accept_best,
+        "extend-repair": orchestrator.request_extend_repair,
     }
-    updated = await handlers[payload.action](run_id)
+    handler = handlers.get(payload.action)
+    if handler is None:
+        raise InvalidParamError(
+            f"非法的运行动作 {payload.action!r}，合法动作：{', '.join(RUN_ACTIONS)}"
+        )
+    updated = await handler(run_id)
     return {
         "code": 0,
         "data": RunActionOut(run_id=run_id, action=payload.action, status=updated.status),

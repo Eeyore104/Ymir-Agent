@@ -118,9 +118,15 @@ class HealthData(BaseModel):
 
 
 class RunActionPayload(BaseModel):
-    """运行控制动作（§6.1 runs/{id}/actions）。"""
+    """运行控制动作（§6.1 runs/{id}/actions）。
 
-    action: Literal["pause", "resume", "cancel", "retry-stage"]
+    白名单（由路由层校验，非法 -> 1001）：``pause`` / ``resume`` / ``cancel`` /
+    ``retry-stage``（v1.0 四动作）+ ``accept-best`` / ``extend-repair``（v1.1 人工介入，
+    §4.5.3）。字段类型放宽为 ``str``，以便给出「非法动作 + 合法动作清单」的可读报错
+    （``Literal`` 只会返回 422 校验错误）。
+    """
+
+    action: str
 
 
 class RunActionOut(BaseModel):

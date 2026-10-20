@@ -125,6 +125,22 @@ class EvalVerdict:
         return self.status == "unknown"
 
 
+@dataclass(frozen=True)
+class ApprovalContext:
+    """审批上下文（v1.1，docs/07 §4.4.2 / §4.5.1）：区分「阶段完成」与「终局候选」。
+
+    - ``phase="stage_completed"``：阶段完成时的常规挂点；``repair_active=True`` 且该
+      阶段属于修复闭环时，实施 ``defer``（中间候选不建卡片，只发 ``approval.deferred``）；
+    - ``phase="final_candidate"``：即将进入终点时对**最终候选版本**补审 1 次
+      （``is_final=True``）。
+    """
+
+    phase: str = "stage_completed"
+    repair_active: bool = False
+    repair_round: int = 0
+    is_final: bool = False
+
+
 def dump_structured(model: BaseModel) -> dict[str, Any]:
     """结构化数据序列化（落 ``<out>.json``）。"""
     return model.model_dump(mode="json")
