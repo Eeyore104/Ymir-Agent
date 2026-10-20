@@ -7,6 +7,8 @@
 
 一句话：**把一句需求，变成一套经过评审、评测、可导出的完整软件交付物。**
 
+v1.1 起再加一层：**评测不达标会自动回边返工**——失败检查定向回灌工程师、最多 N 轮、预算守门，直到双门槛通过或轮次耗尽；耗尽后仍可人工接受最优版或追加一轮。
+
 ## 为什么值得一看
 
 - **自研轻量编排内核**（不 fork 底座、不引编排框架）：状态机 + 声明式 SOP + HITL 挂点，流程每步落库 checkpoint —— 进程被杀后可恢复续跑，审批阻塞可原地等待；
@@ -16,6 +18,8 @@
 - **产物库 + 版本管理**：版本不可变 + `parent_version` 血缘 + 逐文件 unified diff + zip 导出（含 manifest）；内容进文件系统、元数据 / hash 进库；
 - **四角色真实链路已跑通**：PM / 架构师 / 工程师 / QA 发真实模型调用，输出过 JSON schema 校验；单跑脚本一条命令从需求跑到任意角色，产物 / 消息 / 事件 / 用量全量落库；
 - **四维评测体系**（差异化核心）：`需求符合度 / 可运行率 / 规范符合度 / 架构合理性` 加权总分 + **双门槛**（总分 ≥ 75 且可运行率 ≥ 60）+ **逐分证据链**，报告作为一等产物可版本 diff；批量跑分输出「性价比榜单」（total_score vs cost）。
+- **声明式自愈回环（v1.1）**：评测裁决 `fail` → 自动作废 coding/evaluation 的 completed 执行并回边重跑；失败检查命令 + 错误摘要 + **上一版产物**定向注入工程师提示词（不回灌全量日志，受 `max_detail_chars` 预算约束）；轮次上限 + 单 run 预算**fail-closed** 预检；耗尽后支持 `accept-best` / `extend-repair` / `cancel` 三动作人工介入。
+- **评测任务绑定与基准套件（v1.1）**：套件支持 `single` / `per_task` 两种绑定模式；`per_task` 下每个基准任务绑定自己的项目产物，未绑定或产物缺失**零成本跳过**（不启沙箱、不调 judge），跨项目零取材；内置 `benchmark-12`（12 任务 / 12 场景 / 执行型检查）。
 
 ## 项目进度
 
@@ -32,6 +36,20 @@
 v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回退 / 四维评测报告 / diff + zip 导出 / 杀进程恢复 / CI 全绿。设计与任务分解见 `docs/05-增量设计与任务列表-v1.0.md`；**验收结论见 `docs/06-验收报告-v1.0.md`（六大验收线 6/6 通过；v1.0 终态 266 用例，完善周期增补至 302 用例 + 前端 vitest 26 用例）**。
 
 **v1.0 完善周期新增能力**（巡检三线 → 全量 6 包，均经 QA 独立验证）：审批决策原子化（CAS，并发恰一方成功）· 驳回回退「下游级联重跑」· 包级循环依赖清零 + 依赖护栏进 CI · `GET /evaluations/{id}` 报告详情 · run 失败码透传（`error_code`）· 审批 N+1 优化（列表内联反馈链）· SSE 重建 `after_seq` 续传 + 事件按 seq 去重 · element-plus 按需导入（构建 −44%）· 前端 vitest 起步。
+
+### v1.1（进行中）：基准评测 + 自愈回环
+
+| 批次 | 内容 | 状态 |
+|---|---|---|
+| T1 | 评测任务绑定（`single` / `per_task`）+ `benchmark-12` 基准套件 + 结构护栏 | ✅ |
+| T3.1 | `RepairSpec` 声明式回边 + 9 条加载期校验 + 流水线 YAML v1.1 | ✅ |
+| T3.2 | 裁决闸门 `EvaluationGate` + 回边状态机 + 轮次 / 预算守门（fail-closed） | ✅ |
+| T3.3 | 修复上下文注入：失败检查 + 上一版产物 + 定向修复指令 | ✅ |
+| T4.1 / T4.3 | 两种终态可区分 + B-07 三动作（accept-best / extend-repair / cancel）+ CLI | ✅ |
+| T4.2 | 终局审批：中间候选 defer、终局只审最终版一次、防刷屏、驳回重跑 | ⚠️ 代码完成，QA 复验待补 |
+| T5 | 可观测（时间线徽标 / 报告追溯）+ 基线表 + 交付文档 | 🔄 进行中 |
+
+当前测试基线 **410 passed**（302 → 384 → 404 → 410 递增，全部 mock LLM、0 费用）。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；验收报告待 T5 收尾后产出。
 
 ## 架构一览
 
@@ -66,7 +84,7 @@ flowchart LR
 | 编排 | 自研状态机 + 声明式 SOP（YAML / Pydantic）+ 事件 / 消息总线（SSE） |
 | 模型网关 | OpenAI SDK（DeepSeek 先行；qwen / glm / kimi 同构预留）+ Anthropic 适配器接口 |
 | 执行沙箱 | Docker（python:3.12-slim，限额 + 断网；LocalSandbox 降级） |
-| 工程化 | uv · pytest（302 用例，全部 mock LLM）· vitest（26 用例）· ruff · GitHub Actions（后端 + 前端 job） |
+| 工程化 | uv · pytest（410 用例，全部 mock LLM）· vitest（26 用例）· ruff · GitHub Actions（后端 + 前端 job） |
 | 前端 | Vue 3 · Element Plus · Pinia · vue-router · Vite · TypeScript |
 
 ## 快速开始
@@ -139,8 +157,24 @@ uv run python scripts/run_eval.py --project-name demo --versions v1,v2 --no-judg
 uv run python scripts/run_eval.py --project-id <id> --suite default --save
 ```
 
-评测套件定义见 `evals/suites/default.yaml`（四维权重 + 双门槛 + 回归基线任务）；Web 端
-「评测报告」页可查看四维分数与证据链。完整操作见 `docs/04-使用手册.md`。
+评测套件定义见 `evals/suites/default.yaml`（四维权重 + 双门槛 + 回归基线任务）与
+`evals/suites/benchmark-12.yaml`（12 任务 / 12 场景 / `per_task` 绑定，批量基准执行器随 T5 交付）。
+Web 端「评测报告」页可查看四维分数与证据链。完整操作见 `docs/04-使用手册.md`。
+
+### 修复耗尽后的人工介入（B-07）
+
+```bash
+# 接受历史中总分最高的一版（failed -> completed，写 repair.accepted 并发事件）
+uv run python scripts/run_action.py <run_id> --action accept-best --by me
+
+# 追加 1 轮修复（受单 run 预算预检；预算不足返回 1004 且保持 failed）
+uv run python scripts/run_action.py <run_id> --action extend-repair
+
+# 其余动作：pause / resume / cancel / retry-stage（也可走 POST /api/v1/runs/{id}/actions）
+```
+
+> 已知限制：`run_action.py` 是**离线控制面**——动作落库并置 `running`，推进任务需由 API 服务
+> 启动时恢复（recovery）接管；服务在运行时请直接走 API 端点。
 
 ## 目录结构（monorepo）
 
@@ -153,23 +187,23 @@ ymir-agent/
 │   ├── storage/             # DB 引擎 / 会话 + Repository（含 artifact_repo）
 │   ├── gateway/             # 模型网关：providers / 路由 / 预算 / 计量 / 适配器
 │   ├── sop/                 # 声明式流水线：定义模型 / 加载 / 校验
-│   ├── orchestrator/        # 编排内核：状态机 / 执行器 / 角色执行 / 恢复
-│   ├── roles/               # 角色定义 / 注册表 / 运行时 / 提示词 / 输出校验
+│   ├── orchestrator/        # 编排内核：状态机 / 执行器 / 角色执行 / 恢复 / 回边控制器（repair）
+│   ├── roles/               # 角色定义 / 注册表 / 运行时 / 提示词（含定向修复段）/ 输出校验
 │   ├── sandbox/             # Sandbox 接口 + Docker/Local 实现 + 会话 / 工厂
 │   ├── artifacts/           # 产物库：版本 / 血缘 / diff / zip
 │   ├── tools/               # 角色工具（code_writer / doc_writer / read_artifact）
 │   ├── events/              # 事件总线 + 落库 + SSE 桥
 │   ├── messages/            # 角色消息协议与总线
-│   ├── evaluation/          # 评测 harness：四维评估器 / 聚合 / 报告 / 套件 / 批量跑分
+│   ├── evaluation/          # 评测 harness：四维评估器 / 聚合 / 报告 / 套件 / 批量跑分 / 裁决闸门（gate）
 │   └── api/                 # FastAPI app / schemas / routers
 ├── config/
 │   ├── models.yaml          # 模型档位 / 路由 / 预算红线
 │   ├── pipelines/           # 声明式 SOP 流水线定义（software-dev.yaml）
 │   └── roles/               # 四角色 YAML + 提示词模板
 ├── evals/
-│   └── suites/              # 评测套件（default.yaml：权重 + 双门槛 + 任务）
+│   └── suites/              # 评测套件（default：权重+双门槛+任务；benchmark-12：12 任务 per_task 基准）
 ├── migrations/              # Alembic 迁移
-├── scripts/                 # 一键启动 / 单跑角色 / 批量跑分 / 网关冒烟 / 沙箱自检 / 清理演示库
+├── scripts/                 # 一键启动 / 单跑角色 / 批量跑分 / 人工介入（run_action）/ 网关冒烟 / 沙箱自检
 ├── docker/                  # 沙箱镜像构建（sandbox.Dockerfile）
 ├── web/                     # Vue3 控制台
 ├── tests/                   # 单元 + 边界 / 集成 / e2e 测试
@@ -181,7 +215,7 @@ ymir-agent/
 | 文件 | 作用 | 关键点 |
 |---|---|---|
 | `config/models.yaml` | 模型档位与路由 | planner = deepseek-reasoner / executor = deepseek-chat；失败沿候选链降级；预算红线（单 run 50 万 token / 日 ¥50） |
-| `config/pipelines/software-dev.yaml` | 四阶段流水线 | prd → architecture → coding → evaluation；三关 gate 元数据（PRD 确认 / 设计评审 / 代码合并前）；加载时静态校验 |
+| `config/pipelines/software-dev.yaml` | 四阶段流水线 + 自愈回边 | prd → architecture → coding → evaluation；三关 gate 元数据（PRD 确认 / 设计评审 / 代码合并前）；`repair` 块声明回边（`evaluation --evaluation_failed--> coding`，max_rounds / 预算 / 明细预算）；加载时静态校验 |
 | `config/roles/*.yaml` | 四角色定义 | 档位 / 能力 / 输入输出 / 输出 schema / 重试策略 + Jinja2 提示词 |
 
 - 新增角色 = 加一个 YAML + 注册；新增模型 provider = 在 `models.yaml` 追加同构配置（qwen / glm / kimi 已留示例）；
@@ -195,7 +229,7 @@ ymir-agent/
 |---|---|---|
 | 系统 | `GET /health` | 健康检查 |
 | 项目 | `POST /projects` · `GET /projects` · `GET /projects/{id}` | 创建 / 列表 / 详情聚合 |
-| 运行 | `POST /projects/{id}/runs`（202）· `GET /runs/{id}` · `POST /runs/{id}/actions` | 发起 / 详情 / 控制动作（pause / resume / cancel / retry-stage） |
+| 运行 | `POST /projects/{id}/runs`（202）· `GET /runs/{id}` · `POST /runs/{id}/actions` | 发起 / 详情 / 控制动作（pause / resume / cancel / retry-stage / **accept-best / extend-repair**） |
 | 事件 | `GET /runs/{id}/events`（SSE）· `GET /runs/{id}/messages` | 实时事件流（seq 断线重放）+ 角色消息 |
 | 产物 | `GET /projects/{id}/artifacts` · `GET /artifacts/{id}` · `GET /artifacts/{id}/versions/{v}/content` · `GET /artifacts/{id}/diff` | 列表 / 详情 / 版本内容 / 版本 diff |
 | 审批 | `GET /approvals` · `GET /approvals/{id}` · `POST /approvals/{id}/decision` | 审批中心列表 / 详情（含反馈链）/ 决策（approve / reject 带反馈回退） |
@@ -220,6 +254,7 @@ ymir-agent/
 | `docs/04-使用手册.md` | 环境要求 / Docker（Win10/WSL2）/ 一键启动 / 全流程操作 / 评测 / 导出备份 |
 | `docs/05-增量设计与任务列表-v1.0.md` | v1.0 实施口径与任务分解（T01–T05） |
 | `docs/06-验收报告-v1.0.md` | v1.0 版本验收报告（六大验收线 / 探针证据 / 遗留清单） |
+| `docs/07-增量设计与任务列表-v1.1.md` | v1.1 实施口径与任务分解（基准评测 + 自愈回环，T1–T5） |
 
 ## License
 
