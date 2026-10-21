@@ -37,7 +37,7 @@ v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回
 
 **v1.0 完善周期新增能力**（巡检三线 → 全量 6 包，均经 QA 独立验证）：审批决策原子化（CAS，并发恰一方成功）· 驳回回退「下游级联重跑」· 包级循环依赖清零 + 依赖护栏进 CI · `GET /evaluations/{id}` 报告详情 · run 失败码透传（`error_code`）· 审批 N+1 优化（列表内联反馈链）· SSE 重建 `after_seq` 续传 + 事件按 seq 去重 · element-plus 按需导入（构建 −44%）· 前端 vitest 起步。
 
-### v1.1（进行中）：基准评测 + 自愈回环
+### v1.1（已收官 2026-10-21）：基准评测 + 自愈回环
 
 | 批次 | 内容 | 状态 |
 |---|---|---|
@@ -48,6 +48,8 @@ v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回
 | T4.1 / T4.3 | 两种终态可区分 + B-07 三动作（accept-best / extend-repair / cancel）+ CLI | ✅ |
 | T4.2 | 终局审批：中间候选 defer、终局只审最终版一次、防刷屏、驳回重跑 | ✅ 2026-10-21 |
 | T5 | 可观测（时间线徽标 / 报告追溯）+ 基线表 + 交付文档 | ✅ 2026-10-21 |
+
+**验收**：10 条验收线全过；7 份 QA 证书（含 T5 补签，均独立对抗验证 + 变异测试）；CI 后端 + 前端双 job 全绿。已知限制与遗留见 `docs/08-验收报告-v1.1.md` §7 / §9。
 
 当前测试基线 **439 passed**（302 → 384 → 404 → 410 → 437 → 439 递增，全部 mock LLM、0 费用）＋ 前端 vitest **33**。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；**验收结论见 `docs/08-验收报告-v1.1.md`**。
 
@@ -113,7 +115,7 @@ flowchart LR
 | 编排 | 自研状态机 + 声明式 SOP（YAML / Pydantic）+ 事件 / 消息总线（SSE） |
 | 模型网关 | OpenAI SDK（DeepSeek 先行；qwen / glm / kimi 同构预留）+ Anthropic 适配器接口 |
 | 执行沙箱 | Docker（python:3.12-slim，限额 + 断网；LocalSandbox 降级） |
-| 工程化 | uv · pytest（410 用例，全部 mock LLM）· vitest（26 用例）· ruff · GitHub Actions（后端 + 前端 job） |
+| 工程化 | uv · pytest（439 用例，全部 mock LLM）· vitest（33 用例）· ruff · GitHub Actions（后端 + 前端 job） |
 | 前端 | Vue 3 · Element Plus · Pinia · vue-router · Vite · TypeScript |
 
 ## 快速开始
