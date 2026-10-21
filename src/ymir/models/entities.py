@@ -301,7 +301,7 @@ class SandboxSession(Base):
         ForeignKey("pipeline_runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    image: Mapped[str] = mapped_column(String(255), nullable=False, default="python:3.12-slim")
+    image: Mapped[str] = mapped_column(String(255), nullable=False, default="ymir-sandbox:latest")
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=SandboxStatus.CREATED.value, index=True
     )

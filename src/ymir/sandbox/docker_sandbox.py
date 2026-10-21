@@ -1,6 +1,7 @@
 """Docker 沙箱实现（架构设计 §3.5）。
 
-- 镜像 ``python:3.12-slim``（可选预装测试依赖的 ``ymir-sandbox`` 变体）；
+- 默认镜像 ``ymir-sandbox:latest``（``docker/sandbox.Dockerfile`` 构建，**预置 pytest + ruff**，
+  基准跑分预检的必需项）；基础镜像 ``python:3.12-slim`` **不含这些工具，禁止作为默认值回退**；
 - 每 run 一个会话；限额 ``--cpus=2 --memory=4g --pids-limit=512``；
 - 默认 ``network=none``（断网执行）；``restricted`` / ``open`` 走 bridge；
 - docker-py 为同步客户端：全部调用经 ``asyncio.to_thread`` 转线程，不阻塞事件循环。
@@ -47,7 +48,7 @@ class DockerSandbox(Sandbox):
     def __init__(
         self,
         *,
-        image: str = "python:3.12-slim",
+        image: str = "ymir-sandbox:latest",
         cpus: int = 2,
         memory: str = "4g",
         pids_limit: int = 512,

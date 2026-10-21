@@ -48,7 +48,8 @@ class Settings(BaseSettings):
 
     # --- 沙箱（架构设计 §3.5）---
     sandbox_backend: str = "auto"  # auto | docker | local（auto：Docker 不可用降级 local）
-    sandbox_image: str = "python:3.12-slim"  # 可换 docker/sandbox.Dockerfile 构建的 ymir-sandbox
+    # 基准预检要求镜像内预置 pytest+ruff；基础镜像不含工具，勿回退
+    sandbox_image: str = "ymir-sandbox:latest"
     sandbox_network: str = "none"  # 默认网络策略：none | restricted | open
     sandbox_cpus: int = 2
     sandbox_memory: str = "4g"

@@ -22,6 +22,7 @@ judge 经 :class:`~ymir.evaluation.evaluators.base.Judge` 抽象注入。
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -262,6 +263,31 @@ class EvaluationHarness:
             wall_time_ms=int((time.perf_counter() - started) * 1000),
         )
 
+    def without_judge(self) -> EvaluationHarness:
+        """返回**不带 judge** 的副本（v1.1：``--no-judge`` 纯确定性口径，judge 成本 0）。
+
+        只复制引用、不重建评估器与沙箱：零成本演练 / RK5 复现都用它，保证
+        「同一套件、同一沙箱、只是不调模型」。
+        """
+        clone = copy.copy(self)
+        clone._judge = None
+        return clone
+
+    def _bound_judge(self, task: EvalTask) -> Any:
+        """按任务绑定 judge（v1.1 C11）：``task.run_id`` 非空且 judge 支持 ``with_run``
+        时返回绑定副本，使 judge 成本归属到该 run（否则批次成本统计偏低）。
+
+        鸭子判定，**不改 ``Judge`` Protocol** —— 既有 fake judge（无 ``with_run``）
+        原样返回，行为与 v1.0 完全一致。
+        """
+        judge = self._judge
+        if judge is None or not task.run_id:
+            return judge
+        binder = getattr(judge, "with_run", None)
+        if not callable(binder):
+            return judge
+        return binder(task.run_id)
+
     async def _run_evaluators(
         self,
         task: EvalTask,
@@ -300,7 +326,7 @@ class EvaluationHarness:
             workdir=workdir,
             references=references,
             sandbox=sandbox,
-            judge=self._judge,
+            judge=self._bound_judge(task),
             exec_timeout=self._exec_timeout,
         )
         raw = await asyncio.gather(

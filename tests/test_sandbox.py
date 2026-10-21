@@ -126,6 +126,17 @@ class TestDockerSandbox:
         assert kwargs["working_dir"] == "/workspace"
         assert kwargs["command"] == ["sleep", "infinity"]
 
+    async def test_default_image_is_tool_preloaded(self) -> None:
+        """默认镜像必须是预置 pytest+ruff 的 ``ymir-sandbox:latest``。
+
+        真跑基准时暴露过：默认值曾为基础镜像 ``python:3.12-slim``（不含 pytest），
+        导致预检通过、真跑却报 ``No module named pytest``，失败被误分类为「依赖缺失」。
+        """
+        client = FakeDockerClient()
+        sbx = DockerSandbox(client=client)
+        await sbx.start()
+        assert client.run_log[0]["image"] == "ymir-sandbox:latest"
+
     async def test_open_network_uses_bridge(self) -> None:
         client = FakeDockerClient()
         sbx = DockerSandbox(client=client)

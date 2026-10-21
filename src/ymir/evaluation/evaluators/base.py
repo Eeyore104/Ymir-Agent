@@ -232,12 +232,34 @@ class LLMJudge:
         temperature: float = 0.1,
         max_tokens: int = 3000,
         max_attempts: int = 2,
+        run_id: str | None = None,
+        stage_id: str | None = None,
     ) -> None:
         self._gateway = gateway
         self._tier = tier
         self._temperature = min(temperature, 0.2)
         self._max_tokens = max_tokens
         self._max_attempts = max(1, max_attempts)
+        #: v1.1（C11）：judge 成本归属到 run —— ``with_run`` 返回绑定副本
+        self._run_id = run_id
+        self._stage_id = stage_id
+
+    def with_run(self, run_id: str, stage_id: str | None = None) -> LLMJudge:
+        """返回绑定到 ``run_id`` 的副本（成本归属到该 run，§4.2.4）。
+
+        只在 ``EvaluationHarness`` 内按 ``task.run_id`` 非空时使用，
+        **不改 ``Judge`` Protocol**（鸭子判定 ``hasattr(judge, "with_run")``），
+        因此既有 fake judge 完全不受影响。
+        """
+        return LLMJudge(
+            self._gateway,
+            tier=self._tier,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            max_attempts=self._max_attempts,
+            run_id=run_id,
+            stage_id=stage_id if stage_id is not None else self._stage_id,
+        )
 
     async def judge(
         self, *, system: str, user: str, schema: type[BaseModel]
@@ -251,6 +273,8 @@ class LLMJudge:
             result = await self._gateway.chat(
                 messages,
                 tier=self._tier,
+                run_id=self._run_id,
+                stage_id=self._stage_id,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
                 response_format={"type": "json_object"},
