@@ -9,7 +9,7 @@ from enum import StrEnum
 
 
 class EventType(StrEnum):
-    """SSE 事件类型全集（docs/02 §6.2）。"""
+    """SSE 事件类型全集（docs/02 §6.2；v1.1 追加修复闭环 6 类）。"""
 
     # 运行生命周期
     RUN_STARTED = "run.started"
@@ -21,10 +21,9 @@ class EventType(StrEnum):
     STAGE_COMPLETED = "stage.completed"
     STAGE_FAILED = "stage.failed"
     STAGE_LOG = "stage.log"
-    # 审批生命周期（T04）
+    # 审批生命周期（T04 + v1.1 defer）
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
-    # v1.1：修复闭环内的中间候选跳过第三关（docs/07 §4.6.1）
     APPROVAL_DEFERRED = "approval.deferred"
     # 产物 / 消息 / 用量
     ARTIFACT_CREATED = "artifact.created"
@@ -33,8 +32,9 @@ class EventType(StrEnum):
     BUDGET_EXCEEDED = "budget.exceeded"
     # 评测（T05）
     EVALUATION_COMPLETED = "evaluation.completed"
-    # 裁决与修复（v1.1，docs/07 §4.6.1；T5.1 补齐其余两类）
+    # 裁决与修复（v1.1，docs/07 §4.6.1 六个）
     EVALUATION_FAILED = "evaluation.failed"
     REPAIR_STARTED = "repair.started"
+    REPAIR_COMPLETED = "repair.completed"
     REPAIR_EXHAUSTED = "repair.exhausted"
     REPAIR_ACCEPTED = "repair.accepted"

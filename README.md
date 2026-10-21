@@ -46,10 +46,39 @@ v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回
 | T3.2 | 裁决闸门 `EvaluationGate` + 回边状态机 + 轮次 / 预算守门（fail-closed） | ✅ |
 | T3.3 | 修复上下文注入：失败检查 + 上一版产物 + 定向修复指令 | ✅ |
 | T4.1 / T4.3 | 两种终态可区分 + B-07 三动作（accept-best / extend-repair / cancel）+ CLI | ✅ |
-| T4.2 | 终局审批：中间候选 defer、终局只审最终版一次、防刷屏、驳回重跑 | ⚠️ 代码完成，QA 复验待补 |
-| T5 | 可观测（时间线徽标 / 报告追溯）+ 基线表 + 交付文档 | 🔄 进行中 |
+| T4.2 | 终局审批：中间候选 defer、终局只审最终版一次、防刷屏、驳回重跑 | ✅ 2026-10-21 |
+| T5 | 可观测（时间线徽标 / 报告追溯）+ 基线表 + 交付文档 | ✅ 2026-10-21 |
 
-当前测试基线 **410 passed**（302 → 384 → 404 → 410 递增，全部 mock LLM、0 费用）。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；验收报告待 T5 收尾后产出。
+当前测试基线 **439 passed**（302 → 384 → 404 → 410 → 437 → 439 递增，全部 mock LLM、0 费用）＋ 前端 vitest **33**。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；**验收结论见 `docs/08-验收报告-v1.1.md`**。
+
+### v1.1 基准表（benchmark-12 · 部分执行）
+
+> 环境：Windows 11 / Python 3.12 / Docker `ymir-sandbox:latest`（pytest 8.4.2 + ruff 0.6.9 预置，`network=none`）
+> 模型：planner=`deepseek-reasoner` / executor=`deepseek-chat`，**judge 关闭**（`--no-judge`）
+> 批次 `20261021-b`｜跑分时间 2026-10-21T06:30Z｜流水线 software-dev v1.1 / 套件 benchmark-12 v1.1
+
+| 任务 | 场景 | 首轮 | 修复后 | 最终通过 | 修复轮次 | 成本(¥) | 时长(s) |
+|---|---|---|---|---|---|---|---|
+| task-rest-crud-01 | REST CRUD | 47.6 ❌ | **97.2** | ✅ | 2 | 0.3297 | 132.7 |
+| task-cli-notes-02 | CLI 工具 | 96.7 ✅ | 96.7 | ✅ | 0 | 0.3138 | 123.5 |
+| task-data-clean-03 | 数据清洗 | 69.3 ❌ | **97.2** | ✅ | 1 | 0.2393 | 103.6 |
+
+- 执行 3 / 跳过 9（`limit=3` 部分执行）：**首轮通过率 33.3%（1/3）→ 最终通过率 100.0%（3/3）**；实测成本 **¥0.8828**；评分来源 pipeline 3 / fallback 0。
+- 第一行是自愈回环的典型样本：47.6 未达双门槛 → 定向修复 2 轮 → 97.2（失败检查定向回灌 + 上一版产物注入）。
+- 复现（需 Docker 与 `.env` 密钥；judge 关闭，成本仅来自四角色模型调用，3 任务约 ¥0.9）：
+
+```bash
+docker build -f docker/sandbox.Dockerfile -t ymir-sandbox:latest .
+uv run python scripts/run_benchmark.py --suite benchmark-12 --limit 3 --no-judge
+```
+
+- 零费用复现（对已有产物做确定性评测，不发起 run、不调模型）：
+
+```bash
+uv run python scripts/run_eval.py --project-name <项目名> --versions v1 --no-judge
+```
+
+完整基线表字段、12 任务口径与 `--resume / --budget-cny / --report-only` 用法见 `docs/04-使用手册.md` §9.1。
 
 ## 架构一览
 
@@ -255,6 +284,7 @@ ymir-agent/
 | `docs/05-增量设计与任务列表-v1.0.md` | v1.0 实施口径与任务分解（T01–T05） |
 | `docs/06-验收报告-v1.0.md` | v1.0 版本验收报告（六大验收线 / 探针证据 / 遗留清单） |
 | `docs/07-增量设计与任务列表-v1.1.md` | v1.1 实施口径与任务分解（基准评测 + 自愈回环，T1–T5） |
+| `docs/08-验收报告-v1.1.md` | v1.1 版本验收报告（验收线 / 质量数据 / 真跑基线 / 缺陷与缺口台账 / 遗留） |
 
 ## License
 

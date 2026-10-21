@@ -55,6 +55,9 @@ REPAIR_DIRECTIVE = (
     "不要重写整个项目；不要删除已有测试。"
 )
 
+#: ``failed_check_details[].output`` 的截断长度（只留可定位的摘要，控制 context 体积）
+DETAIL_PREVIEW_CHARS = 500
+
 #: 自动修复消息的发送角色（消息面板中的来源标识）
 _AUTO_REPAIR_FROM = "evaluator"
 
@@ -161,7 +164,18 @@ class RepairController:
                 "verdict": verdict.status,
                 "total": round(float(verdict.total_score), 2),
                 "runnability": round(float(verdict.runnability), 2),
+                # 命令名列表（既有形状，多处消费，保持不动）
                 "failed_checks": [check.command for check in verdict.failed_checks],
+                # v1.1 追加：六分类（A-06）需要 exit_code/timed_out/stderr，命令名不够
+                "failed_check_details": [
+                    {
+                        "command": check.command,
+                        "exit_code": check.exit_code,
+                        "timed_out": check.timed_out,
+                        "output": (check.output or "")[:DETAIL_PREVIEW_CHARS],
+                    }
+                    for check in verdict.failed_checks
+                ],
                 "artifact_version": verdict.artifact_version,
                 "cost_cny": round(float(verdict.cost_cny), 6),
                 "wall_time_ms": int(verdict.wall_time_ms),
@@ -221,6 +235,21 @@ class RepairController:
                     "artifact_version": verdict.artifact_version,
                 },
             )
+            if current_round >= 1:
+                # v1.1（§4.6.1）：修复后通过 —— 让时间线能收尾「第 N 轮修复成功」。
+                # 首轮直接 pass（round=0）不 emit：那不是「修复完成」，只是正常通过。
+                await self._events.emit(
+                    run.id,
+                    EventType.REPAIR_COMPLETED,
+                    {
+                        "repair_round": current_round,
+                        "total": verdict.total_score,
+                        "runnability": verdict.runnability,
+                        "artifact_version": verdict.artifact_version,
+                        "wall_time_ms": verdict.wall_time_ms,
+                        "cost_cny": verdict.cost_cny,
+                    },
+                )
             return "pass"
 
         # --- 未达标：先判轮次，再做预算预检（顺序即成本：纯判定 0 成本优先）---

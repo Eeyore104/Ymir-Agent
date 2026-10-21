@@ -12,6 +12,7 @@ import { useRoute } from 'vue-router'
 import ApprovalCard from '@/components/ApprovalCard.vue'
 import ArtifactViewDialog from '@/components/ArtifactViewDialog.vue'
 import LogStream from '@/components/LogStream.vue'
+import RepairTimeline from '@/components/RepairTimeline.vue'
 import StageStepper from '@/components/StageStepper.vue'
 import { useRunEvents, type RunEvent, type SseStatus } from '@/api/sse'
 import { useApprovalsStore } from '@/stores/approvals'
@@ -158,6 +159,21 @@ function onSelectArtifact(artifactId: string): void {
   artifactDialogVisible.value = true
 }
 
+/**
+ * 修复时间线的「查看 vN」入口：事件里只有版本号，先在阶段产物索引里反查 artifact_id。
+ * 反查不到（例如刷新后 artifact.created 事件已不在本地）时给出明确提示，不静默失败。
+ */
+function onSelectRepairArtifact(version: number): void {
+  const artifact = runsStore.stages
+    .flatMap((s) => s.artifacts)
+    .find((a) => a.version === version)
+  if (!artifact) {
+    ElMessage.info(`未定位到产物 v${version} 的引用（可在「阶段产物」中按名查看最新版本）`)
+    return
+  }
+  onSelectArtifact(artifact.artifact_id)
+}
+
 /** 业务错误码中文标签（PM-10：run 失败码透传展示）。 */
 const ERROR_CODE_LABELS: Record<number, string> = {
   1001: '参数错误',
@@ -247,6 +263,12 @@ function formatTime(iso: string | null): string {
         @select-artifact="onSelectArtifact"
       />
     </el-card>
+
+    <!-- 修复时间线（v1.1：按 repair.* 事件折叠「第 N 轮」；无回边时不渲染） -->
+    <RepairTimeline
+      :rounds="runsStore.repairRounds"
+      @select-artifact="onSelectRepairArtifact"
+    />
 
     <!-- 事件日志 -->
     <el-card shadow="never" class="panel">

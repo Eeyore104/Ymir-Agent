@@ -50,6 +50,23 @@ const anyDegraded = computed<boolean>(
     detail.value?.tasks.some((task) => task.dimensions.some((dim) => dim.degraded)) ?? false,
 )
 
+// --- 追溯徽标（v1.1 R6）：四字段来自报告 JSON，缺省时降级显示而不报错 ---
+
+/** 关联 run（截断显示，title 给全量）。 */
+const traceRunId = computed<string>(() => detail.value?.run_id ?? '')
+const runIdShort = computed<string>(() => (traceRunId.value ? traceRunId.value.slice(0, 8) : '—'))
+
+/** 被评产物版本（`code v2`）。 */
+const traceVersion = computed<number | null>(() => detail.value?.artifact_version ?? null)
+
+/** 第几轮修复（0 = 首轮）。 */
+const traceRound = computed<number | null>(() => detail.value?.repair_round ?? null)
+
+/** 裁决来源：harness（绿，唯一裁决源）/ llm_qa（灰，仅叙事）。 */
+const traceVerdictSource = computed<'harness' | 'llm_qa'>(
+  () => (detail.value?.verdict_source === 'llm_qa' ? 'llm_qa' : 'harness'),
+)
+
 onMounted(async () => {
   await projectsStore.loadProjects()
   if (!form.value.projectId) form.value.projectId = projectsStore.items[0]?.id ?? ''
@@ -211,6 +228,30 @@ function gotoArtifacts(): void {
               </el-tag>
             </div>
           </template>
+
+          <!-- 追溯徽标（v1.1 R6）：裁决必须能追到 run → 产物版本 → 修复轮次 → 来源 -->
+          <div class="trace-badges">
+            <el-tag size="small" type="info" effect="plain" :title="traceRunId">
+              run {{ runIdShort }}
+            </el-tag>
+            <el-tag v-if="traceVersion !== null" size="small" type="info" effect="plain">
+              code v{{ traceVersion }}
+            </el-tag>
+            <el-tag v-if="traceRound !== null" size="small" type="info" effect="plain">
+              第 {{ traceRound }} 轮修复
+            </el-tag>
+            <el-tag
+              size="small"
+              :type="traceVerdictSource === 'harness' ? 'success' : 'info'"
+              effect="plain"
+            >
+              裁决来源 {{ traceVerdictSource === 'harness' ? 'harness' : 'llm_qa' }}
+            </el-tag>
+            <el-tag v-if="selected?.kind === 'eval_verdict'" size="small" type="success" effect="dark">
+              eval_verdict
+            </el-tag>
+          </div>
+
           <div class="metric-grid">
             <div class="metric">
               <div class="metric-value">{{ detail.total_score.toFixed(2) }}</div>
@@ -338,9 +379,16 @@ function gotoArtifacts(): void {
   justify-content: space-between;
 }
 
+/* 追溯徽标（v1.1 R6）：一行只读元信息，不抢主体分数 */
+.trace-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
 .metric-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  display: grid;  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
 }
 

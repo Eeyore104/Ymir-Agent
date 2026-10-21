@@ -66,9 +66,13 @@ export default defineConfig({
     globals: false,
     // 默认 include 已覆盖 src/**/*.test.ts；显式声明便于阅读
     include: ['src/**/*.test.ts'],
-    // 顺序执行（3 个纯逻辑文件，耗时 ~1.5s）：并行 worker 会并发写同一份
-    // vite/vitest 缓存文件，在部分环境（沙箱 fs 拦截）下间歇 EPERM，
-    // 并导致收集阶段丢文件；实测并行 8/10、顺序 10/10（0 EPERM）。
+    // 顺序执行：并行 worker 会并发写同一份 vite/vitest 缓存文件，在部分环境
+    // （沙箱 fs 拦截）下间歇 EPERM，并导致收集阶段丢文件（实测并行 8/10）。
     fileParallelism: false,
+    // T5.1：组件测试用 ``@vue/server-renderer`` 渲染 Element Plus 组件，
+    // 需让 vitest 内联处理 element-plus（否则其 ``style/css`` 子路径的 .css
+    // 会以原生 ESM 方式加载，报 Unknown file extension ".css"）。
+    server: { deps: { inline: ['element-plus'] } },
+    css: false,
   },
 })

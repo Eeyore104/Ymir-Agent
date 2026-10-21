@@ -140,13 +140,16 @@ async def test_build_orchestrator_wires_repair_stack(tmp_path: Path) -> None:
 
 
 async def test_run_action_extend_repair_uses_repair_stack(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """端到端：``run_main`` 执行 extend-repair -> exit 0，且 run 进入 coding 重跑。
 
     用 ``_spawn`` 记录式替身阻断进程内推进任务（保证零模型调用 + 确定性），
     同时断言**唤醒确实发生**——否则「装配正确但根本不 wake」的回归会让 run 永远
     停在 running、没人推进（这是 extend-repair 语义的一部分）。
+
+    另断言 CLI 的**输出契约**（stdout 含 ``status: running``）：只有 exit code 时，
+    「不报错但什么都没做」的实现仍可能蒙混过关。
     """
     cli = _load_cli()
     settings = _settings(tmp_path)
@@ -164,6 +167,9 @@ async def test_run_action_extend_repair_uses_repair_stack(
 
     assert code == 0
     assert spawned == [run_id]  # 必须唤醒推进任务
+    out = capsys.readouterr().out
+    assert "action: extend-repair" in out
+    assert "status: running" in out  # T4.3 遗留：CLI 输出契约
     run = await _read_run(settings, run_id)
     assert run is not None
     assert run.status == "running"

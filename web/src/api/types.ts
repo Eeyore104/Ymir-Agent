@@ -247,6 +247,11 @@ export interface EvaluationSummary {
   passed: boolean
   generated_at: string | null
   created_at: string
+  /**
+   * 报告类型（v1.1，T5.2）：``evaluation_report``（QA 叙事）或 ``eval_verdict``
+   * （harness 确定性裁决，唯一裁决源）。旧后端不返回时缺省按 ``evaluation_report``。
+   */
+  kind?: string
 }
 
 /** 单条评分证据（可定位）。 */
@@ -300,6 +305,11 @@ export interface EvaluationReport {
   cost_cny: number
   total_tokens: number
   wall_time_ms: number
+  // --- 追溯字段（v1.1，R6）：哪个 run、哪个产物版本、第几轮修复、裁决来源 ---
+  run_id?: string | null
+  artifact_version?: number | null
+  repair_round?: number | null
+  verdict_source?: 'harness' | 'llm_qa'
 }
 
 /** 沙箱会话（GET /sandboxes；§3.5）。 */

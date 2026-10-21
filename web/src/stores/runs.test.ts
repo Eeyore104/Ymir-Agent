@@ -186,3 +186,166 @@ describe('runs store：加载与错误态', () => {
     expect(store.stages.every((stage) => stage.state === 'pending')).toBe(true)
   })
 })
+
+describe('runs store：修复时间线（T5.1）', () => {
+  let store: ReturnType<typeof useRunsStore>
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mocks.fetchRun.mockReset()
+    mocks.createRun.mockReset()
+    mocks.runAction.mockReset()
+    mocks.fetchMessages.mockReset()
+    store = useRunsStore()
+    store.reset()
+  })
+
+  /** 重新开一个 store（同文件内多场景隔离用）。 */
+  function fresh(): ReturnType<typeof useRunsStore> {
+    setActivePinia(createPinia())
+    const next = useRunsStore()
+    next.reset()
+    return next
+  }
+
+  it('同 round 的 repair.started 只 patch 不重复 push（QA 变异 M3）', () => {
+    store.ingestEvent(
+      event(1, 'evaluation.failed', {
+        total: 62.4,
+        runnability: 48,
+        failure_class: 'check_failed',
+        failed_checks: [{ command: 'python -m pytest -q', exit_code: 1 }],
+      }),
+    )
+    store.ingestEvent(event(2, 'repair.started', { repair_round: 1, max_rounds: 2 }))
+
+    expect(store.repairRounds).toHaveLength(1)
+    expect(store.repairRounds[0].trigger?.total).toBe(62.4)
+    expect(store.repairRounds[0].trigger?.failedChecks).toEqual(['python -m pytest -q'])
+
+    // 同 round 再来一条（重放 / 重复触发）：字段被后一条 patch，轮次不重复
+    store.ingestEvent(
+      event(3, 'repair.started', { repair_round: 1, max_rounds: 3, artifact_version: 2 }),
+    )
+    expect(store.repairRounds).toHaveLength(1)
+    expect(store.repairRounds[0]).toMatchObject({
+      round: 1,
+      status: 'running',
+      maxRounds: 3,
+      artifactVersion: 2,
+    })
+    // 重复帧不得清空已捕获的触发原因（T5.1：pendingTrigger 已被前一条消费）
+    expect(store.repairRounds[0].trigger?.total).toBe(62.4)
+    expect(store.repairRounds[0].trigger?.failureClass).toBe('check_failed')
+  })
+
+  it('repair.exhausted -> 该轮 exhausted + 终止原因 / 末轮分数', () => {
+    store.ingestEvent(event(1, 'repair.started', { repair_round: 1, max_rounds: 2 }))
+    store.ingestEvent(
+      event(2, 'repair.exhausted', {
+        repair_round: 1,
+        stop_reason: 'rounds_exhausted',
+        last_total: 62.4,
+        last_runnability: 48,
+      }),
+    )
+
+    expect(store.repairRounds).toHaveLength(1)
+    expect(store.repairRounds[0]).toMatchObject({
+      round: 1,
+      status: 'exhausted',
+      stopReason: 'rounds_exhausted',
+      total: 62.4,
+      runnability: 48,
+    })
+  })
+
+  it('repair.accepted 按版本反查轮次；查不到取末轮；无轮次时建 round 0', () => {
+    // 场景 A：v1 在 round 1、v2 在 round 2 -> accepted v1 落到 round 1
+    store.ingestEvent(
+      event(1, 'repair.started', { repair_round: 1, artifact_version: 1 }),
+    )
+    store.ingestEvent(event(2, 'repair.started', { repair_round: 2, artifact_version: 2 }))
+    store.ingestEvent(
+      event(3, 'repair.accepted', {
+        accepted_version: 1,
+        total: 62.4,
+        runnability: 48,
+        accepted_by: 'user',
+      }),
+    )
+    const matched = store.repairRounds.find((item) => item.round === 1)
+    expect(matched?.accepted).toEqual({
+      version: 1,
+      total: 62.4,
+      runnability: 48,
+      acceptedBy: 'user',
+    })
+    expect(store.repairRounds.find((item) => item.round === 2)?.accepted).toBeUndefined()
+
+    // 场景 B：版本不在任何轮 -> 贴到末轮
+    const second = fresh()
+    second.ingestEvent(event(1, 'repair.started', { repair_round: 1, artifact_version: 1 }))
+    second.ingestEvent(event(2, 'repair.started', { repair_round: 2, artifact_version: 2 }))
+    second.ingestEvent(
+      event(3, 'repair.accepted', { accepted_version: 99, total: 70, runnability: 60 }),
+    )
+    expect(second.repairRounds).toHaveLength(2)
+    expect(second.repairRounds[1].accepted?.version).toBe(99)
+    expect(second.repairRounds[0].accepted).toBeUndefined()
+
+    // 场景 C：全新 store（无任何轮）-> 建 round 0 并写入 accepted
+    const third = fresh()
+    third.ingestEvent(
+      event(1, 'repair.accepted', { accepted_version: 3, total: 71, runnability: 58 }),
+    )
+    expect(third.repairRounds).toHaveLength(1)
+    expect(third.repairRounds[0]).toMatchObject({ round: 0, accepted: { version: 3 } })
+  })
+
+  it('backfillFromRun：按 context.repair.history 播种 + accepted 贴到对应版本轮', async () => {
+    mocks.fetchRun.mockResolvedValue(
+      run({
+        context: {
+          requirement: 'x',
+          repair: {
+            round: 1,
+            max_rounds: 2,
+            history: [
+              { round: 0, total: 62, runnability: 48, artifact_version: 1 },
+              { round: 1, total: 81, runnability: 80, artifact_version: 2 },
+            ],
+            accepted: { version: 2, total: 81, runnability: 80, accepted_by: 'qa' },
+          },
+        },
+      }),
+    )
+
+    await store.loadRun('r1')
+
+    expect(store.repairRounds).toHaveLength(2)
+    expect(store.repairRounds.map((item) => item.round)).toEqual([0, 1])
+    const withAccepted = store.repairRounds.find((item) => item.artifactVersion === 2)
+    expect(withAccepted?.accepted).toEqual({
+      version: 2,
+      total: 81,
+      runnability: 80,
+      acceptedBy: 'qa',
+    })
+
+    // 回填后同 round 的增量事件只 patch，不重复 push
+    store.ingestEvent(event(1, 'repair.started', { repair_round: 1, max_rounds: 3 }))
+    expect(store.repairRounds).toHaveLength(2)
+    expect(store.repairRounds.find((item) => item.round === 1)?.maxRounds).toBe(3)
+  })
+
+  it('未知事件类型被忽略（不抛错、时间线不变）', () => {
+    store.ingestEvent(event(1, 'repair.started', { repair_round: 1 }))
+    const before = JSON.stringify(store.repairRounds)
+
+    expect(() => store.ingestEvent(event(2, 'some.unknown', { foo: 'bar' }))).not.toThrow()
+
+    expect(JSON.stringify(store.repairRounds)).toBe(before)
+    expect(store.events).toHaveLength(2) // 事件日志仍记录未知类型
+  })
+})

@@ -131,3 +131,119 @@ async def test_extend_repair_requires_history(client: AsyncClient) -> None:
 
     assert resp.status_code == 400
     assert resp.json()["code"] == 1001
+
+
+# --------------------------------------------------------------------- 双报告类型（T5.2）
+
+import json  # noqa: E402
+
+
+def _report_payload(
+    *, suite_id: str, total: float, runnability: float, passed: bool, **extra: Any
+) -> str:
+    """构造一份最小的 ``EvaluationReport`` JSON（两种产物共用同一结构）。"""
+    payload: dict[str, Any] = {
+        "suite_id": suite_id,
+        "suite_version": "1.1",
+        "total_score": total,
+        "runnability": runnability,
+        "passed": passed,
+        "tasks": [],
+        "thresholds": {"total": 75.0, "runnability": 60.0},
+        "weights": {"requirement_conformance": 0.3, "runnability": 0.3},
+    }
+    payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def test_evaluations_support_both_report_kinds(client: AsyncClient) -> None:
+    """T5.2：同项目同时有 ``evaluation_report`` 与 ``eval_verdict`` -> 列表 2 条、kind 正确。"""
+    app = client._transport.app
+    store = app.state.artifacts
+    created = await client.post("/api/v1/projects", json={"name": "dual-report"})
+    project_id = created.json()["data"]["id"]
+
+    qa_report = await store.save(
+        project_id=project_id,
+        name="evaluation_report",
+        artifact_type="report",
+        files={
+            "evaluation_report.json": _report_payload(
+                suite_id="default", total=62.4, runnability=48.0, passed=False,
+                verdict_source="llm_qa",
+            )
+        },
+    )
+    verdict_report = await store.save(
+        project_id=project_id,
+        name="eval_verdict",
+        artifact_type="report",
+        files={
+            # 生产实况：``EvaluationReport.save`` 固定写 ``evaluation_report.json``，
+            # 因此 ``eval_verdict`` 产物内部文件名与 ``evaluation_report`` 相同；
+            # 路由按 artifact.name 选名并回退，两种命名都必须能取到。
+            "evaluation_report.json": _report_payload(
+                suite_id="benchmark-12",
+                total=81.3,
+                runnability=80.0,
+                passed=True,
+                run_id="run-1",
+                artifact_version=2,
+                repair_round=1,
+                verdict_source="harness",
+            )
+        },
+    )
+
+    resp = await client.get(f"/api/v1/projects/{project_id}/evaluations")
+    items = resp.json()["data"]["items"]
+    assert resp.json()["data"]["total"] == 2
+    assert {item["kind"] for item in items} == {"evaluation_report", "eval_verdict"}
+
+    verdict_item = next(item for item in items if item["kind"] == "eval_verdict")
+    assert verdict_item["artifact_id"] == verdict_report.artifact_id
+    assert verdict_item["total_score"] == 81.3
+    assert verdict_item["runnability"] == 80.0
+    assert verdict_item["passed"] is True
+
+    qa_item = next(item for item in items if item["kind"] == "evaluation_report")
+    assert qa_item["artifact_id"] == qa_report.artifact_id
+    assert qa_item["passed"] is False
+
+    # 全局列表同样能区分两类
+    global_items = (await client.get("/api/v1/evaluations")).json()["data"]["items"]
+    assert {item["kind"] for item in global_items} >= {"evaluation_report", "eval_verdict"}
+
+    # 详情：两种产物都能打开，都返回 EvaluationReport
+    for item in items:
+        detail = await client.get(f"/api/v1/evaluations/{item['artifact_id']}")
+        assert detail.status_code == 200, detail.text
+        data = detail.json()["data"]
+        assert data["suite_id"] in {"default", "benchmark-12"}
+        assert "tasks" in data
+
+    # 非报告产物仍 1002/404
+    prd = await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.md": "# x"}
+    )
+    miss = await client.get(f"/api/v1/evaluations/{prd.artifact_id}")
+    assert miss.status_code == 404
+    assert miss.json()["code"] == 1002
+
+
+def test_report_raw_supports_both_file_names() -> None:
+    """路由按产物名选报告文件名，且两种命名都能取到（生产实况 vs 理想命名）。"""
+    from ymir.api.routers.evaluations import _report_raw
+
+    both = {
+        "evaluation_report.json": "QA",
+        "eval_verdict.json": "VERDICT",
+    }
+    assert _report_raw(both, "evaluation_report") == "QA"
+    assert _report_raw(both, "eval_verdict") == "VERDICT"
+    # 生产实况：eval_verdict 产物内部文件名仍是 evaluation_report.json
+    assert _report_raw({"evaluation_report.json": "QA"}, "eval_verdict") == "QA"
+    # 未知产物名：两种都试
+    assert _report_raw(both, "unknown-name") == "QA"
+    # 非报告产物：取不到
+    assert _report_raw({"prd.md": "# x"}, "prd") is None

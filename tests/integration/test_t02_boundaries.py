@@ -912,3 +912,34 @@ async def test_counterexample_completed_run_leaves_no_active_task(
     task = engine._tasks.get(run_id)
     assert task is None or task.done()
     await engine.shutdown()
+
+
+async def test_sse_replays_repair_events_without_duplicates(
+    session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
+) -> None:
+    """T5.1：断线重放把 ``repair.*`` 事件按 seq 补齐且不重复（``after_seq`` 下界语义）。"""
+    from ymir.events.sse import stream_run_events
+
+    run_id = await _new_run(session)
+    publisher = EventPublisher(session_factory)
+    await publisher.emit(run_id, "evaluation.failed", {"total": 62.4, "repair_round": 0})
+    await publisher.emit(run_id, "repair.started", {"repair_round": 1, "manual": False})
+    await publisher.emit(run_id, "repair.completed", {"repair_round": 1, "total": 81.3})
+    await publisher.emit(run_id, "repair.exhausted", {"repair_round": 2})
+
+    frames: list[str] = []
+    consumer = asyncio.create_task(
+        _collect(stream_run_events(publisher, run_id, after_seq=2, heartbeat=5.0), frames)
+    )
+    try:
+        await _wait_until(lambda: len(frames) >= 2)
+        # 只补 seq>2：不重复前两条，且顺序与 seq 一致
+        assert [frame.splitlines()[0] for frame in frames[:2]] == ["id: 3", "id: 4"]
+        assert "repair.completed" in frames[0]
+        assert "repair.exhausted" in frames[1]
+        assert all("evaluation.failed" not in frame for frame in frames)
+        assert all("repair.started" not in frame for frame in frames)
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer

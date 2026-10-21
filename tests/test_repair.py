@@ -276,6 +276,22 @@ async def _events(session_factory: async_sessionmaker[AsyncSession], run_id: str
         )
 
 
+async def _wait_event(
+    session_factory: async_sessionmaker[AsyncSession],
+    run_id: str,
+    event_type: str,
+    timeout: float = 3.0,
+) -> None:
+    """等待某类事件落库（引擎「先提交状态、后发事件」，直接读会偶发缺失）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        if any(event.type == event_type for event in await _events(session_factory, run_id)):
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError(f"事件 {event_type} 未在 {timeout}s 内落库：run={run_id}")
+        await asyncio.sleep(0.02)
+
+
 async def _messages(
     session_factory: async_sessionmaker[AsyncSession], run_id: str
 ) -> list[Message]:
@@ -342,6 +358,10 @@ async def _run_to_end(
     run = await _wait_status(
         session_factory, run_id, terminal or {"completed", "failed"}
     )
+    if run.status == "paused":
+        # _pause_for_budget 先 commit 再 emit：状态已 paused 时事件可能尚未落库，
+        # 若立刻 shutdown 会取消推进任务、丢掉这两条事件（历史 flaky 的根因）。
+        await _wait_event(session_factory, run_id, "run.paused")
     await engine.shutdown()
     return {
         "store": store,
@@ -431,6 +451,10 @@ async def test_two_rounds_exhausted_fails(
     assert exhausted.payload["stop_reason"] == "rounds_exhausted"
     assert exhausted.payload["error_code"] is None
     assert exhausted.payload["repair_round"] == 2
+    # §4.6.1 关键字段齐全（末轮分数让前端能直接收起时间线）
+    assert exhausted.payload["max_rounds"] == 2
+    assert exhausted.payload["last_total"] == 62.4
+    assert exhausted.payload["last_runnability"] == 48.0
 
 
 # --------------------------------------------------------------------- 降级与预算
@@ -1044,6 +1068,13 @@ class TestManualIntervention:
     async def test_accept_best_accepts_highest_total_round(
         self, session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
     ) -> None:
+        """accept-best 取「最优轮」并落 accepted 痕迹（正常路径）。
+
+        注意（覆盖边界）：本用例历史为 ``62 → 71``，**round 序与 total 序一致**，
+        因此**不判别** total 与 round 的优先级 —— 判别力在
+        ``test_accept_best_prefers_total_over_round``（逆序 71 → 62）里；本用例守的是
+        「正常路径取到最优轮 + accepted/事件/错误文案齐全」。
+        """
         store, project_id, run_id = await _seed_failed_run(
             session_factory, tmp_path, history=_history_two_rounds()
         )
@@ -1364,3 +1395,191 @@ async def test_final_gate_creates_single_coding_approval_after_repair(
     run = await _wait_status(session_factory, run_id, {"completed"})
     assert run.status == "completed"
     await engine.shutdown()
+
+
+async def test_record_verdict_adds_failed_check_details(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """``record_verdict`` 追加 ``failed_check_details``（新）；``failed_checks`` 形状不变。
+
+    六分类（A-06）需要 ``exit_code / timed_out / stderr``，而 ``failed_checks`` 只有
+    命令名（多处消费，不能改形状）—— 因此新字段是**加法式**的，旧读者不受影响。
+    """
+    _store, _project_id, run_id = await _seed_failed_run(
+        session_factory, tmp_path, history=[]
+    )
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    controller = RepairController(
+        session_factory=session_factory, events=events, messages=messages
+    )
+    verdict = EvalVerdict(
+        status="fail",
+        failed_checks=(
+            FailedCheck(
+                command="python -m pytest -q",
+                exit_code=1,
+                timed_out=False,
+                output="x" * 800,
+            ),
+            FailedCheck(
+                command="ruff check .", exit_code=None, timed_out=True, output=""
+            ),
+        ),
+    )
+
+    await controller.record_verdict(run_id, verdict)
+
+    run = await _get_run(session_factory, run_id)
+    entry = repair_state(run.context)["history"][-1]
+    assert entry["failed_checks"] == ["python -m pytest -q", "ruff check ."]  # 旧形状
+    details = entry["failed_check_details"]
+    assert [item["command"] for item in details] == ["python -m pytest -q", "ruff check ."]
+    assert details[0]["exit_code"] == 1
+    assert len(details[0]["output"]) == 500  # 截断到 500 字，控制 context 体积
+    assert details[1]["timed_out"] is True
+
+
+# --------------------------------------------------------------------- 六事件闭环（T5.1）
+
+
+def _make_approval_repair_stack(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    store: ArtifactStore,
+    definition: PipelineDefinition,
+    executor: Any,
+    gate: Any,
+) -> tuple[OrchestrationEngine, ApprovalEngine]:
+    """装配「审批 + 回边」全栈（终局第三关 + defer 都生效，用于事件闭环断言）。"""
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    loader = lambda _pid: definition  # noqa: E731 - 测试内联 loader
+    approval_engine = ApprovalEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        definition_loader=loader,
+    )
+
+    async def budget_probe(_run_id: str) -> BudgetSnapshot:
+        return BudgetSnapshot(used_tokens=0, limit_tokens=500_000)
+
+    controller = RepairController(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        budget_probe=budget_probe,
+    )
+    engine = OrchestrationEngine(
+        session_factory=session_factory,
+        events=events,
+        messages=messages,
+        executor=executor,
+        approval_hook=build_approval_hook(approval_engine),
+        eval_gate=gate,
+        repair=controller,
+        definition_loader=loader,
+    )
+    approval_engine.bind_orchestrator(engine)
+    return engine, approval_engine
+
+
+async def test_repair_cycle_emits_event_family_with_full_payloads(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """fail→pass 全链路：``evaluation.failed`` + ``repair.started`` + ``repair.completed``
+    + ``approval.deferred`` 四类事件齐全，且 §4.6.1 的关键字段逐项存在。"""
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    definition = _definition(max_rounds=2, coding_gate=True)
+    executor = SavingExecutor(store)
+    gate = ScriptedGate(store, ["fail", "pass"])
+    engine, approval_engine = _make_approval_repair_stack(
+        session_factory,
+        store=store,
+        definition=definition,
+        executor=executor,
+        gate=gate,
+    )
+    async with session_factory() as session:
+        _project_id, run_id = await _new_run(session, "six-events", mode="key_node")
+
+    await engine.launch(run_id)
+    approval = await _wait_pending_approval(session_factory, run_id)
+    await approval_engine.decide(approval.id, decision="approve")
+    run = await _wait_status(session_factory, run_id, {"completed"})
+    assert run.status == "completed"
+    await engine.shutdown()
+
+    events = await _events(session_factory, run_id)
+    by_type: dict[str, list[Event]] = {}
+    for event in events:
+        by_type.setdefault(event.type, []).append(event)
+
+    # 1) evaluation.failed（触发本轮修复的那次裁决 payload）
+    failed = by_type["evaluation.failed"][0].payload
+    for key in (
+        "total",
+        "runnability",
+        "thresholds",
+        "failed_checks",
+        "failure_class",
+        "repair_round",
+        "max_rounds",
+        "artifact_version",
+        "degraded",
+    ):
+        assert key in failed, key
+    assert failed["repair_round"] == 0 and failed["max_rounds"] == 2
+    assert failed["artifact_version"] == 1
+
+    # 2) repair.started（回边发起）
+    started = by_type["repair.started"][0].payload
+    for key in (
+        "repair_round",
+        "max_rounds",
+        "target_stage",
+        "from_stage",
+        "artifact_version",
+        "manual",
+        "directive_digest",
+    ):
+        assert key in started, key
+    assert started["repair_round"] == 1 and started["manual"] is False
+    assert started["target_stage"] == "coding" and started["from_stage"] == "evaluation"
+
+    # 3) repair.completed（修复后通过；本次新增）
+    completed = by_type["repair.completed"][0].payload
+    assert completed["repair_round"] == 1
+    assert completed["total"] == 88.0
+    assert completed["runnability"] == 90.0
+    assert completed["artifact_version"] == 2
+    assert completed["wall_time_ms"] >= 0
+    assert "cost_cny" in completed
+
+    # 4) approval.deferred（中间候选不建卡片；coding 两次完成各一条）
+    deferred = [event.payload for event in by_type["approval.deferred"]]
+    assert len(deferred) == 2
+    assert [item["repair_round"] for item in deferred] == [0, 1]
+    for item in deferred:
+        assert set(item) == {"stage_id", "gate_name", "repair_round", "reason"}
+        assert item["stage_id"] == "coding"
+        assert item["reason"] == "repair_candidate"
+        assert item["gate_name"] == "代码合并前评审"
+
+    # 事件顺序：failed -> started -> completed（时间线可据此折叠）
+    ordered = [event.type for event in events]
+    assert ordered.index("evaluation.failed") < ordered.index("repair.started")
+    assert ordered.index("repair.started") < ordered.index("repair.completed")
+
+
+async def test_first_round_pass_emits_no_repair_completed(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """首轮直接 pass（round=0）不产生 ``repair.completed``（那只是正常通过）。"""
+    result = await _run_to_end(session_factory, tmp_path, statuses=["pass"])
+
+    types = [event.type for event in result["events"]]
+    assert "evaluation.completed" in types
+    assert "repair.completed" not in types
+    assert "repair.started" not in types

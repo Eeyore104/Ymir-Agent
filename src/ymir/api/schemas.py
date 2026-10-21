@@ -370,7 +370,11 @@ class ApprovalDecisionPayload(BaseModel):
 
 
 class EvaluationSummaryOut(BaseModel):
-    """评测报告摘要（列表项，取自 ``evaluation_report.json``）。"""
+    """评测报告摘要（列表项，取自报告产物的 ``*.json``）。
+
+    v1.1：``kind`` 区分两种一等报告产物 —— ``evaluation_report``（QA 叙事）与
+    ``eval_verdict``（harness 确定性裁决，唯一裁决源）；缺省值保证旧响应可解析。
+    """
 
     artifact_id: str
     version: int
@@ -381,6 +385,7 @@ class EvaluationSummaryOut(BaseModel):
     passed: bool
     generated_at: str | None = None
     created_at: datetime
+    kind: str = "evaluation_report"
 
 
 class EvaluationRunRequest(BaseModel):

@@ -35,6 +35,55 @@ export interface StageView {
   artifacts: StageArtifact[]
 }
 
+/** 修复轮次状态（v1.1，T5.1 时间线）。 */
+export type RepairRoundStatus = 'running' | 'completed' | 'exhausted'
+
+/** 一轮修复的触发原因（来自 ``evaluation.failed`` 事件）。 */
+export interface RepairRoundTrigger {
+  total?: number
+  runnability?: number
+  failureClass?: string | null
+  failedChecks?: string[]
+}
+
+/** 人工接受未达标版本的信息（``repair.accepted``）。 */
+export interface RepairAccepted {
+  version: number
+  total: number
+  runnability: number
+  acceptedBy: string
+}
+
+/** 修复轮次（组件 RepairTimeline 的直接数据源）。 */
+export interface RepairRound {
+  round: number
+  status: RepairRoundStatus
+  maxRounds?: number
+  trigger?: RepairRoundTrigger
+  startedAt?: string
+  durationMs?: number
+  total?: number
+  runnability?: number
+  artifactVersion?: number | null
+  costCny?: number
+  stopReason?: string | null
+  accepted?: RepairAccepted
+}
+
+/** 事件 payload 取数工具（后端 payload 是自由字典，前端逐项校验类型）。 */
+function asNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined
+}
+
+function asVersion(value: unknown): number | null {
+  return typeof value === 'number' ? value : null
+}
+
+
 export const useRunsStore = defineStore('runs', () => {
   const current = ref<Run | null>(null)
   const messages = ref<RunMessage[]>([])
@@ -45,6 +94,10 @@ export const useRunsStore = defineStore('runs', () => {
   const error = ref<string | null>(null)
   /** 最近一次加载失败的业务码（PM-11：区分「run 不存在 1002」与其它失败）。 */
   const errorCode = ref<number | null>(null)
+  /** 修复轮次时间线（v1.1，T5.1）：由 repair.* 事件推进，刷新时按 context 回填。 */
+  const repairRounds = ref<RepairRound[]>([])
+  /** 最近一条 evaluation.failed 的触发原因（供紧随其后的 repair.started 取用）。 */
+  const pendingTrigger = ref<RepairRoundTrigger | null>(null)
 
   /** 阶段看板（STAGE_META × 实时状态 × 产物）。 */
   const stages = computed<StageView[]>(() =>
@@ -86,6 +139,71 @@ export const useRunsStore = defineStore('runs', () => {
     if (run.status === 'waiting_approval' && run.current_stage_id) {
       markStage(run.current_stage_id, 'waiting')
     }
+    backfillRepairRounds(run)
+  }
+
+  /**
+   * 刷新页面后的修复轮次回填（v1.1）：``run.context.repair.history`` 是流水线内裁决的
+   * 落库形态，先按它播种各轮（状态默认 completed），后续事件到达再覆盖/追加。
+   * 这样「刷新即空时间线」不会发生，且与 SSE 增量不冲突（同 round 覆盖而非重复）。
+   */
+  function backfillRepairRounds(run: Run): void {
+    if (repairRounds.value.length > 0) return
+    const context = (run.context ?? {}) as Record<string, unknown>
+    const repair = context['repair']
+    if (!repair || typeof repair !== 'object') return
+    const state = repair as Record<string, unknown>
+    const history = Array.isArray(state['history']) ? state['history'] : []
+    const rounds: RepairRound[] = []
+    for (const entry of history) {
+      if (!entry || typeof entry !== 'object') continue
+      const row = entry as Record<string, unknown>
+      const round = asNumber(row['round'])
+      if (round === undefined) continue
+      rounds.push({
+        round,
+        status: 'completed',
+        total: asNumber(row['total']),
+        runnability: asNumber(row['runnability']),
+        artifactVersion: asVersion(row['artifact_version']),
+      })
+    }
+    const accepted = state['accepted']
+    if (accepted && typeof accepted === 'object') {
+      const info = accepted as Record<string, unknown>
+      const version = asNumber(info['version'])
+      if (version !== undefined) {
+        const target = rounds.find((item) => item.artifactVersion === version) ?? rounds.at(-1)
+        if (target) {
+          target.accepted = {
+            version,
+            total: asNumber(info['total']) ?? 0,
+            runnability: asNumber(info['runnability']) ?? 0,
+            acceptedBy: asString(info['accepted_by']) ?? 'user',
+          }
+        }
+      }
+    }
+    repairRounds.value = rounds.sort((a, b) => a.round - b.round)
+  }
+
+  /** 插入或更新一轮修复（同 round 覆盖，不重复 push）。 */
+  function upsertRepairRound(round: number, patch: Partial<RepairRound>): void {
+    const index = repairRounds.value.findIndex((item) => item.round === round)
+    if (index < 0) {
+      const created: RepairRound = { round, status: 'running', ...patch }
+      repairRounds.value = [...repairRounds.value, created].sort((a, b) => a.round - b.round)
+      return
+    }
+    const next = [...repairRounds.value]
+    next[index] = { ...next[index], ...patch }
+    repairRounds.value = next
+  }
+
+  /** 按产物版本找对应轮次（``repair.accepted`` 的 payload 不带 round）。 */
+  function roundOfVersion(version: number): number {
+    const matched = [...repairRounds.value].reverse().find((item) => item.artifactVersion === version)
+    return matched?.round ?? repairRounds.value.at(-1)?.round ?? 0
   }
 
   function addArtifact(artifact: StageArtifact): void {
@@ -196,6 +314,78 @@ export const useRunsStore = defineStore('runs', () => {
       case 'message.created':
         // 消息增量由调用方（RunDetail）按 seq 去重后追加，此处不处理
         break
+      case 'evaluation.failed':
+        // 暂存触发原因：紧随其后的 repair.started 取用（事件顺序由后端保证）
+        pendingTrigger.value = {
+          total: asNumber(payload.total),
+          runnability: asNumber(payload.runnability),
+          failureClass: asString(payload.failure_class) ?? null,
+          failedChecks: Array.isArray(payload.failed_checks)
+            ? payload.failed_checks
+                .map((item) =>
+                  typeof item === 'string'
+                    ? item
+                    : asString((item as Record<string, unknown> | null)?.['command']),
+                )
+                .filter((value): value is string => typeof value === 'string')
+            : [],
+        }
+        break
+      case 'repair.started': {
+        const round = asNumber(payload.repair_round) ?? 0
+        const patch: Partial<RepairRound> = {
+          status: 'running',
+          maxRounds: asNumber(payload.max_rounds),
+          artifactVersion: asVersion(payload.artifact_version),
+          startedAt: event.timestamp,
+        }
+        // 触发原因只在本次事件**真的捕获到**时写入：同 round 的重复帧 / 重放帧
+        // （pendingTrigger 已被前一条消费）不得把既有 trigger 清空（T5.1 修复）。
+        if (pendingTrigger.value) patch.trigger = pendingTrigger.value
+        upsertRepairRound(round, patch)
+        pendingTrigger.value = null
+        break
+      }
+      case 'repair.completed': {
+        const round = asNumber(payload.repair_round) ?? 0
+        upsertRepairRound(round, {
+          status: 'completed',
+          total: asNumber(payload.total),
+          runnability: asNumber(payload.runnability),
+          artifactVersion: asVersion(payload.artifact_version),
+          durationMs: asNumber(payload.wall_time_ms),
+          costCny: asNumber(payload.cost_cny),
+        })
+        break
+      }
+      case 'repair.exhausted': {
+        const round = asNumber(payload.repair_round) ?? 0
+        upsertRepairRound(round, {
+          status: 'exhausted',
+          stopReason: asString(payload.stop_reason) ?? null,
+          total: asNumber(payload.last_total),
+          runnability: asNumber(payload.last_runnability),
+        })
+        break
+      }
+      case 'repair.accepted': {
+        const version = asNumber(payload.accepted_version)
+        if (version !== undefined) {
+          const round = roundOfVersion(version)
+          upsertRepairRound(round, {
+            accepted: {
+              version,
+              total: asNumber(payload.total) ?? 0,
+              runnability: asNumber(payload.runnability) ?? 0,
+              acceptedBy: asString(payload.accepted_by) ?? 'user',
+            },
+          })
+        }
+        break
+      }
+      case 'approval.deferred':
+        // 中间候选跳过第三关：仅审计，不建卡片（时间线不呈现）
+        break
       case 'run.completed':
         for (const meta of STAGE_META) markStage(meta.id, 'completed')
         break
@@ -219,6 +409,8 @@ export const useRunsStore = defineStore('runs', () => {
     current.value = null
     events.value = []
     messages.value = []
+    repairRounds.value = []
+    pendingTrigger.value = null
     resetStageBoard()
     error.value = null
     errorCode.value = null
@@ -231,6 +423,7 @@ export const useRunsStore = defineStore('runs', () => {
     loading,
     error,
     errorCode,
+    repairRounds,
     stages,
     isTerminal,
     loadRun,
