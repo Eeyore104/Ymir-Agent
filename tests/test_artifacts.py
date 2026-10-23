@@ -9,6 +9,7 @@ import zipfile
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ymir.artifacts.baseline import read_zip_files
 from ymir.artifacts.diff import diff_file_sets
 from ymir.artifacts.store import ArtifactStore
 from ymir.artifacts.versioning import (
@@ -256,3 +257,71 @@ class TestArtifactStore:
             assert [v["version"] for v in prd_meta["versions"]] == [1, 2]
             assert prd_meta["versions"][1]["message"] == "修订"
             assert zf.read("prd/v2/prd.md").decode("utf-8") == "# v2"
+
+
+# ------------------------------------------------- v1.2 基线解析（artifacts/baseline.py）
+
+
+def _zip_of(entries: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+class TestBaselineZip:
+    """``read_zip_files`` 的纯函数边界（校验必须先于任何磁盘写入）。"""
+
+    def test_ok_skips_dirs_and_mac_metadata(self) -> None:
+        payload = _zip_of(
+            {
+                "app/": "",
+                "app/main.py": "print('hi')\n",
+                "__MACOSX/._app": "junk",
+                ".DS_Store": "junk",
+            }
+        )
+        files, size_bytes = read_zip_files(payload, max_files=10, max_bytes=1024)
+        assert files == {"app/main.py": "print('hi')\n"}
+        assert size_bytes == len(b"print('hi')\n")
+
+    @pytest.mark.parametrize("bad", ["../evil.py", "/abs.py", "C:/win.py"])
+    def test_zip_slip_rejected(self, bad: str) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(_zip_of({bad: "x"}), max_files=10, max_bytes=1024)
+
+    def test_duplicate_normalized_path_rejected(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(
+                _zip_of({"a/b.py": "1", "a/./b.py": "2"}), max_files=10, max_bytes=1024
+            )
+
+    def test_over_file_count(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(
+                _zip_of({f"m{i}.py": "x" for i in range(4)}), max_files=3, max_bytes=1024
+            )
+
+    def test_over_bytes(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(_zip_of({"a.py": "x" * 100}), max_files=10, max_bytes=50)
+
+    def test_non_utf8_rejected(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("bin.dat", b"\xff\xfe\x00\x01")
+        with pytest.raises(InvalidParamError):
+            read_zip_files(buffer.getvalue(), max_files=10, max_bytes=1024)
+
+    def test_not_a_zip(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(b"plain text", max_files=10, max_bytes=1024)
+
+    def test_empty_body(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(b"", max_files=10, max_bytes=1024)
+
+    def test_empty_zip_rejected(self) -> None:
+        with pytest.raises(InvalidParamError):
+            read_zip_files(_zip_of({}), max_files=10, max_bytes=1024)

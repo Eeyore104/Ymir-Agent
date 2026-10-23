@@ -79,7 +79,20 @@ async def client(
         sandbox=LocalSandbox(base_dir=tmp_path / "sandboxes"),
     )
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
-        yield c
-    # T02：取消引擎推进任务，避免事件循环关闭时后台任务泄漏告警
-    await app.state.orchestrator.shutdown()
+    try:
+        async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+            yield c
+    finally:
+        # T02：取消引擎推进任务，避免事件循环关闭时后台任务泄漏告警。
+        # QA-16（v1.2）：必须放在 ``finally`` 里 —— 生成器夹具在**用例失败**时是
+        # 把异常抛回 yield 处，yield 之后的语句默认不会执行，于是该 app 的后台推进
+        # 任务（持有 engine / session_factory）会活到后续用例里，形成"跨用例污染"：
+        # 表现为不相关的用例间歇失败、且复跑即绿。清理必须是异常安全的。
+        await app.state.orchestrator.shutdown()
+        # QA-16：应用级**可变**注册表（推送通道）显式归零。``client`` 是 function
+        # 作用域、每个用例一份新 app，今天靠"新 app"天然隔离；但隔离性不应依赖
+        # 这条隐含约定 —— 一旦夹具作用域被改动，注册表就会跨用例泄漏
+        # （典型症状：某个用例注入的 fake 通道出现在另一个用例的响应里）。
+        exports = getattr(app.state, "exports", None)
+        if exports is not None:
+            exports._exporters.clear()  # noqa: SLF001 - 夹具负责重置应用级可变状态

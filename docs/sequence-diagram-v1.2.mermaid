@@ -1,0 +1,69 @@
+%% v1.2 增量时序图 ①（源文件，配套 docs/09-增量设计与任务列表-v1.2.md §6.1）
+%% 场景：选模板 → 骨架注入 → 生成 → 增量 patch → 合并 → 评测 → diff 人审 → 合入
+%% 第二张（推送链路）见 docs/sequence-diagram-v1.2-push.mermaid；v1.0 / v1.1 图未覆盖
+%% 要点：骨架注入在 save 之前（故 file_count/content_hash 口径为注入后）；
+%%       合并树是纯函数派生、不落盘；评测跑整棵合并树
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as Web（Vue3）
+    participant A as API
+    participant ST as ArtifactStore
+    participant EN as Engine
+    participant EX as RoleStageExecutor
+    participant TR as TemplateRegistry
+    participant MG as merge.py
+    participant HA as Harness
+    participant SB as Sandbox
+
+    U->>W: 上传现有项目 zip（仅增量模式需要）
+    W->>A: POST /projects/{id}/baselines（application/zip 原始字节，不用 multipart）
+    A->>ST: save(name=baseline, type=baseline, files)
+    ST-->>A: {artifact_id, version=1, content_hash}
+    A-->>W: 基线 v1 已建立
+
+    U->>W: 需求 + 选模板 fastapi-vue3 + 选基线 v1
+    W->>A: POST /projects/{id}/runs {requirement, template_id, baseline}
+    A->>TR: load(fastapi-vue3)（17 条加载期校验）
+    A->>A: 校验 baseline 属于本项目
+    A->>EN: launch(run)（context 写 template + baseline 引用）
+    EN->>EX: execute(stage=coding)
+    EX->>TR: skeleton_files() / reserved_paths() / seed_paths() / to_layout_rules()
+    EX->>ST: load(baseline, v1)（路径清单 + 预算内正文）
+    EX->>EX: build_user 注入 模板段 + 基线段 + 骨架两清单（reserved 勿输出 / seed 须输出完整版）
+    Note over EX: LLM 产出补丁：新增/修改给全文 + deleted 清单，不重复输出骨架
+    EX->>MG: merge_trees（阶段一：骨架补齐 + reserved 保护）
+    MG-->>EX: MergeOutcome{files, skeleton_added, reserved_conflicts, conflicts}
+    EX->>ST: save(name=code, files=补丁 + patch_manifest.json)
+    EX->>MG: merge_trees(base, patch, mode=merge)（阶段二）
+    MG-->>EX: merged
+    EX->>SB: write(merged) + run_commands 冒烟
+    SB-->>EX: smoke_report
+
+    EN->>HA: 裁决闸门 evaluate(run, evaluation_stage, attempt)
+    HA->>TR: checks（命令） + LayoutRules（结构规则）
+    HA->>ST: load(code) → 读 patch_manifest → merge → workdir=merged
+    HA->>SB: write(merged) + 模板检查命令
+    SB-->>HA: 命令证据（exit / 输出）
+    HA->>ST: save(name=eval_verdict)
+    HA-->>EN: EvalVerdict（pass 继续；fail 走 v1.1 回边）
+
+    U->>W: 产物库 → 「与基线对比」
+    W->>A: GET /projects/{id}/diff-across?base=baseline@1&target=code@1
+    A->>ST: load(baseline@1) + load(code@1) → merge
+    A->>A: diff_file_sets(baseline.files, merged)
+    A-->>W: DiffReport（按文件分组）
+    Note over W: 前端 DiffView 零改动复用
+
+    U->>W: 审阅通过 → 选择出口
+    alt 下载工程
+        W->>A: GET /projects/{id}/export?mode=merged
+        A->>ST: 合并树扁平打包（无 code/vN 前缀）
+        A-->>W: zip（顶层直接 app/…）
+    else 推送到 GitHub
+        W->>A: POST /projects/{id}/exports（详见 sequence-diagram-v1.2-push.mermaid）
+    else 以合入结果为新基线
+        W->>A: POST /projects/{id}/baselines/from-merge {code_artifact_id, code_version}
+        A->>ST: merge → save(name=baseline, version+1)
+        A-->>W: 新基线 v2（旧补丁标记"基于 v1"）
+    end

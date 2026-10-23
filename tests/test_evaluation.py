@@ -1376,3 +1376,220 @@ class TestNoCrossProjectLeakage:
         assert code_a.artifact.id not in dumped
         for fragment in ("create_todo", "CODE_MAIN", "routes.py"):
             assert fragment not in dumped
+
+
+# ------------------------------------------- 模板评测口径接入（v1.2 · T1.3）
+
+
+class TestTemplateChecksInjection:
+    """DoD ①：模板 ``checks`` 覆盖套件 ``checks``；无模板时与套件逐条一致。"""
+
+    def _gate(self) -> Any:
+        from ymir.evaluation.gate import HarnessEvaluationGate
+
+        return HarnessEvaluationGate(harness=EvaluationHarness(store=object()), store=object())
+
+    def test_checks_follow_template_and_fall_back_to_suite(self) -> None:
+        from types import SimpleNamespace
+
+        from ymir.templates import load_template
+
+        gate = self._gate()
+        spec = load_template("fastapi-vue3")
+        run = SimpleNamespace(
+            id="run-tpl", context={"template": {"id": "fastapi-vue3", "version": "1.0"}}
+        )
+        base = EvalTask(
+            id="t", checks=[EvalCheck(type="command", run="suite-only-cmd", weight=3)]
+        )
+
+        checks = gate._resolve_checks(run, base)
+        assert [item.run for item in checks] == [item.run for item in spec.checks]
+        assert [item.weight for item in checks] == [item.weight for item in spec.checks]
+        # 字段名是 type（不是 kind）
+        assert {item.type for item in checks} == {"command"}
+
+        # 无模板 → 与套件逐条一致
+        plain = gate._resolve_checks(SimpleNamespace(id="run-plain", context={}), base)
+        assert plain == list(base.checks)
+        assert [item.run for item in plain] == ["suite-only-cmd"]
+
+        # 模板不可读 → 退回套件（只告警，不让裁决失败）
+        missing = gate._resolve_checks(
+            SimpleNamespace(id="run-missing", context={"template": {"id": "no-such"}}), base
+        )
+        assert [item.run for item in missing] == ["suite-only-cmd"]
+
+    def test_layout_resolved_only_for_template_runs(self) -> None:
+        from types import SimpleNamespace
+
+        gate = self._gate()
+        assert gate._resolve_layout(SimpleNamespace(id="r0", context={})) is None
+        layout = gate._resolve_layout(
+            SimpleNamespace(id="r1", context={"template": {"id": "fastapi-vue3"}})
+        )
+        assert layout is not None
+        assert layout.required_dirs == ["app", "tests", "web/src"]
+        # 前缀带尾斜杠（否则 app 会误匹配 application/）
+        assert layout.allowed_prefixes == ["app/", "tests/", "web/"]
+
+
+class TestConventionLayoutParameterization:
+    """DoD ②③：``layout is None`` 分数与 v1.1 完全相同；``layout`` 非空走模板规则。"""
+
+    async def test_layout_none_keeps_v11_structure_score(self) -> None:
+        """§10-13 兼容契约：同输入同分数（v1.1 规则 = 命名 + 文件大小 + 测试约定）。"""
+        from ymir.evaluation.evaluators.convention import ConventionEvaluator
+
+        workdir = {"app.py": "x = 1\n", "README.md": "# x\n"}
+        ctx = _ctx(workdir=workdir)  # layout=None
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+
+        # v1.1：naming 通过 + 无超大文件 通过 + 无测试 不通过 = 2/3
+        assert score.score == pytest.approx(100 * 2 / 3, abs=0.01)
+        assert "结构规范 2/3" in score.rationale
+
+    async def test_layout_rules_change_structure_verdict(self) -> None:
+        from ymir.common.contracts import LayoutRules
+        from ymir.evaluation.evaluators.convention import ConventionEvaluator
+
+        layout = LayoutRules(
+            required_dirs=["app"],
+            required_files=["pyproject.toml"],
+            snake_case_py=True,
+            max_file_lines=50,
+            allowed_prefixes=["app/"],
+        )
+        ctx = EvalContext(
+            task=EvalTask(id="t"),
+            workdir={"other.py": "x = 1\n"},  # 缺 app/、缺 pyproject、路径越界
+            layout=layout,
+        )
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+
+        assert "模板结构规范" in score.rationale
+        refs = {item.ref for item in score.evidence}
+        assert {"app", "pyproject.toml", "allowed_prefixes"} <= refs
+        assert any("缺失" in item.detail for item in score.evidence)
+        # 模板规则 5 条：缺 app/、缺 pyproject、路径越界 3 条不通过；
+        # 命名 snake_case 与文件大小 2 条通过 → 2/5 = 40（v1.1 口径下同输入是 66.67）
+        assert "模板结构规范 2/5" in score.rationale
+        assert score.score == pytest.approx(40.0, abs=0.01)
+
+    async def test_frontend_rules_marked_static_only(self) -> None:
+        """DoD ③：``frontend`` 命中时证据标注「静态检查（未构建）」。"""
+        from ymir.common.contracts import FrontendRules, LayoutRules
+        from ymir.evaluation.evaluators.convention import ConventionEvaluator
+
+        layout = LayoutRules(
+            frontend=FrontendRules(
+                required_dirs=["web/src"],
+                required_glob=["web/src/**/*.vue"],
+                forbidden_imports=["jquery"],
+            )
+        )
+        ctx = EvalContext(
+            task=EvalTask(id="t"),
+            workdir={"web/src/App.vue": "<template><div/></template>\n"},
+            layout=layout,
+        )
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+        frontend_evidence = [
+            item for item in score.evidence if "静态检查（未构建）" in item.detail
+        ]
+        assert frontend_evidence, [item.detail for item in score.evidence]
+
+
+def test_sandbox_dockerfile_has_v12_packages() -> None:
+    """DoD ④：Dockerfile 三处改动静态核对（**真机 docker build 待用户手动验证**）。
+
+    CI 不跑构建（团队约定），因此这里只钉住文本形态：预装清单 / Node 注释 / pip 行。
+    """
+    text = (PROJECT_ROOT / "docker" / "sandbox.Dockerfile").read_text(encoding="utf-8")
+    for package in (
+        "fastapi>=0.115",
+        "uvicorn>=0.30",
+        "sqlalchemy>=2.0",
+        "aiosqlite>=0.20",
+        "alembic>=1.13",
+    ):
+        assert package in text, package
+    assert "pytest / pytest-cov / httpx / pydantic" in text  # :7 预装清单已同步
+    assert "Node 预装与前端构建校验留待 v1.3 镜像变体" in text
+    assert "v1.2 前端只做静态检查" in text
+
+
+def test_find_cycles_is_independent_of_node_order() -> None:
+    """QA-复验：DFS **起点顺序**不得影响环条数（否则跨进程不可复现）。
+
+    生产图的邻接集来自 ``set``，dict 插入序受 ``PYTHONHASHSEED`` 影响；同一张图
+    ``a→b→c→a`` 且 ``c→b`` 在不同起点下会数出 2 或 1 条环。修复方式是
+    ``_find_cycles`` 内部按 ``sorted(graph)`` 固定起点顺序。
+    """
+    forward = {"a": {"b"}, "b": {"c"}, "c": {"a", "b"}}
+    backward = {"c": {"b", "a"}, "b": {"c"}, "a": {"b"}}
+    assert _find_cycles(forward) == _find_cycles(backward)
+    assert len(_find_cycles(forward)) == 2  # a→b→c→a 与 b→c→b
+
+
+def test_find_cycles_is_repeatable_within_process() -> None:
+    """同一图**重复调用**必须返回逐项相同的列表（顺序也相同，不只是长度相同）。
+
+    环数直接进 ``architecture`` 维度的 20% 权重，一旦列表顺序/条数抖动，
+    "同代码同输入同分数"的基线承诺就破了。邻接集用 ``set`` 构造（真实生产形态），
+    刻意放多个环 + 一个悬挂节点。
+    """
+    graph: dict[str, set[str]] = {
+        "a": {"b", "d"},
+        "b": {"c"},
+        "c": {"a", "b"},
+        "d": set(),
+        "e": {"f"},
+        "f": {"e"},
+    }
+    baseline = _find_cycles(graph)
+    for _ in range(5):
+        assert _find_cycles(graph) == baseline
+    assert len(baseline) == 3  # a→b→c→a、b→c→b、e→f→e
+
+
+def test_find_cycles_is_stable_across_hash_seeds() -> None:
+    """跨进程（不同 ``PYTHONHASHSEED``）结果必须**完全相同**。
+
+    进程内无法改 hash 种子，因此真的起两个子进程跑：``set`` 的迭代序随种子变化，
+    若 DFS 起点沿用 dict 插入序，同一张图会数出不同的环数 —— 这正是本用例要挡住的
+    回归（修复方式：``for node in sorted(graph)``）。
+    """
+    import os
+    import subprocess  # noqa: S404 - 固定脚本、无 shell、无外部输入
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        from ymir.evaluation.evaluators.architecture import _find_cycles
+
+        # 用 set 构造邻接集（与生产一致）：迭代序随 PYTHONHASHSEED 变化
+        edges = {("a", "b"), ("b", "c"), ("c", "a"), ("c", "b"), ("x", "y"), ("y", "x")}
+        nodes = {src for src, _ in edges} | {dst for _, dst in edges}
+        graph = {node: set() for node in nodes}
+        for src, dst in edges:
+            graph[src].add(dst)
+        print(repr(_find_cycles(graph)))
+        """
+    )
+    outputs: list[str] = []
+    for seed in ("0", "1", "12345"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": str(PROJECT_ROOT / "src")}
+        completed = subprocess.run(  # noqa: S603 - 固定脚本
+            [sys.executable, "-c", script],
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        outputs.append(completed.stdout.strip())
+    assert len(set(outputs)) == 1, f"不同 hash 种子下环列表不一致: {outputs}"
+    assert outputs[0].count("["), outputs[0]  # 至少确实返回了环

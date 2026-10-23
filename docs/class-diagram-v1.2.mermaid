@@ -1,0 +1,191 @@
+%% v1.2 增量类图（源文件，配套 docs/09-增量设计与任务列表-v1.2.md §5）
+%% 范围：仅新增 / 变更的类；v1.0 全量类图见 docs/class-diagram.mermaid，v1.1 增量见 docs/class-diagram-v1.1.mermaid（均未覆盖）
+%% 分层纪律（scripts/check_import_graph.py）：templates=2 产出 LayoutRules(common=5)，evaluation=1 消费；
+%%   artifacts=3 的 merge_trees 只收纯数据（Mapping / frozenset），禁止 import templates（逆层）
+classDiagram
+    class TemplateSpec {
+        +str id
+        +str version
+        +str name
+        +StackSpec stack
+        +LayoutSpec layout
+        +list~ConventionFile~ conventions
+        +SkeletonSpec skeleton
+        +list~CheckSpec~ checks
+        +dict~str,str~ prompting
+        +list~str~ supports
+        +to_layout_rules() LayoutRules
+        +skeleton_files() dict
+        +reserved_paths() frozenset
+        +seed_paths() frozenset
+        +command_checks() list
+        +render_for(role_id) str
+    }
+    class SkeletonSpec {
+        +int max_files
+        +int max_bytes
+        +list~SkeletonFile~ files
+        +reserved_paths() frozenset
+        +seed_paths() frozenset
+        +all_paths() frozenset
+        +total_bytes() int
+    }
+    class SkeletonFile {
+        +str path
+        +str content
+        +bool reserved
+    }
+    class TemplateRegistry {
+        -Path dir
+        -dict _cache
+        +load(template_id) TemplateSpec
+        +load_optional(ref) TemplateSpec
+        +list_all() list
+        +image_manifest() set
+    }
+    class LayoutRules {
+        +bool snake_case_py
+        +int max_file_lines
+        +list required_dirs
+        +list required_files
+        +list any_of_files
+        +FrontendRules frontend
+    }
+    class FrontendRules {
+        +list required_dirs
+        +list required_glob
+        +list forbidden_imports
+    }
+    class StageInput {
+        +str requirement
+        +list~UpstreamArtifact~ upstream
+        +list~str~ feedback
+        +TemplateContext template
+        +BaselineRef baseline
+    }
+    class BaselineRef {
+        +str artifact_id
+        +int version
+        +str content_hash
+        +int file_count
+        +list~str~ paths
+    }
+    class MergeResult {
+        +dict~str,str~ files
+        +PatchManifest manifest
+        +tuple changed_paths
+        +tuple deleted
+        +tuple conflicts
+        +manifest_json() str
+    }
+    class PatchManifest {
+        +str mode
+        +str base_content_hash
+        +PatchCounts counts
+        +list changed_paths
+        +list deleted
+        +list conflicts
+        +list skeleton_added
+        +list reserved_conflicts
+        +list skipped_existing
+    }
+    class PatchCounts {
+        +int added
+        +int modified
+        +int noop_dropped
+        +int deleted
+        +int skeleton_added
+        +int reserved_conflicts
+        +int skipped_existing
+    }
+    class ArtifactStore {
+        +save(...)
+        +load(...)
+        +latest_by_name(...)
+        +diff(v1, v2)
+        +export_zip(project_id, mode)
+    }
+    class Exporter {
+        <<Protocol>>
+        +str kind
+        +export(request, files) ExportResult
+    }
+    class GitHubExporter {
+        +str kind
+        +export(request, files) ExportResult
+        -_probe_token() str
+        -_create_commit(files) str
+    }
+    class ExportService {
+        -ArtifactStore store
+        -dict registry
+        +export(request) ExportResult
+        -_select_tree(request) tuple
+        -_idempotent_hit(request) ExportRecord
+        -_record(result) ExportRecord
+    }
+    class ExportRecord {
+        +str id
+        +str tenant_id
+        +str artifact_id
+        +int artifact_version
+        +str tree_mode
+        +str target_repo
+        +str target_branch
+        +str idempotency_key
+        +str status
+        +str commit_sha
+    }
+    class ExportTarget {
+        +str kind
+        +str repo
+        +str branch
+        +str path_prefix
+        +bool create_repo
+        +bool dry_run
+        +bool allow_protected_branch
+        +bool strict_secret_check
+    }
+    class EvalTask {
+        +str id
+        +frozenset changed_paths
+        +bool baseline_unavailable
+        +dict baseline_ref
+        +LayoutRules layout
+        +list~EvalCheck~ checks
+    }
+    class EvalContext {
+        +dict workdir
+        +LayoutRules layout
+        +workdir_text() str
+    }
+    class HarnessEvaluationGate {
+        +evaluate(run, stage, attempt) EvalVerdict
+        -_resolve_checks(run) list
+        -_resolve_layout(run) LayoutRules
+    }
+    class ConventionEvaluator {
+        +evaluate(ctx) EvalScore
+        -_structure_component(ctx, evidence) tuple
+    }
+    TemplateRegistry --> TemplateSpec
+    TemplateSpec --> SkeletonSpec
+    SkeletonSpec --> SkeletonFile
+    TemplateSpec ..> LayoutRules : to_layout_rules()
+    StageInput --> TemplateSpec : template context
+    StageInput --> BaselineRef
+    ExportService --> ArtifactStore
+    ExportService --> Exporter
+    ExportService --> MergeResult : tree=merged
+    ExportService --> ExportRecord
+    ExportService --> ExportTarget
+    Exporter <|.. GitHubExporter
+    HarnessEvaluationGate --> TemplateRegistry
+    HarnessEvaluationGate --> EvalTask
+    HarnessEvaluationGate --> EvalContext
+    EvalContext --> LayoutRules
+    EvalTask --> LayoutRules
+    ConventionEvaluator --> EvalContext
+    MergeResult --> PatchManifest
+    PatchManifest --> PatchCounts
+    ArtifactStore ..> MergeResult : reads patch_manifest

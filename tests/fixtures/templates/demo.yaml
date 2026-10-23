@@ -1,0 +1,63 @@
+id: demo
+version: "1.0"
+name: 演示模板
+description: 单元测试用最小合规模板（含保守骨架与两条检查命令）
+supports: [from_scratch, patch]
+
+stack:
+  language: python
+  runtime: "3.12"
+  backend: fastapi
+  frontend: vue3
+  dependencies: [fastapi, uvicorn, sqlalchemy]
+  package_manager: uv
+
+layout:
+  required_dirs: [app, tests, web/src]
+  required_files: [pyproject.toml]
+  any_of_files:
+    - [pyproject.toml, requirements.txt]
+  forbidden_dirs: [venv, node_modules, .venv]
+  snake_case_py: true
+  max_file_lines: 600
+  allowed_prefixes: [app/, tests/, web/]
+  frontend:
+    required_dirs: [web/src, web/src/components]
+    required_glob: ["web/src/**/*.vue"]
+    forbidden_imports: [jquery, bootstrap]
+
+conventions:
+  - { path: README.md, required: true }
+  - { path: .gitignore, required: true }
+
+skeleton:
+  max_files: 5
+  max_bytes: 32768
+  files:
+    - path: pyproject.toml
+      reserved: true
+      content: |
+        [project]
+        name = "app"
+        requires-python = ">=3.12"
+    - path: requirements.txt
+      reserved: false
+      content: |
+        fastapi>=0.115
+    - path: app/main.py
+      reserved: false
+      content: |
+        from fastapi import FastAPI
+        app = FastAPI()
+    - path: .env.example
+      reserved: true
+      content: |
+        APP_ENV=dev
+
+checks:
+  - { type: command, run: "python -m compileall -q app", weight: 1 }
+  - { type: command, run: "python -m pytest -q", weight: 2 }
+
+prompting:
+  pm: PRD 必须声明后端为 FastAPI，并说明数据持久化方案。
+  engineer: 固定提供的文件不要输出；给了最小版本的文件须输出完整版。

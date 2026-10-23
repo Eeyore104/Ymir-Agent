@@ -10,14 +10,27 @@
 
 from __future__ import annotations
 
+import io
+import json
+import zipfile
 from typing import Any
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ymir.artifacts.store import ArtifactStore
+from ymir.artifacts.versioning import compute_content_hash
 from ymir.models.base import utcnow
 from ymir.models.entities import StageExecution
 from ymir.storage.repositories import ProjectRepository, RunRepository
+from ymir.templates.models import (
+    CheckSpec,
+    SkeletonFile,
+    SkeletonSpec,
+    StackSpec,
+    TemplateSpec,
+)
 
 HISTORY: list[dict[str, Any]] = [
     {"round": 0, "verdict": "fail", "total": 62.0, "runnability": 48.0, "artifact_version": 1},
@@ -135,7 +148,6 @@ async def test_extend_repair_requires_history(client: AsyncClient) -> None:
 
 # --------------------------------------------------------------------- 双报告类型（T5.2）
 
-import json  # noqa: E402
 
 
 def _report_payload(
@@ -247,3 +259,515 @@ def test_report_raw_supports_both_file_names() -> None:
     assert _report_raw(both, "unknown-name") == "QA"
     # 非报告产物：取不到
     assert _report_raw({"prd.md": "# x"}, "prd") is None
+
+
+# --------------------------------------------------- v1.2 基线上传 / 模板引用（T2.2 / T1.2）
+
+BASELINE_FILES: dict[str, str] = {
+    "app/main.py": "print('hi')\n",
+    "README.md": "# 用户现有项目\n",
+}
+
+#: 骨架正文标记：只允许出现在模板 YAML 里，**绝不允许**进 run.context
+_SKELETON_BODY_MARKER = "SKELETON_BODY_MUST_NOT_LEAK"
+
+
+def _zip_bytes(files: dict[str, str]) -> bytes:
+    """把文件集打成 zip（内存，无临时文件）。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+async def _new_project(
+    session_factory: async_sessionmaker[AsyncSession], name: str = "baseline 项目"
+) -> str:
+    async with session_factory() as session:
+        project = await ProjectRepository(session).create(name=name)
+        await session.commit()
+        return project.id
+
+
+def _zip_names(payload: bytes) -> set[str]:
+    return set(zipfile.ZipFile(io.BytesIO(payload)).namelist())
+
+
+async def test_upload_baseline_zip_creates_immutable_artifact(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
+) -> None:
+    """DoD①：zip 上传 → ``baseline`` v1 落库，file_count / content_hash / size_bytes 正确。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes(BASELINE_FILES),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert data["version"] == 1
+    assert data["file_count"] == len(BASELINE_FILES)
+    assert data["content_hash"] == compute_content_hash(BASELINE_FILES)
+    assert data["size_bytes"] == sum(len(c.encode("utf-8")) for c in BASELINE_FILES.values())
+
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    loaded = await store.load(data["artifact_id"])
+    assert loaded.artifact.name == "baseline"
+    assert loaded.artifact.type == "baseline"
+    assert loaded.files == BASELINE_FILES
+
+    # 再上传一次 → 同一 artifact 的新版本（版本不可变，v1 仍在）
+    again = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes({"app/main.py": "print('v2')\n"}),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert again.json()["data"]["version"] == 2
+    assert again.json()["data"]["artifact_id"] == data["artifact_id"]
+
+
+async def test_upload_baseline_json_channel(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """脚本/测试通道：``{"files": {...}}`` JSON 与 zip 语义一致（docs/09 §4.2.1 ①）。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        json={"files": BASELINE_FILES},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["file_count"] == len(BASELINE_FILES)
+
+
+@pytest.mark.parametrize("bad_path", ["../evil.py", "/abs.py", "C:/win.py"])
+async def test_upload_baseline_zip_slip_rejected_without_disk_residue(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
+    bad_path: str,
+) -> None:
+    """DoD②：zip slip 三类 → 1001，且**磁盘无残留**（版本目录未创建）。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes({bad_path: "x = 1\n", "ok.py": "y = 2\n"}),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == 1001
+    artifacts_root = tmp_path / "artifacts"
+    created = (
+        [p for p in artifacts_root.rglob("v*") if p.is_dir()]
+        if artifacts_root.exists()
+        else []
+    )
+    assert created == [], f"磁盘出现残留版本目录: {created}"
+
+
+async def test_upload_baseline_over_file_count_limit(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """DoD③：文件数超 ``baseline_max_files``（默认 300）→ 1001。"""
+    project_id = await _new_project(session_factory)
+    files = {f"pkg/mod_{index}.py": "x = 1\n" for index in range(301)}
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes(files),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1001
+    assert "上限" in resp.json()["message"]
+
+
+async def test_upload_baseline_over_bytes_limit(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """DoD③：解压后总字节超 ``baseline_max_bytes``（默认 5MB）→ 1001。"""
+    project_id = await _new_project(session_factory)
+    big = "x" * (5 * 1024 * 1024 + 1)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes({"big.txt": big}),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1001
+
+
+async def test_upload_baseline_rejects_non_zip(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """非 zip 字节 → 1001（不静默当成空基线）。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=b"not a zip at all",
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1001
+
+
+async def test_create_run_rejects_baseline_from_another_project(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """DoD④：``POST /runs`` 引用**不属于本项目**的 baseline → 1001。"""
+    owner_id = await _new_project(session_factory, "基线归属项目")
+    other_id = await _new_project(session_factory, "另一个项目")
+    upload = await client.post(
+        f"/api/v1/projects/{owner_id}/baselines",
+        content=_zip_bytes(BASELINE_FILES),
+        headers={"Content-Type": "application/zip"},
+    )
+    artifact_id = upload.json()["data"]["artifact_id"]
+
+    resp = await client.post(
+        f"/api/v1/projects/{other_id}/runs",
+        json={"requirement": "在现有项目上改", "baseline_artifact_id": artifact_id},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == 1001
+    assert "不属于本项目" in resp.json()["message"]
+
+
+async def test_create_run_rejects_non_baseline_artifact(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """引用 type≠baseline 的产物 → 1001（基线引用不是"任意产物引用"）。"""
+    project_id = await _new_project(session_factory)
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    prd = await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.md": "# x"}
+    )
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "改代码", "baseline_artifact_id": prd.artifact_id},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1001
+    assert "不是基线" in resp.json()["message"]
+
+
+async def test_create_run_records_baseline_reference_in_context(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """基线引用快照写入 ``run.context["baseline"]``（id/version/hash/file_count）。"""
+    project_id = await _new_project(session_factory)
+    upload = await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes(BASELINE_FILES),
+        headers={"Content-Type": "application/zip"},
+    )
+    artifact_id = upload.json()["data"]["artifact_id"]
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "在现有项目上改", "baseline_artifact_id": artifact_id},
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = resp.json()["data"]["run_id"]
+    run = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+    baseline = run["context"]["baseline"]
+    assert baseline["artifact_id"] == artifact_id
+    assert baseline["version"] == 1
+    assert baseline["file_count"] == len(BASELINE_FILES)
+    assert baseline["content_hash"] == compute_content_hash(BASELINE_FILES)
+
+
+async def test_create_run_without_template_keeps_v11_context(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """无模板/无基线的 run：``context`` 只含 ``context_refs``（v1.1 行为不变）。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs", json={"requirement": "做一个 CLI"}
+    )
+    run = (await client.get(f"/api/v1/runs/{resp.json()['data']['run_id']}")).json()["data"]
+    assert "template" not in run["context"]
+    assert "baseline" not in run["context"]
+    assert run["context"]["context_refs"] == []
+
+
+async def test_create_run_unknown_template_is_1001(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """DoD⑥：``template_id`` 不存在 → 1001（请求体参数非法，不是路径资源 1002）。"""
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "做一个 CLI", "template_id": "no-such-template"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == 1001
+    assert "模板不存在" in resp.json()["message"]
+
+
+async def test_create_run_records_template_reference_without_skeleton_body(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run.context["template"]`` 只存 ``{"id","version"}``，**不含骨架正文**。"""
+    spec = TemplateSpec(
+        id="fake-template",
+        version="2.3",
+        name="假模板",
+        stack=StackSpec(dependencies=["fastapi"]),
+        skeleton=SkeletonSpec(
+            files=[
+                SkeletonFile(
+                    path="pyproject.toml", content=f"{_SKELETON_BODY_MARKER}\n", reserved=True
+                )
+            ]
+        ),
+        checks=[CheckSpec(run="python -m compileall -q .")],
+        prompting={"engineer": "遵守目录规范"},
+    )
+    monkeypatch.setattr("ymir.api.routers.runs.load_template", lambda template_id: spec)
+
+    project_id = await _new_project(session_factory)
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/runs",
+        json={"requirement": "做一个 CLI", "template_id": "fake-template"},
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = resp.json()["data"]["run_id"]
+    run = (await client.get(f"/api/v1/runs/{run_id}")).json()["data"]
+    assert run["context"]["template"] == {"id": "fake-template", "version": "2.3"}
+    dumped = json.dumps(run, ensure_ascii=False)
+    assert _SKELETON_BODY_MARKER not in dumped
+    assert "skeleton" not in run["context"]["template"]
+
+
+async def test_baseline_denied_on_upload_for_unknown_project(
+    client: AsyncClient,
+) -> None:
+    """项目不存在 → 1002。"""
+    resp = await client.post(
+        "/api/v1/projects/no-such-project/baselines",
+        content=_zip_bytes(BASELINE_FILES),
+        headers={"Content-Type": "application/zip"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["code"] == 1002
+
+
+async def test_export_zip_excludes_baseline(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD⑤：``GET /export`` 默认**不含** baseline 目录；无基线项目输出不变。"""
+    project_id = await _new_project(session_factory)
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.md": "# x"}
+    )
+
+    plain = await client.get(f"/api/v1/projects/{project_id}/export")
+    assert plain.status_code == 200
+    plain_names = _zip_names(plain.content)
+    # 无基线项目：与 v1.1 完全一致（顶层 manifest + {name}/v{n}/{path}）
+    assert plain_names == {"manifest.json", "prd/v1/prd.md"}
+
+    await client.post(
+        f"/api/v1/projects/{project_id}/baselines",
+        content=_zip_bytes(BASELINE_FILES),
+        headers={"Content-Type": "application/zip"},
+    )
+    with_baseline = _zip_names((await client.get(f"/api/v1/projects/{project_id}/export")).content)
+    assert with_baseline == plain_names  # 基线目录整体不出现
+    export_bytes = (await client.get(f"/api/v1/projects/{project_id}/export")).content
+    manifest = json.loads(zipfile.ZipFile(io.BytesIO(export_bytes)).read("manifest.json"))
+    assert [item["name"] for item in manifest["artifacts"]] == ["prd"]
+
+    # 显式 include_baseline=True 才带上（服务端能力，不暴露给缺省 API）
+    full = _zip_names(
+        await store.export_zip(project_id, include_baseline=True)
+    )
+    assert "baseline/v1/app/main.py" in full
+
+
+# ------------------------------------------- v1.2 跨产物 diff / 合并导出（T2.5）
+
+DIFF_BASE: dict[str, str] = {
+    "README.md": "# 用户项目\n",
+    "app/main.py": "app = None\n",
+    "app/legacy.py": "LEGACY = True\n",
+}
+
+
+async def _seed_incremental(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> tuple[ArtifactStore, str, dict[str, str], dict[str, str]]:
+    """铺「基线 + 增量 code 产物」；返回 (store, project_id, 基线文件, 合并树)。
+
+    增量产物只存 ``changed_paths`` 的文件 + ``patch_manifest.json``（与编排层落盘口径一致）。
+    """
+    from ymir.artifacts.merge import PATCH_MANIFEST_NAME, merge_trees
+
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    project_id = await _new_project(session_factory, "diff-across 项目")
+    await store.save(
+        project_id=project_id,
+        name="baseline",
+        artifact_type="baseline",
+        files=DIFF_BASE,
+        created_by="user",
+    )
+
+    patch = {
+        "app/main.py": "app = 'v2'\n",  # modified
+        "app/new.py": "NEW = True\n",  # added
+    }
+    merged = merge_trees(
+        DIFF_BASE, patch, mode="patch", deleted=["app/legacy.py"]
+    )  # app/legacy.py -> removed
+    stored = {
+        path: merged.files[path]
+        for path in merged.manifest.changed_paths
+        if path in merged.files
+    }
+    stored[PATCH_MANIFEST_NAME] = merged.manifest_json()
+    await store.save(
+        project_id=project_id, name="code", artifact_type="code", files=stored
+    )
+    return store, project_id, DIFF_BASE, merged.files
+
+
+async def test_diff_across_returns_diff_report_structure(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ①：返回 ``DiffReport`` 结构；新增=added、修改=modified、删除=removed。"""
+    _store, project_id, _base, merged = await _seed_incremental(session_factory, tmp_path)
+
+    resp = await client.get(f"/api/v1/projects/{project_id}/diff-across")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+
+    statuses = {item["path"]: item["status"] for item in data["files"]}
+    assert statuses == {
+        "app/main.py": "modified",
+        "app/new.py": "added",
+        "app/legacy.py": "removed",
+    }
+    assert data["stats"]["files_changed"] == 3
+    assert data["stats"]["additions"] > 0 and data["stats"]["deletions"] > 0
+    # modified 的文件必须有 unified diff（复用 diff_file_sets，不重写）
+    modified = next(item for item in data["files"] if item["path"] == "app/main.py")
+    assert "--- a/app/main.py" in modified["diff"]
+    assert merged["app/main.py"] == "app = 'v2'\n"
+
+
+async def test_diff_across_explicit_version_refs(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """``name@version`` 形式可用（显式版本）。"""
+    _store, project_id, _base, _merged = await _seed_incremental(session_factory, tmp_path)
+    resp = await client.get(
+        f"/api/v1/projects/{project_id}/diff-across?base=baseline@1&target=code@1"
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["v1"] == 1 and resp.json()["data"]["v2"] == 1
+
+
+async def test_diff_across_without_baseline_is_1001(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ②：项目无基线 → 1001（提示改用同产物 diff）。"""
+    store = ArtifactStore(session_factory, tmp_path / "artifacts")
+    project_id = await _new_project(session_factory, "无基线项目")
+    await store.save(
+        project_id=project_id, name="code", artifact_type="code", files={"a.py": "x = 1\n"}
+    )
+    resp = await client.get(f"/api/v1/projects/{project_id}/diff-across")
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == 1001
+    message = resp.json()["message"]
+    assert "没有基线" in message or "不是基线" in message
+
+
+async def test_diff_across_unknown_artifact_is_1002(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ②：artifact / version 不存在 → 1002。"""
+    _store, project_id, _base, _merged = await _seed_incremental(session_factory, tmp_path)
+    missing_artifact = await client.get(
+        f"/api/v1/projects/{project_id}/diff-across?target=nope"
+    )
+    assert missing_artifact.status_code == 404
+    assert missing_artifact.json()["code"] == 1002
+
+    missing_version = await client.get(
+        f"/api/v1/projects/{project_id}/diff-across?target=code@9"
+    )
+    assert missing_version.status_code == 404
+    assert missing_version.json()["code"] == 1002
+
+
+async def test_diff_across_reuses_artifact_diff_schema(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ⑤：字段集合与既有 ``ArtifactDiffOut`` **完全一致**（前端 DiffView 零改动）。"""
+    from ymir.api.schemas import ArtifactDiffOut, DiffStatsOut, FileDiffOut
+
+    _store, project_id, _base, _merged = await _seed_incremental(session_factory, tmp_path)
+    data = (await client.get(f"/api/v1/projects/{project_id}/diff-across")).json()["data"]
+    assert set(data) == set(ArtifactDiffOut.model_fields)
+    assert set(data["stats"]) == set(DiffStatsOut.model_fields)
+    assert set(data["files"][0]) == set(FileDiffOut.model_fields)
+
+
+async def test_export_merged_is_flat_project_layout(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ③：``mode=merged`` 的 zip 是扁平工程布局（顶层直接 ``app/main.py``）。"""
+    _store, project_id, _base, merged = await _seed_incremental(session_factory, tmp_path)
+    resp = await client.get(f"/api/v1/projects/{project_id}/export?mode=merged")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Export-Mode"] == "merged"
+
+    names = _zip_names(resp.content)
+    assert "app/main.py" in names and "manifest.json" in names
+    assert not [name for name in names if name.startswith("code/")], names
+    assert not [name for name in names if "/v1/" in name], names
+    # 合并树口径：基线文件在场、补丁覆盖、删除的路径不在
+    payload = zipfile.ZipFile(io.BytesIO(resp.content))
+    assert payload.read("app/main.py").decode() == merged["app/main.py"]
+    assert payload.read("README.md").decode() == DIFF_BASE["README.md"]
+    assert "app/legacy.py" not in names
+    manifest = json.loads(payload.read("manifest.json"))
+    assert manifest["mode"] == "merged" and manifest["tree"] == "merged"
+
+
+async def test_export_default_mode_is_v11_identical(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession], tmp_path
+) -> None:
+    """DoD ④：``mode`` 缺省时 zip 与 v1.1 **逐条目一致**（条目名集合 + manifest 结构）。
+
+    断言方式：①条目名集合与 v1.1 的 ``{name}/v{n}/{path}`` 形态**精确相等**；
+    ②``manifest.json`` 的键集合与 v1.1 完全相同（无 v1.2 新增键）；
+    ③与显式 ``mode=latest`` 的条目集合一致；④响应头不含 v1.2 新增标记头。
+    """
+    _store, project_id, _base, _merged = await _seed_incremental(session_factory, tmp_path)
+
+    default = await client.get(f"/api/v1/projects/{project_id}/export")
+    explicit = await client.get(f"/api/v1/projects/{project_id}/export?mode=latest")
+    assert default.status_code == explicit.status_code == 200
+
+    expected = {
+        "manifest.json",
+        "code/v1/app/main.py",
+        "code/v1/app/new.py",
+        "code/v1/patch_manifest.json",  # 增量产物只存变更文件（legacy 是删除，不在文件集里）
+    }
+    assert _zip_names(default.content) == expected
+    assert _zip_names(default.content) == _zip_names(explicit.content)
+
+    manifest = json.loads(zipfile.ZipFile(io.BytesIO(default.content)).read("manifest.json"))
+    assert set(manifest) == {"project_id", "exported_at", "artifacts"}  # 无 mode/tree
+    assert {item["name"] for item in manifest["artifacts"]} == {"code"}  # 基线被排除
+
+    assert "X-Export-Mode" not in default.headers  # 缺省响应头与 v1.1 一致
+    assert default.headers["X-Manifest"] == "manifest.json"

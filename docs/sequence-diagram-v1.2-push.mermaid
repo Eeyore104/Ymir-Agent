@@ -1,0 +1,54 @@
+%% v1.2 增量时序图 ②（源文件，配套 docs/09-增量设计与任务列表-v1.2.md §6.2）
+%% 场景：产物 → dry-run 预演 → 确认推送 → GitHub Git Data API → 回执落库（含幂等分支）
+%% 第一张（模板/骨架/增量/人审）见 docs/sequence-diagram-v1.2.mermaid
+%% 要点：文件过滤永远先于网络调用；1 次推送 = 1 个 commit；.env 拦截 / .env.example 放行
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant W as Web
+    participant A as API
+    participant S as ExportService
+    participant R as exports（回执表）
+    participant ST as ArtifactStore
+    participant MG as merge.py
+    participant G as GitHubExporter
+    participant GH as GitHub API
+
+    U->>W: 点「推送 GitHub」→ 填 repo / branch
+    W->>A: POST /projects/{id}/exports {tree:merged, target, dry_run:true}
+    A->>S: export(request)
+    S->>ST: load(code@v) + load(baseline 引用)
+    S->>MG: merge_trees(mode=merge) → files
+    S->>G: 文件过滤（路径黑名单 + 白名单例外 + 内容指纹 + 尺寸）
+    Note over G: .env 拦下；.env.example/.env.sample/.env.template 放行
+    G-->>S: {allowed, blocked, skipped}
+    S-->>A: ExportResult{status=ok, dry_run=true, pushed_files, blocked_files}
+    A-->>W: 预演结果（12 个将推 / 1 个拦截 / 2 个跳过）
+    Note over W: 默认 dry_run=true，用户确认后才真推
+
+    U->>W: 确认推送
+    W->>A: POST /projects/{id}/exports {dry_run:false}
+    A->>S: export(request)
+    S->>R: 查 idempotency_key = sha256(artifact|version|content_hash|repo|branch|prefix)
+    alt 命中且远端 head 未变
+        R-->>S: 已有 status=ok 记录（commit_sha 相同）
+        S-->>A: ExportResult{status=skipped_identical, commit_sha}
+    else 未命中或远端 head 已变
+        S->>G: export(request, files=allowed)
+        G->>GH: GET /user（读 X-OAuth-Scopes 探测 repo scope）
+        alt token 缺失 / scope 不含 repo
+            GH-->>G: 401 或 403
+            G-->>S: ExportResult{status=failed, error_class=auth|permission}
+        else 鉴权通过
+            G->>GH: POST /git/blobs × N
+            G->>GH: POST /git/trees（base_tree=目标分支当前 tree）
+            G->>GH: POST /git/commits（1 个 commit）
+            G->>GH: POST|PATCH /git/refs/heads/{branch}
+            GH-->>G: commit_sha
+            G-->>S: ExportResult{status=ok, dry_run=false, pushed_files, commit_sha}
+        end
+        S->>R: upsert 回执（status / commit_sha / file_count / blocked_count / error_class）
+        S-->>A: ExportResult
+    end
+    A-->>W: 结果（commit 链接 / blocked 清单 / 错误指引）
+    Note over W: 404 文案必须含"GitHub 对无权访问的私有仓库也返回 404"

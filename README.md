@@ -20,6 +20,8 @@ v1.1 起再加一层：**评测不达标会自动回边返工**——失败检�
 - **四维评测体系**（差异化核心）：`需求符合度 / 可运行率 / 规范符合度 / 架构合理性` 加权总分 + **双门槛**（总分 ≥ 75 且可运行率 ≥ 60）+ **逐分证据链**，报告作为一等产物可版本 diff；批量跑分输出「性价比榜单」（total_score vs cost）。
 - **声明式自愈回环（v1.1）**：评测裁决 `fail` → 自动作废 coding/evaluation 的 completed 执行并回边重跑；失败检查命令 + 错误摘要 + **上一版产物**定向注入工程师提示词（不回灌全量日志，受 `max_detail_chars` 预算约束）；轮次上限 + 单 run 预算**fail-closed** 预检；耗尽后支持 `accept-best` / `extend-repair` / `cancel` 三动作人工介入。
 - **评测任务绑定与基准套件（v1.1）**：套件支持 `single` / `per_task` 两种绑定模式；`per_task` 下每个基准任务绑定自己的项目产物，未绑定或产物缺失**零成本跳过**（不启沙箱、不调 judge），跨项目零取材；内置 `benchmark-12`（12 任务 / 12 场景 / 执行型检查）。
+- **模板约束注入（v1.2）**：垂直模板以声明式 YAML 定义技术栈 / 目录规范 / 规范文件集 / 依赖白名单 / 检查命令，并携带 3–5 个**骨架文件**（`pyproject.toml` / `ruff.toml` / `requirements.txt` / `app/main.py` / `.env.example`）；约束同时注入四角色提示词并驱动评测检查口径，两套模板：`fastapi-vue3` + `python-cli`。
+- **增量合入与安全推送（v1.2）**：上传基线 → 只产出新增/修改（`noop` 自动丢弃）→ 「基线 ⊕ 补丁」合并树评测 → 跨产物 diff 人审 → GitHub 推送（Git Data API 单 commit、dry-run 前置、密钥双层过滤、默认推新分支）。
 
 ## 项目进度
 
@@ -81,6 +83,32 @@ uv run python scripts/run_eval.py --project-name <项目名> --versions v1 --no-
 ```
 
 完整基线表字段、12 任务口径与 `--resume / --budget-cny / --report-only` 用法见 `docs/04-使用手册.md` §9.1。
+
+### v1.2（实施完成 2026-10-23）：垂直模板库 + 增量 patch + GitHub 推送
+
+从「从零生成一个能跑的项目」升级为「**按用户既有工程的规矩把改动增量合进去，并安全推到自己的仓库**」。
+
+| 能力 | 一句话 |
+|---|---|
+| 垂直模板 | `fastapi-vue3` + `python-cli` 两套 YAML：技术栈 / 目录规范 / 规范文件集 / 依赖白名单 / 检查命令 + 3–5 个骨架文件 |
+| 增量 patch | 「基线 ⊕ 补丁」→ 合并树；与基线逐字节相同的文件 `noop` 自动丢弃；`patch_manifest.json` 自描述（`base_content_hash` / `changed_paths` / `counts`） |
+| 人工可审 | 跨产物 `diff-across` 复用既有 `DiffView`；骨架冲突与改动面（added / modified / noop）在审批卡片可见 |
+| 安全推送 | Git Data API **1 次推送 = 1 个 commit**；dry-run 前置；密钥双层过滤（路径黑名单 + 内容指纹）；默认推新分支 `ymir/<artifact>-v<n>` |
+
+**质量数据（v1.2 验收证书实测）**：后端 **720 passed**（8 轮全量 0 失败）· 前端 **63 passed / 12 files** ·
+`ruff check` / `scripts/check_import_graph.py`（分层 + 循环依赖）/ `alembic check`（新增 1 个迁移 `0004_add_exports`，双向可逆）全绿 ·
+前端构建 `index.js` **483.58 kB（gzip 163.92）** / `vue-vendor` 157.37 / `markdown` 93.60 / `css` 173.60，1896 modules，`vue-tsc` 零错。
+
+**零费用复现（不调真实模型、不依赖 Docker）**
+
+```bash
+uv run pytest -q                                # 720 passed
+uv run python scripts/check_import_graph.py     # 分层护栏 PASS
+cd web && npx vitest run && npm run build       # 63 passed / 12 files
+```
+
+> **待补**：模板**端到端真跑**（2 模板 × 从零 / 增量，benchmark 式基线）因开发环境 Docker 未启动**尚未执行**，
+> 上述 720 条为单元/集成用例。限制与补跑口径见 `docs/04-使用手册.md` §10.4。
 
 ## 架构一览
 
