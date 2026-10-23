@@ -1,0 +1,45 @@
+# Docker 构建上下文最小化
+#
+# 背景（2026-10-23 实测）：本文件缺失时，`docker build .` 会把 23731 个文件 /
+# 约 300MB 传给 Docker daemon（其中 web/ 180MB、.venv/ 112MB），单次构建光
+# 上下文传输就要数分钟。而 docker/sandbox.Dockerfile **不含任何 COPY 指令**，
+# 只在 python:3.12-slim 上 pip install，**根本不需要构建上下文**。
+#
+# 保留 src/ 与 config/ 是为了将来若加 COPY（如把校验脚本塞进镜像）不必回头放开。
+
+# 版本控制与 IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Python 虚拟环境与缓存
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+
+# 前端（镜像不含 Node，v1.3 才有前端构建变体）
+web
+node_modules
+
+# 运行时数据（数据库 / 产物 / 评测输出，绝不进镜像）
+data
+
+# 测试与文档（非运行时依赖）
+tests
+docs
+deliverables
+
+# 本地工作区（含会话记忆与临时产物）
+.workbuddy
+
+# CI 与容器编排（镜像内用不到）
+.github
+docker-compose.yml
+
+# 其他
+*.log
+*.tmp
+.DS_Store

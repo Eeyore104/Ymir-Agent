@@ -36,6 +36,7 @@ from ymir.sop.loader import load_pipeline, truncate_pipeline
 from ymir.sop.models import PipelineDefinition, StageSpec
 from ymir.storage.db import build_engine, build_session_factory
 from ymir.storage.repositories import ProjectRepository, RunRepository
+from ymir.templates import load_template
 
 TERMINAL = (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.PAUSED.value)
 
@@ -53,7 +54,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-name", default=None, help="新建项目名（默认时间戳命名）")
     parser.add_argument("--timeout", type=float, default=900.0, help="等待终态超时（秒）")
     parser.add_argument("--dry-run", action="store_true", help="仅打印阶段链与档位，不调模型")
+    # v1.2（T5.1 真跑场景）：模板与基线都是 run 的**运行参数**，只写引用进 run.context，
+    # 绝不进 stage.inputs（sop 校验器会否决未知键）。语义与 ``POST /runs`` 一致。
+    parser.add_argument(
+        "--template-id",
+        default=None,
+        help="v1.2 模板 ID（fastapi-vue3 / python-cli）；缺省 = 通用模式（零模板）",
+    )
+    parser.add_argument(
+        "--baseline-artifact-id",
+        default=None,
+        help="v1.2 基线产物 ID；指定即进入增量（patch）模式",
+    )
+    parser.add_argument(
+        "--baseline-version",
+        type=int,
+        default=None,
+        help="基线产物版本（缺省取最新）",
+    )
+    # HITL 模式（docs §3.8）。默认 key_node 保持 T03 联调脚本原行为；
+    # 无人值守的真跑（T5.1 四场景）必须用 batch，否则会在三道审批 gate 上挂到超时。
+    parser.add_argument(
+        "--mode",
+        default="key_node",
+        choices=["key_node", "batch", "debug"],
+        help="HITL 模式（key_node=三关审批 / batch=全自动 / debug=全步骤人审）",
+    )
     return parser.parse_args()
+
+
+def build_run_context(args: argparse.Namespace) -> dict[str, object]:
+    """构造 ``run.context``：模板与基线只放**引用快照**。
+
+    与 ``src/ymir/api/routers/runs.py`` 的 ``POST /runs`` 保持同一形状：
+    ``{"context_refs": [...], "template": {"id","version"}, "baseline": {...}}``。
+    """
+    context: dict[str, object] = {"context_refs": []}
+    if args.template_id:
+        spec = load_template(args.template_id)
+        context["template"] = {"id": spec.id, "version": spec.version}
+        print(f"[template] 已加载 {spec.id} v{spec.version}")
+    if args.baseline_artifact_id:
+        baseline: dict[str, object] = {"artifact_id": args.baseline_artifact_id}
+        if args.baseline_version is not None:
+            baseline["version"] = args.baseline_version
+        context["baseline"] = baseline
+        label = f"v{args.baseline_version}" if args.baseline_version else "latest"
+        print(f"[baseline] {args.baseline_artifact_id} {label}（增量模式）")
+    return context
 
 
 def find_stage_by_role(definition: PipelineDefinition, role_id: str) -> StageSpec:
@@ -213,11 +261,14 @@ async def run_main(args: argparse.Namespace) -> int:
         )
 
         project_id = await resolve_project(session_factory, args)
+        context = build_run_context(args)
         async with session_factory() as session:
             run = await RunRepository(session).create(
                 project_id=project_id,
                 requirement=args.requirement,
                 pipeline_id=definition.id,
+                mode=args.mode,
+                context=context,
             )
             await session.commit()
             run_id = run.id
