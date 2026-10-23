@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ymir.artifacts.exporter import ExportTarget
 from ymir.models.enums import RunMode
 
 
@@ -69,12 +70,37 @@ class ProjectDetail(ProjectOut):
 
 
 class RunCreate(BaseModel):
-    """发起运行请求。"""
+    """发起运行请求。
+
+    v1.2（docs/09 §4.1.2 / §4.2.1）：``template_id`` 与 ``baseline_*`` 都是**可选**
+    运行参数 —— 模板是 run 的运行参数而**不是**流水线拓扑（写进 ``stage.inputs``
+    会被 ``sop/validator._check_inputs`` 直接否决）。两者缺省 ``None`` 时行为与
+    v1.1 完全一致。
+    """
 
     requirement: str = Field(..., min_length=1, description="原始需求文本")
     pipeline_id: str = Field(default="software-dev", description="流水线 ID")
     mode: RunMode = Field(default=RunMode.KEY_NODE, description="HITL 模式")
     context_refs: list[str] = Field(default_factory=list, description="附加上下文引用")
+    template_id: str | None = Field(
+        default=None, description="模板 id（不存在/非法 → 1001）；缺省 = 通用模式"
+    )
+    baseline_artifact_id: str | None = Field(
+        default=None, description="基线产物 id（须属于本项目且 type=baseline）"
+    )
+    baseline_version: int | None = Field(
+        default=None, ge=1, description="基线版本号；缺省 = 该产物当前版本"
+    )
+
+
+class BaselineUploadOut(BaseModel):
+    """基线上传结果（v1.2，docs/09 §4.2.1）。"""
+
+    artifact_id: str
+    version: int
+    file_count: int
+    content_hash: str
+    size_bytes: int
 
 
 class RunOut(BaseModel):
@@ -278,6 +304,87 @@ class ArtifactDiffOut(BaseModel):
     v2: int
     files: list[FileDiffOut]
     stats: DiffStatsOut
+
+
+# --- 推送（v1.2 T3.4，docs/09 §4.3.1）---
+
+
+class ExportCreate(BaseModel):
+    """推送请求体（**绝不接受 token 字段**）。
+
+    ``extra="forbid"`` 是安全底线：请求体里出现 ``token`` / ``pat`` 之类键一律
+    400/1001 拒掉，避免凭证经请求体流入日志、回执表或异常信息（§4.3.2）。
+    token 只从环境变量读（``settings.github_token_env``）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: ExportTarget = Field(description="推送目标（repo/branch/path_prefix…）")
+    artifact_id: str = Field(min_length=1, description="要推送的产物 id")
+    artifact_version: int | None = Field(default=None, ge=1, description="缺省 = 最新版本")
+    tree: Literal["files", "merged"] = Field(
+        default="merged", description="files=原产物 / merged=基线⊕补丁（推荐）"
+    )
+    dry_run: bool = Field(default=True, description="缺省预演（前端确认后才真推）")
+    strict_secret_check: bool = Field(default=False)
+
+
+class BlockedFileOut(BaseModel):
+    """被拦/被跳过的文件（``path`` + ``reason``，**不含正文**）。"""
+
+    path: str
+    reason: str
+
+
+class ExportReceiptOut(BaseModel):
+    """推送回执（v1.2 T4.1）。"""
+
+    id: str
+    artifact_id: str
+    artifact_version: int
+    tree: str
+    target_kind: str
+    repo: str
+    branch: str
+    path_prefix: str = ""
+    status: str
+    commit_sha: str | None = None
+    file_count: int = 0
+    blocked_count: int = 0
+    skipped_count: int = 0
+    error_code: int | None = None
+    error_class: str | None = None
+    error_message: str | None = None
+    idempotency_key: str = ""
+    dry_run: bool = False
+    #: dry-run 预演结果（"将推送 N 个 / 拦截 M 个 / 跳过 K 个"的 M、K 部分）
+    blocked_files: list[BlockedFileOut] = Field(default_factory=list)
+    skipped_files: list[BlockedFileOut] = Field(default_factory=list)
+    created_at: datetime
+
+
+# --- 模板（v1.2 T4.1，§4.1.1）---
+
+
+class TemplateSummaryOut(BaseModel):
+    """模板摘要（**只含路径清单，不含骨架正文**；坏模板只带 ``loading_error``）。"""
+
+    id: str
+    version: str = ""
+    name: str = ""
+    description: str = ""
+    supports: list[str] = Field(default_factory=list)
+    stack: dict[str, Any] = Field(default_factory=dict)
+    layout: dict[str, Any] = Field(default_factory=dict)
+    conventions: list[str] = Field(default_factory=list)
+    reserved_paths: list[str] = Field(default_factory=list)
+    seed_paths: list[str] = Field(default_factory=list)
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    #: 角色 -> 追加约束文本（骨架正文永远不在这里）
+    prompting: dict[str, str] = Field(default_factory=dict)
+    prompting_roles: list[str] = Field(default_factory=list)
+    #: 加载失败原因（为 ``None`` 表示该模板可用）；坏模板不让列表整体 500
+    loading_error: str | None = None
 
 
 # --- 沙箱（T03，§3.5）---

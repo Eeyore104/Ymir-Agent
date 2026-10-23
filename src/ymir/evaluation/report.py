@@ -109,6 +109,9 @@ class TaskOut(BaseModel):
     wall_time_ms: int = 0
     cost_cny: float = 0.0
     tokens: int = 0
+    #: 报告级警示（v1.2）：如"基线不可用 → 分数与基线内运行不可比"（R9）。
+    #: 缺省空列表 —— 空时 Markdown 渲染与 v1.1 逐字节一致。
+    warnings: list[str] = Field(default_factory=list)
 
     def dimension(self, name: str) -> DimensionOut | None:
         for item in self.dimensions:
@@ -309,6 +312,10 @@ class EvaluationReport(BaseModel):
                 "",
                 f"- 产物：{json.dumps(task.artifact_ref, ensure_ascii=False)}",
                 f"- 需求：{task.requirement or '（未提供）'}",
+            ]
+            # 警示行仅在存在时输出（空时与 v1.1 逐字节一致）
+            lines += [f"- ⚠️ {warning}" for warning in task.warnings]
+            lines += [
                 "",
                 "| 维度 | 分数 | 权重 | 理由 |",
                 "|---|---|---|---|",

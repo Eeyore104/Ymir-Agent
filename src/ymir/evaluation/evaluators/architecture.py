@@ -275,7 +275,14 @@ def _build_graph(py: dict[str, str], name_to_path: dict[str, str]) -> dict[str, 
 
 
 def _find_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
-    """检测有向图中的环（返回若干条环路径）。"""
+    """检测有向图中的环（返回若干条环路径）。
+
+    ★ **起点必须有序**：DFS 起点决定"先发现哪条环"，而环按 ``frozenset`` 去重，
+    因此不同起点会得到**不同条数**（例：``a→b→c→a`` 且 ``c→b``，从 ``a`` 起跑 2 条、
+    从 ``b`` 起跑 1 条）。生产图的邻接集来自 ``set``，若沿用 dict 插入序（受
+    ``PYTHONHASHSEED`` 影响），同一张图在不同进程会给出不同环数 → 评测不可复现。
+    这里按 ``sorted(graph)`` 固定起点顺序，保证"同图同结果"。
+    """
     cycles: list[list[str]] = []
     seen_keys: set[frozenset[str]] = set()
     color: dict[str, int] = dict.fromkeys(graph, 0)  # 0=未访问 1=在栈 2=完成
@@ -297,7 +304,7 @@ def _find_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
         stack.pop()
         color[node] = 2
 
-    for node in graph:
+    for node in sorted(graph):
         if color.get(node, 0) == 0:
             _dfs(node)
     return cycles

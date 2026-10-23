@@ -8,6 +8,7 @@ from typing import Annotated, Any
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ymir.artifacts.export_service import ExportService
 from ymir.artifacts.store import ArtifactStore
 from ymir.config import Settings, get_settings
 from ymir.events.bus import EventPublisher
@@ -78,6 +79,11 @@ def get_approval_service(request: Request) -> ApprovalService:
     return request.app.state.approval_service
 
 
+def get_export_service(request: Request) -> ExportService:
+    """返回应用绑定的推送服务（v1.2 T4.1）。"""
+    return request.app.state.exports
+
+
 def get_eval_harness(request: Request) -> Any:
     """返回应用绑定的评测 harness（T05）。"""
     return request.app.state.evaluations
@@ -95,3 +101,4 @@ ArtifactsDep = Annotated[ArtifactStore, Depends(get_artifact_store)]
 SandboxesDep = Annotated[SandboxService, Depends(get_sandbox_service)]
 ApprovalsDep = Annotated[ApprovalService, Depends(get_approval_service)]
 EvaluationsDep = Annotated[Any, Depends(get_eval_harness)]
+ExportServiceDep = Annotated[ExportService, Depends(get_export_service)]

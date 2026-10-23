@@ -16,6 +16,10 @@
 - :class:`EvalVerdict` / :class:`FailedCheck`（v1.1，docs/07 §4.4.2）：**裁决合同**。
   编排层只认这份不可变快照，`evaluation` 负责产出、`orchestrator` 负责消费 ——
   任何自动化分支（回边 / 终态 / 基线）只读它，绝不读 QA 的 LLM 叙事输出。
+- :class:`LayoutRules` / :class:`FrontendRules`（v1.2，docs/09 §4.1.1）：**模板结构规则**。
+  ``templates``(rank 2) 产出、``evaluation``(rank 1) 消费；放在 common(rank 5)
+  是为了让两条跨层边都合法（``2 -> 5``、``1 -> 5``），避免 ``evaluation -> templates``
+  的分层逆层（CI 由 ``scripts/check_import_graph.py`` 拦截）。
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ymir.common.errors import BizCode, YmirError
 
@@ -59,6 +63,58 @@ class CodeBundle(BaseModel):
         default_factory=list, description="冒烟/自测命令（在沙箱内执行）"
     )
     notes: str = Field(default="", description="实现说明与未决事项")
+    #: ★增量模式（v1.2，docs/09 §4.2.2）：要从基线删除的相对路径。
+    #: 缺省 ``[]`` ⇒ v1.1 旧 JSON（无该键）反序列化行为不变，非增量路径完全忽略。
+    deleted: list[str] = Field(default_factory=list, description="要从基线删除的相对路径")
+
+
+# ------------------------------------------------------- 模板结构规则（v1.2，docs/09 §4.1.1）
+
+
+class FrontendRules(BaseModel):
+    """前端结构规则（仅结构静态检查，**不做构建校验**：docs/09 §12-Q2 定案 A）。
+
+    纯数据合同：``templates``(rank 2) 产出、``evaluation``(rank 1) 消费，两者都只
+    依赖 ``common``(rank 5)，从而绕开「evaluation -> templates」的分层逆层。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_dirs: list[str] = Field(default_factory=list, description="必须存在的前端目录")
+    required_glob: list[str] = Field(
+        default_factory=list, description="必须命中的 glob 模式（如 web/src/**/*.vue）"
+    )
+    forbidden_imports: list[str] = Field(
+        default_factory=list, description="禁止出现的前端依赖名（如 jquery）"
+    )
+
+
+class LayoutRules(BaseModel):
+    """模板声明的目录与命名规范（纯数据，跨层唯一载体）。
+
+    条目的路径均已在模板加载期过 ``normalize_rel_path``（docs/09 §4.1.5 校验 5），
+    消费方（``convention`` 评估器）无需再做路径安全处理。
+
+    ``None`` 语义（docs/09 §10-13）：评估器拿到 ``None`` 时必须与 v1.1 行为逐字节
+    一致 —— 参数化只允许"有模板时更严"，不允许改变无模板口径。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_dirs: list[str] = Field(default_factory=list, description="必须存在的目录")
+    required_files: list[str] = Field(default_factory=list, description="必须存在的文件")
+    any_of_files: list[list[str]] = Field(
+        default_factory=list, description="每组内至少存在一个文件（如 pyproject/requirements）"
+    )
+    forbidden_dirs: list[str] = Field(default_factory=list, description="禁止出现的目录名")
+    snake_case_py: bool = Field(default=True, description="Python 文件名必须 snake_case")
+    max_file_lines: int = Field(default=600, gt=0, description="单文件行数上限")
+    allowed_prefixes: list[str] = Field(
+        default_factory=list, description="产物路径必须命中的前缀（空 = 不限制）"
+    )
+    frontend: FrontendRules | None = Field(
+        default=None, description="前端结构规则（None = 不做前端检查）"
+    )
 
 
 # --------------------------------------------------------------------- 裁决合同（v1.1）

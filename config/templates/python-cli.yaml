@@ -1,0 +1,81 @@
+# Python CLI / 自动化工具模板（v1.2，docs/09 §4.1.1 / §9-T1.4）
+#
+# 骨架清单（4 个，**未达 max_files=5 上限**，刻意不硬凑第 5 个）：
+#   ① pyproject.toml      reserved  —— 打包/测试口径
+#   ② ruff.toml           reserved  —— checks 里跑 `ruff check .`，line-length=100
+#   ③ ymir_cli/__init__.py seed     —— 包入口，模型须输出完整版（含版本号等）
+#   ④ requirements.txt     seed     —— 新增依赖出口
+# 注：骨架**不含任何测试文件**（§12-3 定案）：`has_tests` 会把"存在 tests/ 下 py 文件"
+#     直接算通过，骨架带测试等于白送结构分。
+
+id: python-cli
+version: "1.0"
+name: Python CLI / 自动化工具
+description: 单包 Python CLI 的工程规范包（argparse/typer 皆可，零前端）
+supports: [from_scratch, patch]
+
+stack:
+  language: python
+  runtime: "3.12"
+  backend: none
+  frontend: none
+  dependencies: [pytest]
+  package_manager: uv
+
+layout:
+  required_dirs: [ymir_cli, tests]
+  required_files: [pyproject.toml]
+  any_of_files:
+    - [pyproject.toml, requirements.txt]
+  forbidden_dirs: [venv, .venv]
+  snake_case_py: true
+  max_file_lines: 600
+  allowed_prefixes: [ymir_cli/, tests/]
+
+conventions:
+  - { path: README.md, required: true }
+  - { path: .gitignore, required: true }
+
+skeleton:
+  max_files: 5
+  max_bytes: 32768
+  files:
+    - path: pyproject.toml
+      reserved: true
+      content: |
+        [project]
+        name = "ymir-cli"
+        requires-python = ">=3.12"
+
+        [tool.pytest.ini_options]
+        pythonpath = ["."]
+    - path: ruff.toml
+      reserved: true
+      content: |
+        line-length = 100
+        target-version = "py312"
+
+        [lint]
+        select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
+    - path: ymir_cli/__init__.py
+      reserved: false
+      content: |
+        """ymir_cli 包入口。"""
+
+        __version__ = "0.1.0"
+    - path: requirements.txt
+      reserved: false
+      content: |
+        pytest>=8.2
+
+checks:
+  - { type: command, run: "python -m compileall -q ymir_cli", weight: 1 }
+  - { type: command, run: "python -m pytest -q", weight: 2 }
+  - { type: command, run: "ruff check .", weight: 1 }
+  - { type: command, run: 'python -c "import ymir_cli"', weight: 1 }
+
+prompting:
+  pm: PRD 必须声明为命令行工具形态（子命令 + 参数），不得引入 Web 框架。
+  architect: 设计文档的目录结构必须与模板 layout 一致（单包 + tests），不得引入服务端组件。
+  engineer: 严格遵守模板目录规范；固定提供的文件不要输出；给了最小版本的文件须输出完整版；新增依赖写入 requirements.txt。
+  qa: 证据链须引用模板检查命令的执行输出（CLI 以 --help / 子命令用例为证）。

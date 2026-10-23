@@ -11,7 +11,14 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ymir.models.entities import DEFAULT_TENANT_ID, Approval, PipelineRun, Project, StageExecution
+from ymir.models.entities import (
+    DEFAULT_TENANT_ID,
+    Approval,
+    Export,
+    PipelineRun,
+    Project,
+    StageExecution,
+)
 from ymir.models.enums import ApprovalStatus, RunMode, RunStatus
 
 
@@ -270,3 +277,55 @@ class StageExecutionRepository(BaseRepository[StageExecution]):
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+
+class ExportRepository(BaseRepository[Export]):
+    """推送回执仓储（v1.2，docs/09 §9-T3.3）。
+
+    三个方法对应三类查询：写入（``add``）/ 幂等判定（``find_by_key``）/ 列表页
+    （``list_by_project``）。幂等判定取**最近一条**回执 —— 因为每次尝试都写一行，
+    "上次是否已推成功"必须看最新状态，而不是"有没有推过"。
+    """
+
+    model = Export
+
+    async def add(self, row: Export) -> Export:
+        """写入一条回执（不 commit，调用方控制事务边界）。"""
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def find_by_key(
+        self, idempotency_key: str, tenant_id: str = DEFAULT_TENANT_ID
+    ) -> Export | None:
+        """按幂等键取**最近一条**回执（含失败与 dry_run）。"""
+        stmt = (
+            select(Export)
+            .where(
+                Export.idempotency_key == idempotency_key,
+                Export.tenant_id == tenant_id,
+            )
+            .order_by(Export.created_at.desc(), Export.id.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_by_project(
+        self,
+        project_id: str,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Export]:
+        """项目推送历史（时间倒序）。"""
+        stmt = (
+            select(Export)
+            .where(Export.project_id == project_id, Export.tenant_id == tenant_id)
+            .order_by(Export.created_at.desc(), Export.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())

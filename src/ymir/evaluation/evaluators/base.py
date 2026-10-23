@@ -16,11 +16,13 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
+from ymir.common.contracts import LayoutRules
 from ymir.common.jsonx import extract_json
 from ymir.sandbox.base import SandboxSession
 
@@ -141,6 +143,19 @@ class EvalTask(BaseModel):
     artifact_name: str | None = "code"
     version: int | None = None  # None = latest
     checks: list[EvalCheck] = Field(default_factory=list)
+    #: ★增量模式（v1.2，docs/09 §4.2.5）：本次实际变更的路径（来自
+    #: ``patch_manifest.changed_paths``）。``None`` = 非增量 ⇒ judge 语料与 v1.1
+    #: 完全一致（全量正文）；非 ``None`` 时走「变更文件全文 + 其余只给路径」分级。
+    changed_paths: frozenset[str] | None = None
+    #: 基线**精确引用**（``run.context["baseline"]``，即 ``{artifact_id, version, ...}``）。
+    #: 增量产物合并优先按它加载（R9：不能拿"当前基线"猜）。
+    baseline_ref: dict[str, Any] | None = None
+    #: 基线**不可用**（既无精确引用、``base_content_hash`` 也匹配不到任何版本）。
+    #: 此时**不合并**、只评补丁自身，并在报告里显式标注"不可比"（R9 禁止自动重放）。
+    baseline_unavailable: bool = False
+    #: ★模板结构规则（v1.2，docs/09 §4.1.3）：``None`` = 非模板 ⇒ 评估器走 v1.1 原逻辑。
+    #: 由 ``evaluation/gate`` 从 ``TemplateSpec.to_layout_rules()`` 注入（纯数据跨层）。
+    layout: LayoutRules | None = None
 
 
 @dataclass
@@ -160,6 +175,9 @@ class EvalContext:
     sandbox: SandboxSession | None = None
     judge: Judge | None = None
     exec_timeout: float = 120.0
+    #: 模板结构规则（v1.2，docs/09 §4.1.3）：``None`` = 与 v1.1 完全一致的行为。
+    #: 由 harness 从 ``EvalTask.layout`` 透传（跨层载体是 ``common.contracts.LayoutRules``）。
+    layout: LayoutRules | None = None
 
     def reference(self, name: str) -> dict[str, str]:
         """取同项目某产物的文件集（不存在返回空）。"""
@@ -170,8 +188,18 @@ class EvalContext:
         return _join_files(self.reference(name))
 
     def workdir_text(self) -> str:
-        """被评测产物全部文件拼成的文本。"""
-        return _join_files(self.workdir)
+        """被评测产物拼成的文本（judge 语料）。
+
+        非增量（``task.changed_paths is None``）→ 全部文件正文，与 v1.1 逐字节一致。
+
+        增量（v1.2，docs/09 §4.2.5）→ **语料分级**：只把**变更文件**的正文喂进语料，
+        未变更文件只给路径。理由：增量模式的树是"基线 ⊕ 补丁"（几百个文件），整树下
+        单 run token 会数倍于 v1.1（R10 成本放大），而判"需求有没有被实现"只需看改动面。
+        """
+        changed = self.task.changed_paths
+        if not changed:
+            return _join_files(self.workdir)
+        return _graded_files(self.workdir, changed)
 
     def requirement_text(self) -> str:
         """原始需求文本：优先从 PRD 结构化 JSON 抽取条目，回退 task.requirement。"""
@@ -333,6 +361,20 @@ _PY_SUFFIXES = (".py",)
 
 def _join_files(files: Mapping[str, str]) -> str:
     return "\n".join(f"# ---- {path} ----\n{content}" for path, content in sorted(files.items()))
+
+
+def _graded_files(files: Mapping[str, str], changed: AbstractSet[str]) -> str:
+    """语料分级渲染（增量模式）：变更文件给全文，其余只给路径。
+
+    未变更文件**正文绝不出现** —— 这是 judge 成本控制的关键断言点（T2.4 DoD ⑤）。
+    """
+    parts: list[str] = []
+    for path in sorted(files):
+        if path in changed:
+            parts.append(f"# ---- {path} ----\n{files[path]}")
+        else:
+            parts.append(f"# ---- {path} ----（未变更，正文省略）")
+    return "\n".join(parts)
 
 
 def iter_text_files(

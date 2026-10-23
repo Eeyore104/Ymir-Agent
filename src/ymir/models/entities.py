@@ -13,8 +13,10 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -328,3 +330,58 @@ class Pipeline(Base):
         String(64), nullable=False, default=DEFAULT_TENANT_ID, primary_key=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow, nullable=False)
+
+
+class Export(Base):
+    """推送回执（v1.2，docs/09 §4.4.1：v1.2 唯一新增表）。
+
+    **每次推送尝试都写一行**（含 ``dry_run`` / 失败），因此 ``idempotency_key``
+    **刻意不设唯一约束**——这不是漏写，理由有三：
+
+    1. docs §4.4.1 的 ``UNIQUE(tenant_id, idempotency_key) WHERE status='pushed'``
+       partial index 会堵死一条**正常路径**：远端 branch head 被人改动后要"同键再推
+       一次"，那会产生**第二条成功回执**，唯一索引会直接 IntegrityError；
+    2. 失败重试、dry-run 预演同样需要同键多行，才能回答"试过几次、为什么失败"；
+    3. 并发双推的最终裁决在 **GitHub 的 ref 更新**（非 fast-forward 的 PATCH 返回 422），
+       平台侧只保证"同键 + 远端 head 未变 → 不重复推"，不靠 DB 约束兜并发。
+
+    索引 ``ix_exports_idempotency_key`` 只服务于"按幂等键查**最近一条**回执"。
+    """
+
+    __tablename__ = "exports"
+    #: 项目级回执查询索引（``GET /exports`` 按项目 + 时间倒序）；与 0004 迁移一致，
+    #: 否则 ``alembic check`` 会报 drift。
+    __table_args__ = (Index("ix_exports_project", "project_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=DEFAULT_TENANT_ID, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_name: Mapped[str] = mapped_column(String(128), nullable=False, default="code")
+    artifact_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    #: 推送的树语义：``files``（原产物）| ``merged``（基线 ⊕ 补丁）
+    tree_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="merged")
+    target_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="github")
+    repo: Mapped[str] = mapped_column(String(255), nullable=False)
+    branch: Mapped[str] = mapped_column(String(255), nullable=False)
+    path_prefix: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: 回执明细（被拦/被跳过文件清单等；不含任何密钥正文）
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)

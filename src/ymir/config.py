@@ -68,6 +68,25 @@ class Settings(BaseSettings):
     event_queue_size: int = 1000  # SSE 订阅队列上限（原 events/bus.py:_SUBSCRIBER_QUEUE_SIZE）
     approval_waiting_grace_seconds: float = 2.0  # 审批等待窗口（原 hitl/engine.py 常量）
 
+    # --- 推送（v1.2，docs/09 §4.3.2：**token 只走 env**，变量名由本字段指定）---
+    #: 与 ``config/models.yaml:18 api_key_env`` 同构：代码不写死变量名，
+    #: 部署方可用 ``YMIR_GITHUB_TOKEN_ENV`` 指向自己的变量（如 ``GH_PAT``）。
+    github_token_env: str = "GITHUB_TOKEN"
+
+    # --- 基线快照上限（v1.2，docs/09 §11-R3）---
+    #: 单次上传的文件数上限（防大基线拖慢沙箱逐文件写入）
+    baseline_max_files: int = 300
+    #: 单次上传的**解压后**总字节上限（默认 5MB）
+    baseline_max_bytes: int = 5 * 1024 * 1024
+
+    def github_token(self) -> str:
+        """从环境变量读取 GitHub token（**只从 env 读，绝不入库/入日志**）。
+
+        变量名由 :attr:`github_token_env` 指定（缺省 ``GITHUB_TOKEN``）。为空表示
+        未配置，推送会被通道判为 ``failed(no_token)`` 且不发任何请求。
+        """
+        return os.environ.get(self.github_token_env, "").strip()
+
     @property
     def resolved_db_path(self) -> Path:
         """将相对 db_path 解析为基于仓库根目录的绝对路径。"""

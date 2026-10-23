@@ -9,7 +9,8 @@ from typing import Any
 class BizCode(IntEnum):
     """业务错误码。
 
-    ``0`` 表示成功；``1001``-``1006`` 为架构设计 §6.3 约定的业务码。
+    ``0`` 表示成功；``1001``-``1006`` 为架构设计 §6.3 约定的业务码，
+    ``1007`` 为 v1.2 新增的推送域失败码（docs/09 §12-D4 定案 A）。
     """
 
     OK = 0
@@ -19,6 +20,8 @@ class BizCode(IntEnum):
     BUDGET_EXCEEDED = 1004
     SANDBOX_ERROR = 1005
     MODEL_CALL_FAILED = 1006
+    #: 推送失败（鉴权 / 权限 / 配额 / 网络 / 分支保护），v1.2 §4.3.4
+    EXPORT_FAILED = 1007
     # 扩展：未预期的服务端错误（对齐 RuoYi 约定，超出 §6.3 六码表）
     INTERNAL_ERROR = 500
 
@@ -77,4 +80,15 @@ class ModelCallError(YmirError):
     """模型调用失败（1006）。"""
 
     biz_code = BizCode.MODEL_CALL_FAILED
+    http_status = 502
+
+
+class ExportError(YmirError):
+    """推送失败（1007，v1.2 docs/09 §12-D4 定案 A）。
+
+    与 ``ModelCallError`` 同为"外部依赖失败"语义：502 表示上游（GitHub）侧失败，
+    前端据 ``error_class`` 区分 auth / permission / rate_limit / not_found / network。
+    """
+
+    biz_code = BizCode.EXPORT_FAILED
     http_status = 502

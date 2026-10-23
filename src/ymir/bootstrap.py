@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ymir.artifacts.export_service import ExportService
+from ymir.artifacts.github import GitHubExporter, MissingTokenExporter
 from ymir.artifacts.store import ArtifactStore
 from ymir.config import PROJECT_ROOT, Settings
 from ymir.evaluation.gate import HarnessEvaluationGate
@@ -52,6 +54,28 @@ class ExecutionStack:
     role_registry: RoleRegistry
     role_runtime: RoleRuntime
     executor: StageExecutor
+
+
+def build_export_service(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    store: ArtifactStore,
+) -> ExportService:
+    """装配推送服务（v1.2 T4.1）。
+
+    token 只从 ``settings.github_token_env`` 指定的环境变量读（缺省 ``GITHUB_TOKEN``）；
+    **缺失时用** :class:`MissingTokenExporter` **兜底** —— 没配 GitHub 的人也必须能
+    本地起服务（推送时会得到 ``failed/no_token``，而不是 app 起不来）。
+    """
+    token = settings.github_token()
+    exporter = GitHubExporter(token=token) if token else MissingTokenExporter()
+    if not token:
+        logger.info("未配置 GitHub token，推送通道进入 no_token 降级（本地流程不受影响）")
+    return ExportService(
+        session_factory=session_factory,
+        store=store,
+        exporters={"github": exporter},
+    )
 
 
 @dataclass

@@ -1,0 +1,96 @@
+# FastAPI + Vue3 全栈模板（v1.2，docs/09 §4.1.1 / §9-T1.4）
+#
+# 骨架清单（**恰为 5 个 = max_files 上限**，加第 6 个即超限）：
+#   ① pyproject.toml   reserved  —— 打包/测试口径，逐字节要求精确
+#   ② ruff.toml        reserved  —— **必须存在**：checks 里跑 `ruff check .`
+#   ③ requirements.txt seed      —— 新增依赖的正规出口，允许模型整文件重写
+#   ④ app/main.py      seed      —— 最小入口，模型在其上写路由（必须输出完整版）
+#   ⑤ .env.example     reserved  —— 只写空值，禁止真实密钥
+# 注：ruff 配置**只有一个来源**（ruff.toml）；pyproject.toml 内不再写 [tool.ruff]，
+#     否则两处配置漂移，模型写出的"合规代码"会被判违规。
+# 注：行长度 100 是**每行字符上限**（ruff line-length），与 layout.max_file_lines
+#     （每文件行数上限 600）是两个不同的轴，前者对齐文档 §13 的定案值。
+
+id: fastapi-vue3
+version: "1.0"
+name: FastAPI + Vue3 全栈
+description: Python 后端 FastAPI + 前端 Vue3 的工程规范包（后端真执行、前端仅静态检查）
+supports: [from_scratch, patch]
+
+stack:
+  language: python
+  runtime: "3.12"
+  backend: fastapi
+  frontend: vue3
+  dependencies: [fastapi, uvicorn, sqlalchemy, aiosqlite, alembic]
+  package_manager: uv
+
+layout:
+  required_dirs: [app, tests, web/src]
+  required_files: [pyproject.toml]
+  any_of_files:
+    - [pyproject.toml, requirements.txt]
+  forbidden_dirs: [venv, node_modules, .venv]
+  snake_case_py: true
+  max_file_lines: 600
+  allowed_prefixes: [app/, tests/, web/]
+  frontend:
+    required_dirs: [web/src, web/src/components]
+    required_glob: ["web/src/**/*.vue"]
+    forbidden_imports: [jquery, bootstrap]
+
+conventions:
+  - { path: README.md, required: true }
+  - { path: .gitignore, required: true }
+
+skeleton:
+  max_files: 5
+  max_bytes: 32768
+  files:
+    - path: pyproject.toml
+      reserved: true
+      content: |
+        [project]
+        name = "app"
+        requires-python = ">=3.12"
+
+        [tool.pytest.ini_options]
+        pythonpath = ["."]
+    - path: ruff.toml
+      reserved: true
+      content: |
+        line-length = 100
+        target-version = "py312"
+
+        [lint]
+        select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
+    - path: requirements.txt
+      reserved: false
+      content: |
+        fastapi>=0.115
+        uvicorn>=0.30
+        sqlalchemy>=2.0
+    - path: app/main.py
+      reserved: false
+      content: |
+        from fastapi import FastAPI
+
+        app = FastAPI()
+    - path: .env.example
+      reserved: true
+      content: |
+        # 复制为 .env 后填写；真实密钥禁止入库
+        APP_ENV=dev
+        DATABASE_URL=
+
+checks:
+  - { type: command, run: "python -m compileall -q app", weight: 1 }
+  - { type: command, run: "python -m pytest -q", weight: 2 }
+  - { type: command, run: "ruff check .", weight: 1 }
+  - { type: command, run: 'python -c "from app.main import app"', weight: 1 }
+
+prompting:
+  pm: PRD 必须声明后端为 FastAPI、前端为 Vue3，并说明数据持久化方案（SQLAlchemy + SQLite）。
+  architect: 设计文档的目录结构必须与模板 layout 一致，不得引入 Django/Flask；前端只做结构设计。
+  engineer: 严格遵守模板目录规范；固定提供的文件不要输出；给了最小版本的文件须输出完整版；新增依赖写入 requirements.txt。
+  qa: 证据链须引用模板检查命令的执行输出；前端结论必须标注「静态检查（未构建）」。

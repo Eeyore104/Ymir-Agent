@@ -1,6 +1,9 @@
 """产物版本与内容完整性工具（架构设计 §3.6）。
 
-- 路径安全：产物内路径一律 POSIX 风格相对路径，拒绝绝对路径 / 盘符 / ``..`` 逃逸；
+- 路径安全：产物内路径一律 POSIX 风格相对路径（**实现在** :mod:`ymir.common.paths`，
+  本模块只做向后兼容的 re-export —— 既有调用方 ``store.py`` / ``diff.py`` /
+  测试与外部脚本都按 ``ymir.artifacts.versioning.normalize_rel_path`` 引用，
+  v1.2 r4 下沉到 ``common``(rank 5) 后 import 路径不变、行为不变）；
 - 内容哈希：sha256(路径 + ``\\0`` + 内容 + ``\\0``) 按路径排序累积 —— 同一文件集
   哈希稳定，可据此判断两次版本内容是否一致。
 """
@@ -8,35 +11,16 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Mapping
 
 from ymir.common.errors import InvalidParamError
+from ymir.common.paths import normalize_rel_path as normalize_rel_path
 
-_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
-
-
-def normalize_rel_path(path: str) -> str:
-    """校验并归一化产物内相对路径。
-
-    规则：统一为 POSIX 分隔符；拒绝空路径 / 绝对路径 / 盘符 / ``..`` 逃逸；
-    丢弃 ``.`` 与多余空段（``a//b`` -> ``a/b``）。
-    """
-    raw = path.strip().replace("\\", "/")
-    if not raw:
-        raise InvalidParamError("产物路径不能为空")
-    if raw.startswith("/") or _WINDOWS_DRIVE_RE.match(raw):
-        raise InvalidParamError(f"产物路径不允许绝对路径/盘符: {path}")
-    parts: list[str] = []
-    for part in raw.split("/"):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            raise InvalidParamError(f"产物路径不允许 '..' 逃逸: {path}")
-        parts.append(part)
-    if not parts:
-        raise InvalidParamError(f"无效的产物路径: {path}")
-    return "/".join(parts)
+__all__ = [
+    "compute_content_hash",
+    "normalize_files",
+    "normalize_rel_path",
+]
 
 
 def normalize_files(files: Mapping[str, str]) -> dict[str, str]:

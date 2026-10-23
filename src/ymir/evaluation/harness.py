@@ -29,6 +29,12 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
+from ymir.artifacts.merge import (
+    PATCH_MANIFEST_NAME,
+    merge_trees,
+    parse_patch_manifest,
+)
+from ymir.artifacts.store import BASELINE_TYPE
 from ymir.config import Settings
 from ymir.evaluation.aggregator import aggregate
 from ymir.evaluation.evaluators import default_evaluators
@@ -53,6 +59,7 @@ from ymir.evaluation.report import (
 from ymir.evaluation.suite import EvalSuite
 from ymir.sandbox.base import NetworkPolicy, Sandbox, SandboxSession
 from ymir.sandbox.factory import build_sandbox
+from ymir.storage.repositories import RunRepository
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,26 @@ class SandboxProvider(Protocol):
     def session(self) -> Any:
         """返回异步上下文管理器，产出 :class:`SandboxSession`。"""
         ...
+
+
+#: 增量模式下「可作参考产物」的体量上限（超限不进 references，docs/09 §4.2.5 C9/R3）。
+#: 只在增量分支生效 —— 非增量路径的 references 组成必须与 v1.1 完全一致。
+_REFERENCE_MAX_FILES: int = 200
+_REFERENCE_MAX_BYTES: int = 1024 * 1024
+
+#: 基线不可用时的报告警示文案（R9：必须让人看见"这次分数不可比"）。
+BASELINE_UNAVAILABLE_WARNING: str = (
+    "本次未使用基线（基线不可用），只评了补丁自身，分数与「基于基线」的运行不可比"
+)
+
+
+def _within_reference_budget(files: Mapping[str, str]) -> bool:
+    """参考产物是否在预算内（文件数 / 总字节）。"""
+    if len(files) > _REFERENCE_MAX_FILES:
+        return False
+    return sum(len(content.encode("utf-8")) for content in files.values()) <= (
+        _REFERENCE_MAX_BYTES
+    )
 
 
 class BackendSandboxProvider:
@@ -236,6 +263,9 @@ class EvaluationHarness:
             wall_time_ms=wall_time_ms,
             cost_cny=round(sum(score.cost_cny for score in scores), 6),
             tokens=sum(score.tokens for score in scores),
+            warnings=(
+                [BASELINE_UNAVAILABLE_WARNING] if task.baseline_unavailable else []
+            ),
         )
 
     def _skipped(
@@ -328,6 +358,7 @@ class EvaluationHarness:
             sandbox=sandbox,
             judge=self._bound_judge(task),
             exec_timeout=self._exec_timeout,
+            layout=task.layout,
         )
         raw = await asyncio.gather(
             *(self._safe_evaluate(evaluator, ctx) for evaluator in self._evaluators)
@@ -440,11 +471,22 @@ class EvaluationHarness:
 
         返回值第三项为「同项目其它产物」引用集（四维交叉引用用）；
         产物未命中时返回 ``artifact_ref={"name": None, ...}``，由调用方决定短路。
+
+        v1.2 增量（docs/09 §4.2.5）：
+        - 产物内**有 ``patch_manifest.json``** → ``workdir`` 返回**合并树**
+          （基线 ⊕ 补丁），并把 ``changed_paths`` 写回 ``task``（judge 语料分级）；
+        - ``references`` **排除** ``type=baseline`` 的产物（C9：基线是用户自己的
+          工程快照，几百个文件，既不参与交叉引用也不该进 judge 语料）；增量模式下
+          再额外剔除超限产物（R3 大基线性能）。
         """
         artifacts = await self._store.list_artifacts(project_id) if project_id else []
         references: dict[str, dict[str, str]] = {}
         by_name: dict[str, Any] = {}
         for artifact in artifacts:
+            # v1.2：基线是用户自己的工程快照，既不参与交叉引用也不进 judge 语料（C9）。
+            # 增量合并时再按需溯源（见 `_resolve_baseline`），避免白读几百个文件。
+            if getattr(artifact, "type", "") == BASELINE_TYPE:
+                continue
             loaded = await self._store.load(artifact.id)
             references[artifact.name] = loaded.files
             by_name[artifact.name] = artifact
@@ -462,7 +504,119 @@ class EvaluationHarness:
             "name": target.name,
             "version": loaded.version,
         }
-        return loaded.files, artifact_ref, references
+        workdir = loaded.files
+        manifest = parse_patch_manifest(workdir.get(PATCH_MANIFEST_NAME))
+        if manifest is None:
+            return workdir, artifact_ref, references
+
+        # 产物内的簿记文件不是源码，永远不进评测工作区（不参与 lint / 测试）
+        client_files = {
+            path: content
+            for path, content in workdir.items()
+            if path != PATCH_MANIFEST_NAME
+        }
+        if not manifest.base_content_hash:
+            # ``from_scratch`` + 模板骨架：产物本身就是整树、没有基线可合
+            return client_files, artifact_ref, references
+
+        base_files = await self._resolve_baseline(
+            task, manifest.base_content_hash, project_id
+        )
+        if not base_files:
+            # R9 红线：**禁止**拿"当前基线"顶上去合并 —— 那等价于把补丁自动重放到
+            # 模型从未见过的树，会产出一个"看着正常、实际不可比"的分数。
+            # 处置：不合并、只评补丁自身，并在报告里显式标注不可比（不阻断，同 unknown 语义）。
+            task.baseline_unavailable = True
+            logger.warning(
+                "基线不可用：patch_manifest.base_content_hash 无匹配基线，"
+                "本次不合并、分数与基线内运行不可比（task=%s hash=%s）",
+                task.id,
+                manifest.base_content_hash[:12],
+            )
+            return client_files, artifact_ref, references
+
+        merged = merge_trees(
+            base_files, client_files, mode="merge", deleted=manifest.deleted
+        )
+        task.changed_paths = frozenset(manifest.changed_paths)
+        references = {
+            name: files
+            for name, files in references.items()
+            if _within_reference_budget(files)
+        }
+        return merged.files, artifact_ref, references
+
+    async def _resolve_baseline(
+        self,
+        task: EvalTask,
+        expected_hash: str,
+        project_id: str | None,
+    ) -> dict[str, str]:
+        """解析基线正文（R9：只认**精确引用**或**指纹匹配**，绝不猜当前基线）。
+
+        优先级（team-lead r5 定案）：
+
+        1. ``run.context["baseline"]`` 的 ``(artifact_id, version)`` **精确加载**；
+        2. 按 ``base_content_hash`` 在该项目基线产物的**全部历史版本**里匹配
+           （实现委托给 ``ArtifactStore.find_baseline_files``，与合并导出共用一份逻辑）；
+        3. 都失败 → 返回 ``{}``（调用方标记 ``baseline_unavailable``，不合并）。
+
+        返回 ``{}`` 是唯一失败表达 —— 本方法**没有**任何"回退到 latest"的分支。
+        """
+        ref = await self._baseline_ref_of(task)
+        if ref is not None:
+            artifact_id = str(ref.get("artifact_id") or "").strip()
+            raw_version = ref.get("version")
+            version = raw_version if isinstance(raw_version, int) else None
+            if artifact_id:
+                try:
+                    exact = await self._store.load(artifact_id, version)
+                except Exception:  # noqa: BLE001 - 精确引用失效：退回指纹匹配
+                    logger.warning(
+                        "基线精确引用加载失败（task=%s baseline=%s v=%s），改按指纹匹配",
+                        task.id,
+                        artifact_id,
+                        version,
+                        exc_info=True,
+                    )
+                else:
+                    if (
+                        expected_hash
+                        and exact.version_row.content_hash != expected_hash
+                    ):
+                        logger.warning(
+                            "基线引用与 patch_manifest 指纹不一致（task=%s ref=%s manifest=%s）",
+                            task.id,
+                            exact.version_row.content_hash[:12],
+                            expected_hash[:12],
+                        )
+                    return exact.files
+
+        if not expected_hash or not project_id:
+            return {}
+        try:
+            return await self._store.find_baseline_files(project_id, expected_hash)
+        except Exception:  # noqa: BLE001 - 检索失败同样按"不可用"处理，绝不猜
+            logger.warning(
+                "基线指纹检索失败（task=%s hash=%s）", task.id, expected_hash[:12], exc_info=True
+            )
+            return {}
+
+    async def _baseline_ref_of(self, task: EvalTask) -> dict[str, Any] | None:
+        """取基线的精确引用：``task.baseline_ref`` > ``run.context["baseline"]``。"""
+        if isinstance(task.baseline_ref, dict) and task.baseline_ref:
+            return task.baseline_ref
+        if self._session_factory is None or not task.run_id:
+            return None
+        try:
+            async with self._session_factory() as session:
+                run = await RunRepository(session).get(task.run_id)
+        except Exception:  # noqa: BLE001 - 读不到 run 就退回指纹匹配
+            logger.warning("基线引用查询失败（run=%s）", task.run_id, exc_info=True)
+            return None
+        context = run.context if run is not None and isinstance(run.context, dict) else {}
+        ref = context.get("baseline")
+        return ref if isinstance(ref, dict) and ref else None
 
     @staticmethod
     def _resolve_target(

@@ -23,15 +23,18 @@ import logging
 import re
 from typing import Any
 
-from ymir.common.contracts import EvalVerdict, FailedCheck
+from ymir.common.contracts import EvalVerdict, FailedCheck, LayoutRules
+from ymir.common.errors import YmirError
 from ymir.evaluation.aggregator import normalize_weights
-from ymir.evaluation.evaluators.base import RUNNABILITY, EvalTask
+from ymir.evaluation.evaluators.base import RUNNABILITY, EvalCheck, EvalTask
 from ymir.evaluation.harness import EvaluationHarness
 from ymir.evaluation.report import EvaluationReport
 from ymir.evaluation.suite import EvalSuite
 from ymir.models.entities import PipelineRun
 from ymir.sop.loader import load_pipeline
 from ymir.sop.models import PipelineDefinition, StageSpec
+from ymir.templates import load_template
+from ymir.templates.models import TemplateSpec
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,13 @@ class HarnessEvaluationGate:
                 project_id=run.project_id,
                 run_id=run.id,
                 artifact_name=self._artifact_name,
-                checks=list(base.checks) if base is not None else [],
+                # v1.2（docs/09 §4.1.2 唯一注入点）：模板 checks 覆盖套件 checks；
+                # 无模板时与套件逐条一致（`list(base.checks)`）。
+                checks=self._resolve_checks(run, base),
+                # 模板结构规则（纯数据）：None = 评估器走 v1.1 原逻辑
+                layout=self._resolve_layout(run),
+                # 基线精确引用（R9）：评测侧据此加载基线，绝不猜"当前基线"
+                baseline_ref=_baseline_ref(run.context),
             )
             outcome = await self._harness.evaluate_task(
                 task, project_id=run.project_id, suite=suite
@@ -104,6 +113,44 @@ class HarnessEvaluationGate:
         return self._to_verdict(suite, outcome, repair_round)
 
     # ------------------------------------------------------------------ 解析
+
+    def _resolve_checks(self, run: PipelineRun, base: EvalTask | None) -> list[EvalCheck]:
+        """确定性检查命令：模板 ``checks`` 覆盖套件 ``checks``（v1.2，§4.1.2）。
+
+        无模板（或模板已不可读）时**逐条沿用套件**，与 v1.1 完全一致（§10-9）。
+        字段名是 ``type``（与 ``EvalCheck.type`` 同构）：模板 YAML 里写 ``kind`` 早在
+        加载期就被 ``extra="forbid"`` 拒掉，这里不做二次改名。
+        """
+        spec = self._template_spec(run)
+        if spec is None:
+            return list(base.checks) if base is not None else []
+        return [
+            EvalCheck(type=check.type, run=check.run, weight=check.weight)
+            for check in spec.checks
+        ]
+
+    def _resolve_layout(self, run: PipelineRun) -> LayoutRules | None:
+        """模板结构规则（``LayoutRules`` 纯数据；``None`` = 不做模板结构校验）。"""
+        spec = self._template_spec(run)
+        return spec.to_layout_rules() if spec is not None else None
+
+    def _template_spec(self, run: PipelineRun) -> TemplateSpec | None:
+        """按 ``run.context["template"]["id"]`` 读模板（失败只告警，退回套件口径）。"""
+        context = run.context if isinstance(run.context, dict) else {}
+        ref = context.get("template")
+        template_id = str(ref.get("id") or "").strip() if isinstance(ref, dict) else ""
+        if not template_id:
+            return None
+        try:
+            return load_template(template_id)
+        except YmirError:
+            logger.warning(
+                "裁决：模板不可读，退回套件 checks（run=%s template=%s）",
+                run.id,
+                template_id,
+                exc_info=True,
+            )
+            return None
 
     def _select(self, run: PipelineRun) -> tuple[str, str | None]:
         """套件 / 任务解析（run.context 覆盖 > 流水线 repair.eval > 缺省）。"""
@@ -308,3 +355,9 @@ def _first_str(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _baseline_ref(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    """取基线精确引用（``run.context["baseline"]``，R9 要求按它加载而非猜最新版本）。"""
+    ref = (context or {}).get("baseline")
+    return ref if isinstance(ref, dict) and ref else None

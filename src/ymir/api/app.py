@@ -30,14 +30,21 @@ from ymir.api.routers import (
     evaluations,
     events,
     export,
+    exports,
     models,
     projects,
     runs,
     sandboxes,
+    templates,
     usage,
 )
 from ymir.api.schemas import ApiResponse, HealthData
-from ymir.bootstrap import build_approval_stack, build_execution_stack, build_repair_stack
+from ymir.bootstrap import (
+    build_approval_stack,
+    build_execution_stack,
+    build_export_service,
+    build_repair_stack,
+)
 from ymir.common.errors import BizCode
 from ymir.common.logging import setup_logging
 from ymir.config import Settings, get_settings, load_env_file
@@ -139,6 +146,10 @@ def create_app(
     app.state.approvals = approval_stack.engine
     app.state.approval_service = approval_stack.service
     app.state.evaluations = eval_harness
+    # v1.2 T4.1：推送服务（选树 / 幂等 / 回执）
+    app.state.exports = build_export_service(
+        settings, session_factory, stack.artifact_store
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -161,6 +172,8 @@ def create_app(
     app.include_router(approvals.router, prefix=settings.api_prefix)
     app.include_router(evaluations.router, prefix=settings.api_prefix)
     app.include_router(export.router, prefix=settings.api_prefix)
+    app.include_router(templates.router, prefix=settings.api_prefix)
+    app.include_router(exports.router, prefix=settings.api_prefix)
 
     @app.get("/health", response_model=ApiResponse[HealthData], tags=["system"])
     async def health(request: Request) -> JSONResponse:

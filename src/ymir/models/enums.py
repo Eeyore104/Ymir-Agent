@@ -37,7 +37,11 @@ class StageStatus(StrEnum):
 
 
 class ArtifactType(StrEnum):
-    """产物类型（§3.6）。"""
+    """产物类型（§3.6）。
+
+    ``BASELINE``（v1.2，docs/09 §4.4.1）：用户上传的**现有项目快照**，是独立不可变
+    产物（``name="baseline"``）。``Artifact.type`` 是 ``String(32)``，加枚举值**零迁移**。
+    """
 
     PRD = "prd"
     DESIGN = "design"
@@ -45,6 +49,7 @@ class ArtifactType(StrEnum):
     TEST = "test"
     REPORT = "report"
     DOC = "doc"
+    BASELINE = "baseline"
 
 
 class MessageType(StrEnum):

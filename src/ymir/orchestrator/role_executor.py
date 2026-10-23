@@ -19,27 +19,44 @@ v1.1 定向修复（docs/07 §4.4.4 / B-01③）：自动修复消息**不进** 
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ymir.artifacts.merge import (
+    DEFAULT_MAX_FILE_BYTES,
+    PATCH_MANIFEST_NAME,
+    MergeResult,
+    merge_trees,
+)
 from ymir.artifacts.store import ArtifactStore
-from ymir.common.errors import InvalidParamError, SandboxError
+from ymir.common.errors import InvalidParamError, NotFoundError, SandboxError, YmirError
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
 from ymir.models.entities import Message, PipelineRun
 from ymir.models.enums import ArtifactType, MessageType
 from ymir.orchestrator.executor import StageOutcome
-from ymir.roles.io import RepairContext, StageInput, StageOutput, UpstreamArtifact
+from ymir.roles.io import (
+    BaselineContext,
+    RepairContext,
+    StageInput,
+    StageOutput,
+    TemplateContext,
+    UpstreamArtifact,
+)
 from ymir.roles.runtime import RoleRuntime
 from ymir.sandbox.base import NetworkPolicy
 from ymir.sandbox.session import SandboxService
 from ymir.sop.models import ENTRY_INPUT, StageSpec
 from ymir.storage.repositories import ProjectRepository
+from ymir.templates import load_template
+from ymir.templates.models import TemplateSpec
 from ymir.tools.read_artifact import read_artifacts
 
 logger = logging.getLogger(__name__)
@@ -64,6 +81,37 @@ _AUTO_REPAIR_SOURCE = "auto_repair"
 #: 失败检查 output 摘要的缺省总长上限（与 ``RepairContextSpec`` 缺省一致）
 _DEFAULT_DETAIL_CHARS = 1200
 
+#: 模板降级原因前缀（r5 硬要求：必须落进 ``run.context["template"]["degraded"]``）
+_TEMPLATE_DEGRADED_NOT_FOUND = "template_not_found"
+_TEMPLATE_DEGRADED_INVALID = "template_invalid"
+
+#: 降级原因里的异常摘要长度上限（JSON 列不留长栈，tooltip 够读即可）
+_TEMPLATE_DEGRADED_DETAIL_CHARS = 200
+
+
+@dataclass(frozen=True)
+class TemplateLoadResult:
+    """模板装载结果（v1.2 · r5）。
+
+    ``spec is None`` 表示「按通用模式继续」，但**两种原因必须区分**：
+
+    - ``degraded_reason == ""``：本次 run 本来就没用模板（v1.1 路径，零写入）；
+    - ``degraded_reason != ""``：模板有引用却装载失败 = **发生降级**，调用方必须把
+      原因落进 ``run.context["template"]["degraded"]`` —— 用户以为有模板约束、实际
+      没有，比报错更危险（r5 定案）。
+    """
+
+    spec: TemplateSpec | None = None
+    degraded_reason: str = ""
+
+
+def _template_error_summary(
+    exc: BaseException, limit: int = _TEMPLATE_DEGRADED_DETAIL_CHARS
+) -> str:
+    """把模板装载异常压成单行摘要（去换行 / 截断），避免 JSON 列膨胀。"""
+    text = " ".join(str(exc).split()) or exc.__class__.__name__
+    return text if len(text) <= limit else text[:limit] + "…"
+
 
 class RoleStageExecutor:
     """真实四角色执行器（引擎按阶段调用）。"""
@@ -78,6 +126,7 @@ class RoleStageExecutor:
         events: EventPublisher | None = None,
         sandbox_network: NetworkPolicy = NetworkPolicy.NONE,
         exec_timeout: float = 120.0,
+        max_patch_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     ) -> None:
         self._session_factory = session_factory
         self._store = store
@@ -86,18 +135,39 @@ class RoleStageExecutor:
         self._events = events
         self._sandbox_network = sandbox_network
         self._exec_timeout = exec_timeout
+        #: 增量模式下单文件上限（超限在 ``merge_trees`` 记 ``too_large`` 并跳过）
+        self._max_patch_file_bytes = max_patch_file_bytes
 
     async def execute(
         self, *, run: PipelineRun, stage: StageSpec, attempt: int
     ) -> StageOutcome:
-        stage_input = await self._collect_input(run, stage, attempt)
+        template_load = self._load_template_spec(run)
+        template_spec = template_load.spec
+        if template_load.degraded_reason:
+            # r5：降级必须可观测 —— 模板被删/改坏时把原因落进 run.context，只写一次
+            await self._record_template_degraded(run, reason=template_load.degraded_reason)
+        baseline_ref, base_files = await self._load_baseline(run)
+        stage_input = await self._collect_input(
+            run, stage, attempt, template_spec=template_spec, baseline_ref=baseline_ref
+        )
         output = await self._runtime.execute(
             stage.role, stage_input, run_id=run.id, stage_id=stage.id
         )
 
+        # ---- 阶段一（合法化）+ 阶段二（合入）：骨架注入 / patch 契约 ----------
+        # 顺序是硬要求（docs/09 §4.1.3 S1）：runtime.execute 之后、smoke 之前、save 之前。
+        # 无模板且无基线时整段跳过 ⇒ v1.1 路径逐字节不变。
+        merged = self._apply_patch_contract(
+            output,
+            template_spec=template_spec,
+            base_files=base_files,
+            stage_input=stage_input,
+        )
+        smoke_files = merged.files if merged is not None else output.files
+
         smoke: dict[str, Any] | None = None
         if stage.use_sandbox and self._sandbox_service is not None:
-            smoke = await self._run_sandbox_smoke(run, output)
+            smoke = await self._run_sandbox_smoke(run, output, files=smoke_files)
             output.files["smoke_report.json"] = (
                 json.dumps(smoke, ensure_ascii=False, indent=2) + "\n"
             )
@@ -145,17 +215,119 @@ class RoleStageExecutor:
                 "commands": len(smoke.get("commands", [])),
                 "error": smoke.get("error"),
             }
+        if merged is not None:
+            # 审批卡片摘要必须能看到改动面与骨架冲突（docs/09 §13「报告纪律」）
+            payload["patch"] = {
+                "mode": merged.manifest.mode,
+                "counts": merged.manifest.counts.model_dump(),
+                "changed_paths": list(merged.manifest.changed_paths),
+                "reserved_conflicts": list(merged.manifest.reserved_conflicts),
+                "conflicts": [item.model_dump() for item in merged.manifest.conflicts],
+            }
 
         return StageOutcome(
             output_refs=[saved.ref()],
             summary=output.summary,
             payload=payload,
+            changed_paths=(
+                tuple(merged.manifest.changed_paths) if merged is not None else ()
+            ),
+        )
+
+    # ------------------------------------------------------------------ patch 契约
+
+    def _apply_patch_contract(
+        self,
+        output: StageOutput,
+        *,
+        template_spec: TemplateSpec | None,
+        base_files: dict[str, str],
+        stage_input: StageInput,
+    ) -> MergeResult | None:
+        """阶段一/阶段二合并（`docs/09 §4.1.3 S1 + §4.2.2`）。
+
+        - **阶段一（合法化）**：``merge_trees(base=基线正文, patch=模型输出, mode=patch)``
+          —— 传基线**正文**（不是 ``{}``）才能逐字节判定 noop；骨架按优先级表注入；
+        - **阶段二（合入）**：``out1.files`` 即整棵交付树，冒烟用它、评测也用它；
+        - **产物只存增量**：由 ``manifest.changed_paths`` 反推，而不是"以为传了 ``{}``
+          就只留了增量"（``out1.files`` 是整树，直接落盘会把基线全文写进产物）。
+
+        无模板且无基线 → 返回 ``None``，``output.files`` 一字不改（v1.1 路径）。
+        """
+        if template_spec is None and not base_files:
+            return None
+
+        skeleton = template_spec.skeleton_files() if template_spec is not None else None
+        reserved = (
+            template_spec.reserved_paths() if template_spec is not None else frozenset()
+        )
+        deleted = _deleted_paths(output.structured)
+        out1 = merge_trees(
+            base_files,
+            output.files,
+            mode="patch" if base_files else "from_scratch",
+            skeleton=skeleton,
+            reserved_paths=reserved,
+            base_paths=frozenset(base_files),
+            deleted=deleted,
+            max_file_bytes=self._max_patch_file_bytes,
+        )
+
+        stored = {path: out1.files[path] for path in out1.manifest.changed_paths
+                  if path in out1.files}
+        stored[PATCH_MANIFEST_NAME] = out1.manifest_json()
+        output.files = stored
+        return out1
+
+    async def _load_baseline(
+        self, run: PipelineRun
+    ) -> tuple[BaselineContext | None, dict[str, str]]:
+        """按 ``run.context["baseline"]`` 加载基线**正文**（无基线返回 ``(None, {})``）。
+
+        加载失败只告警并降级为"无基线"（与"上一版产物加载失败仅告警"同口径）：
+        基线被删除时不该让整轮 run 失败，但 ``mode`` 会退化为 ``from_scratch``。
+        """
+        context = run.context if isinstance(run.context, dict) else {}
+        ref = context.get("baseline")
+        if not isinstance(ref, dict):
+            return None, {}
+        artifact_id = str(ref.get("artifact_id") or "").strip()
+        if not artifact_id:
+            return None, {}
+        raw_version = ref.get("version")
+        version = raw_version if isinstance(raw_version, int) else None
+        try:
+            loaded = await self._store.load(artifact_id, version)
+        except Exception:  # noqa: BLE001 - 基线缺失/损坏：降级为从零生成
+            logger.warning(
+                "基线加载失败，按从零生成处理（run=%s baseline=%s v=%s）",
+                run.id,
+                artifact_id,
+                version,
+                exc_info=True,
+            )
+            return None, {}
+        return (
+            BaselineContext(
+                artifact_id=artifact_id,
+                version=loaded.version,
+                content_hash=loaded.version_row.content_hash,
+                file_count=len(loaded.files),
+                paths=tuple(sorted(loaded.files)),
+            ),
+            dict(loaded.files),
         )
 
     # ------------------------------------------------------------------ 输入收集
 
     async def _collect_input(
-        self, run: PipelineRun, stage: StageSpec, attempt: int
+        self,
+        run: PipelineRun,
+        stage: StageSpec,
+        attempt: int,
+        *,
+        template_spec: TemplateSpec | None = None,
+        baseline_ref: BaselineContext | None = None,
     ) -> StageInput:
         requirement = ""
         if isinstance(run.context, dict):
@@ -185,7 +357,102 @@ class RoleStageExecutor:
             attempt=attempt,
             repair_context=repair_context,
             previous_output=previous_output,
+            template=self._collect_template(run, spec=template_spec),
+            baseline=baseline_ref,
         )
+
+    @staticmethod
+    def _load_template_spec(run: PipelineRun) -> TemplateLoadResult:
+        """按 ``run.context["template"]["id"]`` 读模板定义。
+
+        与 :meth:`_collect_template` 分开是为了「一次 run 只读一次 YAML」：
+        ``execute`` 先取 spec，再分别给提示词视图与骨架注入用。
+
+        Returns:
+            :class:`TemplateLoadResult`。``degraded_reason`` 非空 = 模板有引用但
+            装载失败（被删 -> ``template_not_found``；改坏 -> ``template_invalid``），
+            调用方据此落库（r5：降级必须可观测）。
+        """
+        context = run.context if isinstance(run.context, dict) else {}
+        ref = context.get("template")
+        if not isinstance(ref, dict):
+            return TemplateLoadResult()
+        template_id = str(ref.get("id") or "").strip()
+        if not template_id:
+            return TemplateLoadResult()
+        try:
+            return TemplateLoadResult(spec=load_template(template_id))
+        except NotFoundError as exc:
+            logger.warning(
+                "模板已不存在，按通用模式继续（run=%s template=%s）: %s",
+                run.id,
+                template_id,
+                exc,
+            )
+            return TemplateLoadResult(
+                degraded_reason=f"{_TEMPLATE_DEGRADED_NOT_FOUND}: {template_id}"
+            )
+        except YmirError as exc:
+            logger.warning(
+                "模板装载失败，按通用模式继续（run=%s template=%s）: %s",
+                run.id,
+                template_id,
+                exc,
+            )
+            return TemplateLoadResult(
+                degraded_reason=f"{_TEMPLATE_DEGRADED_INVALID}: {_template_error_summary(exc)}"
+            )
+
+    async def _record_template_degraded(self, run: PipelineRun, *, reason: str) -> None:
+        """把模板降级原因落进 ``run.context["template"]["degraded"]``（r5 硬要求）。
+
+        实现纪律（逐条对应 docs/09「JSON 列」约定）：
+
+        - **JSON 列纪律**：读 → dict 深拷贝 → 改副本 → **整体赋值**回 ``row.context``
+          → commit。SQLAlchemy 不会感知 JSON 列的原地修改。
+        - **只写一次**：``degraded`` 键已存在（另一个阶段先写过）则**不覆盖**，
+          同一 run 多次降级保留首次原因。
+        - **正常路径零写入**：本方法只在确实降级时被调用；模板加载成功时
+          ``run.context["template"]`` 仍是 ``{"id","version"}`` 原样（§10 兼容契约）。
+        - **不改 run 状态**：降级不等于失败，阶段照常推进。
+        - **不发事件、不写回执表**：与本缺陷无关（事件域 ``events.run_id`` NOT NULL）。
+        """
+        async with self._session_factory() as session:
+            row = await session.get(PipelineRun, run.id)
+            if row is None:
+                return
+            context = copy.deepcopy(row.context) if isinstance(row.context, dict) else {}
+            ref = context.get("template")
+            if not isinstance(ref, dict) or not str(ref.get("id") or "").strip():
+                return
+            if "degraded" in ref:
+                # 已有首次原因：只把内存对象对齐，不覆盖落库值
+                run.context = context
+                return
+            ref["degraded"] = reason
+            row.context = context
+            await session.commit()
+            # 同一阶段后续读取（提示词 / 骨架注入）看到的是同一份上下文
+            run.context = copy.deepcopy(context)
+
+    @classmethod
+    def _collect_template(
+        cls, run: PipelineRun, *, spec: TemplateSpec | None = None
+    ) -> TemplateContext | None:
+        """从 ``run.context["template"]`` 装载模板约束（v1.2，docs/09 §4.1.2）。
+
+        ``run.context`` 只存**引用**（``{"id","version"}``，避免 JSON 列膨胀），
+        因此这里按 id 重新读模板 YAML 并解成提示词视图 :class:`TemplateContext`
+        （含 ``reserved_paths`` / ``seed_paths`` 两清单，**不含骨架正文**）。
+
+        模板在 run 创建后被删除/改坏属配置漂移：**只告警并按通用模式继续**，
+        不让整轮 run 失败（与"上一版产物加载失败仅告警"同口径）。降级原因由
+        :meth:`_record_template_degraded` 落进 ``run.context``（本方法保持**只读**语义）。
+        """
+        resolved = spec if spec is not None else cls._load_template_spec(run).spec
+        if resolved is None:
+            return None
+        return TemplateContext.from_spec(resolved)
 
     async def _collect_feedback(self, run_id: str, role_id: str) -> list[str]:
         """反馈消息（T04 驳回产生；此处已按「目标角色 = 本阶段角色」过滤）。
@@ -281,9 +548,15 @@ class RoleStageExecutor:
     # ------------------------------------------------------------------ 沙箱冒烟
 
     async def _run_sandbox_smoke(
-        self, run: PipelineRun, output: StageOutput
+        self, run: PipelineRun, output: StageOutput, *, files: dict[str, str] | None = None
     ) -> dict[str, Any]:
-        """在沙箱内执行代码产物的自测命令（尽力而为：失败仅记录，不阻断阶段）。"""
+        """在沙箱内执行代码产物的自测命令（尽力而为：失败仅记录，不阻断阶段）。
+
+        ``files`` 缺省为 ``output.files``；**增量/模板模式下必须传合并后的整树**
+        （docs/09 §4.2.2 / §4.1.3）：只写补丁会让 ``import`` 链缺基线文件，
+        冒烟必然 ``ModuleNotFoundError``，那是假失败。
+        """
+        tree = output.files if files is None else files
         commands = [
             str(cmd).strip()
             for cmd in output.structured.get("run_commands", [])
@@ -315,7 +588,7 @@ class RoleStageExecutor:
 
         try:
             session = managed.session
-            for path, content in output.files.items():
+            for path, content in tree.items():
                 await session.write_file(path, content)
             for command in commands:
                 try:
@@ -374,3 +647,17 @@ def _as_check_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _deleted_paths(structured: Any) -> list[str]:
+    """从 engineer 输出里取 ``deleted`` 清单（v1.2 ``CodeBundle.deleted``）。
+
+    脏值一律忽略：非 dict / 非 list / 非字符串元素都跳过 —— patch 契约容错优先于
+    教学式报错（docs/09 §4.2.2「为什么容错而不报错」）。
+    """
+    if not isinstance(structured, dict):
+        return []
+    raw = structured.get("deleted")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if isinstance(item, str) and item.strip()]

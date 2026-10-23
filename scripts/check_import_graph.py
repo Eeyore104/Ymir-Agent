@@ -13,7 +13,7 @@
 分层契约（按修复后的实际依赖图校准，docs/02 §2.2/§5）：
 
     api(0) > bootstrap/orchestrator/evaluation(1)
-           > hitl/roles/sop/messages/events(2)
+           > hitl/roles/sop/messages/events/templates(2)
            > tools/sandbox/gateway/artifacts(3)
            > storage(4)
            > models/common/config(5)
@@ -42,6 +42,9 @@ LAYERS: dict[str, int] = {
     "sop": 2,
     "messages": 2,
     "events": 2,
+    # v1.2（docs/09 §2-C14 / §3.1）：模板库与 roles/sop 同层。跨层只传纯数据：
+    # templates(2) -> common(5) 产出 LayoutRules；artifacts(3) 禁止 -> templates(2)（逆层）。
+    "templates": 2,
     "tools": 3,
     "sandbox": 3,
     "gateway": 3,

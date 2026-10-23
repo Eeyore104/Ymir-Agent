@@ -23,6 +23,9 @@ class StageOutcome:
     summary: str = ""
     message_type: str = MessageType.ARTIFACT.value
     payload: dict[str, Any] = field(default_factory=dict)
+    #: 增量模式（v1.2）：本次落盘相对基线/骨架实际变更的路径。
+    #: 非增量路径恒为 ``()`` —— 旧调用方零影响（docs/09 §4.2.5「changed_paths 传入」）。
+    changed_paths: tuple[str, ...] = ()
 
 
 class StageExecutor:

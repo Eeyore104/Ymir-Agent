@@ -27,13 +27,18 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.artifacts.diff import DiffReport, diff_file_sets
+from ymir.artifacts.merge import PATCH_MANIFEST_NAME, merge_trees, parse_patch_manifest
 from ymir.artifacts.versioning import compute_content_hash, normalize_files
 from ymir.common.errors import NotFoundError, StateConflictError
 from ymir.models.base import utcnow
 from ymir.models.entities import DEFAULT_TENANT_ID, Artifact, ArtifactVersion
+from ymir.models.enums import ArtifactType
 from ymir.storage.artifact_repo import ArtifactRepository, ArtifactVersionRepository
 
 logger = logging.getLogger(__name__)
+
+#: 基线产物类型值（``Artifact.type``，与 :class:`ymir.models.enums.ArtifactType` 同源）
+BASELINE_TYPE: str = ArtifactType.BASELINE.value
 
 
 @dataclass
@@ -292,6 +297,30 @@ class ArtifactStore:
             )
         return artifact, versions
 
+    async def get_version_meta(
+        self,
+        artifact_id: str,
+        version: int | None = None,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> tuple[Artifact, ArtifactVersion]:
+        """只取版本元数据（**不读文件树**），用于校验引用合法性（v1.2 基线引用）。
+
+        与 :meth:`load` 的区别：基线可能有几百个文件，仅仅为了"这个 id@version
+        是否存在、属于哪个项目"而读全树是纯浪费。
+        """
+        async with self._session_factory() as session:
+            artifact = await ArtifactRepository(session).get(artifact_id, tenant_id=tenant_id)
+            if artifact is None:
+                raise NotFoundError(f"产物不存在: {artifact_id}")
+            effective = artifact.current_version if version is None else version
+            row = await ArtifactVersionRepository(session).get_version(
+                artifact_id, effective, tenant_id=tenant_id
+            )
+            if row is None:
+                raise NotFoundError(f"产物版本不存在: {artifact_id} v{effective}")
+        return artifact, row
+
     async def diff(
         self,
         artifact_id: str,
@@ -305,10 +334,106 @@ class ArtifactStore:
         target = await self.load(artifact_id, v2, tenant_id=tenant_id)
         return diff_file_sets(base.files, target.files)
 
+    async def find_baseline_files(
+        self,
+        project_id: str,
+        expected_hash: str,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> dict[str, str]:
+        """按内容指纹在项目基线产物的**全部版本**里找正文（R9：不看 latest）。
+
+        v1.2 唯一的"按指纹回溯基线"实现：``evaluation.harness`` 与
+        ``export_zip(mode="merged")`` 共用它，避免两处各写一遍搜索逻辑。
+        找不到返回 ``{}``（调用方据此降级并标注，绝不猜"当前基线"）。
+        """
+        if not expected_hash:
+            return {}
+        artifacts = await self.list_artifacts(
+            project_id, tenant_id=tenant_id, limit=1000
+        )
+        for artifact in artifacts:
+            if artifact.type != BASELINE_TYPE:
+                continue
+            _artifact, versions = await self.get_artifact_detail(
+                artifact.id, tenant_id=tenant_id
+            )
+            for row in versions:
+                if row.content_hash != expected_hash:
+                    continue
+                loaded = await self.load(artifact.id, row.version, tenant_id=tenant_id)
+                return loaded.files
+        return {}
+
+    async def merged_tree(
+        self,
+        project_id: str,
+        *,
+        name: str = "code",
+        version: int | None = None,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> dict[str, str]:
+        """取"合入后的工程树"（基线 ⊕ 补丁），供合并导出 / 跨产物 diff 使用。
+
+        - 产物**没有** ``patch_manifest.json`` → 直接返回其文件集（v1.1 语义）；
+        - 有 manifest 且有基线 → ``merge_trees(mode="merge")`` 的整树；
+        - 有 manifest 但基线不可用（R9）→ **只返回补丁自身**，不拿"当前基线"凑。
+
+        簿记文件 ``patch_manifest.json`` 永远不进导出树（它不是工程源码）。
+        """
+        latest = await self.latest_by_name(project_id, name, tenant_id=tenant_id)
+        if latest is None:
+            raise NotFoundError(f"产物不存在: {name}")
+        loaded = (
+            latest
+            if version is None or version == latest.version
+            else await self.load(latest.artifact.id, version, tenant_id=tenant_id)
+        )
+        patch = {
+            path: content
+            for path, content in loaded.files.items()
+            if path != PATCH_MANIFEST_NAME
+        }
+        manifest = parse_patch_manifest(loaded.files.get(PATCH_MANIFEST_NAME))
+        if manifest is None or not manifest.base_content_hash:
+            return patch
+        base_files = await self.find_baseline_files(
+            project_id, manifest.base_content_hash, tenant_id=tenant_id
+        )
+        if not base_files:
+            logger.warning(
+                "合并导出：基线不可用，只导出补丁自身（project=%s name=%s hash=%s）",
+                project_id,
+                name,
+                manifest.base_content_hash[:12],
+            )
+            return patch
+        return merge_trees(
+            base_files, patch, mode="merge", deleted=manifest.deleted
+        ).files
+
     async def export_zip(
-        self, project_id: str, *, tenant_id: str = DEFAULT_TENANT_ID
+        self,
+        project_id: str,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+        include_baseline: bool = False,
+        mode: str = "latest",
     ) -> bytes:
-        """整库导出：各产物最新版本内容 + ``manifest.json``（含版本历史元数据）。"""
+        """整库导出（``mode="latest"``）或**扁平工程布局**导出（``mode="merged"``）。
+
+        ``mode="latest"``（缺省，v1.1 行为）：各产物最新版本内容 + ``manifest.json``，
+        zip 内路径 ``{name}/v{n}/{rel_path}``；``include_baseline=False`` 时排除
+        ``type=baseline`` 产物（v1.2，docs/09 §9-T2.2 ⑤）。
+
+        ``mode="merged"``（v1.2，docs/09 §9-T2.5 ③）：把「基线 ⊕ 补丁」的**合并树**
+        以**可运行工程布局**打出 —— 顶层直接 ``app/main.py``，**没有** ``code/v1/``
+        前缀；``manifest.json`` 里额外标注 ``mode`` 与来源产物，供合入前追溯。
+        """
+        if mode == "merged":
+            return await self.export_merged_zip(project_id, tenant_id=tenant_id)
+        if mode != "latest":
+            raise StateConflictError(f"非法导出模式: {mode!r}（latest | merged）")
         async with self._session_factory() as session:
             artifacts = await ArtifactRepository(session).list_by_project(
                 project_id, tenant_id=tenant_id, limit=1000
@@ -317,10 +442,48 @@ class ArtifactStore:
             version_rows = await ArtifactVersionRepository(session).list_for_artifacts(
                 [art.id for art in artifacts], tenant_id=tenant_id
             )
+        if not include_baseline:
+            artifacts = [art for art in artifacts if art.type != BASELINE_TYPE]
         # 整库打包为同步阻塞 IO（逐文件读取 + zip 压缩），转线程避免阻塞事件循环（ARCH-07）
         return await asyncio.to_thread(
             self._build_export_zip, project_id, artifacts, version_rows
         )
+
+    async def export_merged_zip(
+        self,
+        project_id: str,
+        *,
+        name: str = "code",
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> bytes:
+        """合并树导出（扁平布局：顶层直接是工程文件）。"""
+        files = await self.merged_tree(project_id, name=name, tenant_id=tenant_id)
+        latest = await self.latest_by_name(project_id, name, tenant_id=tenant_id)
+        manifest = {
+            "project_id": project_id,
+            "exported_at": utcnow().isoformat(),
+            "mode": "merged",
+            "tree": "merged",
+            "artifacts": [
+                {
+                    "id": latest.artifact.id if latest is not None else None,
+                    "name": name,
+                    "version": latest.version if latest is not None else None,
+                    "file_count": len(files),
+                }
+            ],
+        }
+        return await asyncio.to_thread(self._build_flat_zip, files, manifest)
+
+    @staticmethod
+    def _build_flat_zip(files: Mapping[str, str], manifest: Mapping[str, Any]) -> bytes:
+        """扁平工程布局 zip（无 ``{name}/v{n}/`` 前缀）。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel_path, content in sorted(files.items()):
+                zf.writestr(rel_path, content)
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        return buffer.getvalue()
 
     def _build_export_zip(
         self,
