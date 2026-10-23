@@ -6,18 +6,29 @@
   工具栏 / 空态可「发起四维评测」（POST /projects/{id}/evaluations，PM-07）。
 
   降级维度（degraded=true，评估器异常 / 沙箱不可用）显著标记（QA-10 / PM-07）。
+
+  v1.2 T4.4 增补两处来源标注：「检查命令来源：模板/套件」与「骨架冲突 N 处」。
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import EvalSourceNotes from '@/components/EvalSourceNotes.vue'
+import { fetchVersionContent } from '@/api/artifacts'
 import {
   fetchEvaluationDetail,
   fetchEvaluations,
   fetchProjectEvaluations,
   runEvaluation,
 } from '@/api/evaluations'
+import { fetchRun } from '@/api/runs'
 import { useProjectsStore } from '@/stores/projects'
+import {
+  PATCH_MANIFEST_FILE,
+  checksSourceOf,
+  countReservedConflicts,
+  parseTemplateRef,
+} from '@/utils/runContext'
 import type { EvaluationReport, EvaluationSummary } from '@/api/types'
 
 const route = useRoute()
@@ -49,6 +60,58 @@ const anyDegraded = computed<boolean>(
   () =>
     detail.value?.tasks.some((task) => task.dimensions.some((dim) => dim.degraded)) ?? false,
 )
+
+// --- 来源标注（v1.2 T4.4）---
+
+/** 检查命令来源：模板 checks 还是套件默认检查。 */
+const checksSource = ref<'template' | 'suite'>('suite')
+
+/** 骨架冲突条数（产物内 patch_manifest.json 的 reserved_conflicts）。 */
+const conflictCount = ref<number>(0)
+
+/**
+ * 加载报告页的两处来源标注。
+ *
+ * 1. **检查命令来源**：报告 JSON **没有**显式记录 checks 的来源，因此判据取
+ *    ``run.context.template`` 是否存在（有模板快照 -> 模板 checks；否则套件默认检查）。
+ *    v1.1 报告没有 ``run_id`` 追溯，直接按「套件」计。
+ * 2. **骨架冲突数**：读被评版本的 ``patch_manifest.json``，取 ``reserved_conflicts`` 条数；
+ *    产物不含该文件（v1.1 / 无模板无基线）时保持 0（整块隐藏）。
+ *
+ * 两处都做了**失败降级**：任一请求失败都不影响报告主体展示。
+ */
+async function loadAnnotations(row: EvaluationSummary): Promise<void> {
+  checksSource.value = 'suite'
+  conflictCount.value = 0
+  const runId = detail.value?.run_id ?? ''
+  const jobs: Promise<void>[] = [loadConflictCount(row)]
+  if (runId) jobs.push(loadChecksSource(runId))
+  await Promise.all(jobs)
+}
+
+/** 拉 run 详情判定检查命令来源（失败按套件展示，不阻塞报告）。 */
+async function loadChecksSource(runId: string): Promise<void> {
+  try {
+    const run = await fetchRun(runId)
+    checksSource.value = checksSourceOf(parseTemplateRef(run.context) !== null)
+  } catch {
+    checksSource.value = 'suite'
+  }
+}
+
+/** 读被评版本的 patch_manifest.json，统计骨架冲突条数。 */
+async function loadConflictCount(row: EvaluationSummary): Promise<void> {
+  const version = row.version
+  if (!version || version <= 0) return
+  try {
+    const listing = await fetchVersionContent(row.artifact_id, version)
+    if (!(listing.files ?? []).includes(PATCH_MANIFEST_FILE)) return
+    const manifest = await fetchVersionContent(row.artifact_id, version, PATCH_MANIFEST_FILE)
+    conflictCount.value = countReservedConflicts(manifest.content)
+  } catch {
+    conflictCount.value = 0
+  }
+}
 
 // --- 追溯徽标（v1.1 R6）：四字段来自报告 JSON，缺省时降级显示而不报错 ---
 
@@ -99,6 +162,8 @@ async function open(row: EvaluationSummary): Promise<void> {
   detailError.value = null
   try {
     detail.value = await fetchEvaluationDetail(row.artifact_id)
+    // 报告主体到手后再补来源标注（T4.4）；失败已在各 loader 内部降级
+    await loadAnnotations(row)
   } catch (e) {
     detail.value = null
     detailError.value = e instanceof Error ? e.message : String(e)
@@ -251,6 +316,9 @@ function gotoArtifacts(): void {
               eval_verdict
             </el-tag>
           </div>
+
+          <!-- 来源标注（T4.4）：检查命令来源 + 骨架冲突数（>0 才显示） -->
+          <EvalSourceNotes :checks-source="checksSource" :conflict-count="conflictCount" />
 
           <div class="metric-grid">
             <div class="metric">

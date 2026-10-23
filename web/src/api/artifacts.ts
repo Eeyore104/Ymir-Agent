@@ -1,9 +1,16 @@
 /**
- * 产物库 API（§6.1、§3.6：项目产物列表 / 详情 / 版本内容 / 版本 diff）。
+ * 产物库 API（§6.1、§3.6：项目产物列表 / 详情 / 版本内容 / 版本 diff）；
+ * v1.2 增补：跨产物对比（基线 vs 合并结果）与基线上传（docs/09 §4.2）。
  */
 
 import client, { request, type PageData } from './client'
-import type { Artifact, ArtifactContent, ArtifactDetail, ArtifactDiff } from './types'
+import type {
+  Artifact,
+  ArtifactContent,
+  ArtifactDetail,
+  ArtifactDiff,
+  BaselineUploadResult,
+} from './types'
 
 /** 项目产物列表（信封 data 为 PageData：{items, total}）。 */
 export function fetchProjectArtifacts(projectId: string): Promise<Artifact[]> {
@@ -52,4 +59,41 @@ export async function exportProjectZip(projectId: string): Promise<Blob> {
     responseType: 'blob',
   })
   return response.data
+}
+
+/**
+ * 上传现有工程快照为基线（v1.2，docs/09 §4.2.1）。
+ *
+ * **必须用原始字节**：后端刻意不引入 ``python-multipart``，因此这里把 ``File``
+ * 作为请求体直接 POST，并显式声明 ``Content-Type: application/zip``；
+ * **禁止 FormData / multipart**。
+ *
+ * @param projectId 项目 id
+ * @param file zip 文件（浏览器 ``File`` / ``Blob``）
+ */
+export function uploadBaseline(projectId: string, file: File | Blob): Promise<BaselineUploadResult> {
+  return request<BaselineUploadResult>({
+    method: 'post',
+    url: `/projects/${projectId}/baselines`,
+    data: file,
+    headers: { 'Content-Type': 'application/zip' },
+  })
+}
+
+/**
+ * 跨产物对比（v1.2，docs/09 §4.2.4）：``base`` 与「基线 ⊕ 补丁」的差异。
+ *
+ * ``base`` / ``target`` 形如 ``name`` 或 ``name@version``；返回体复用
+ * :class:`ArtifactDiff`，因此 ``DiffView.vue`` 零改动即可渲染。
+ */
+export function fetchDiffAcross(
+  projectId: string,
+  base = 'baseline',
+  target = 'code',
+): Promise<ArtifactDiff> {
+  return request<ArtifactDiff>({
+    method: 'get',
+    url: `/projects/${projectId}/diff-across`,
+    params: { base, target },
+  })
 }

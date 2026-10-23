@@ -13,6 +13,7 @@ import ApprovalCard from '@/components/ApprovalCard.vue'
 import ArtifactViewDialog from '@/components/ArtifactViewDialog.vue'
 import LogStream from '@/components/LogStream.vue'
 import RepairTimeline from '@/components/RepairTimeline.vue'
+import RunContextBadges from '@/components/RunContextBadges.vue'
 import StageStepper from '@/components/StageStepper.vue'
 import { useRunEvents, type RunEvent, type SseStatus } from '@/api/sse'
 import { useApprovalsStore } from '@/stores/approvals'
@@ -219,6 +220,11 @@ function formatTime(iso: string | null): string {
         <el-tag v-if="run" type="info" size="default" effect="plain">
           {{ RUN_MODE_LABELS[run.mode] ?? run.mode }}
         </el-tag>
+        <!--
+          v1.2 运行上下文徽标（T4.4）：模板 / 模板未生效 / 增量·基线 / 从零。
+          v1.1 老帧没有 template/baseline 字段时由组件内部 v-if 整块隐藏。
+        -->
+        <RunContextBadges :context="run?.context ?? null" />
       </div>
       <div class="run-actions">
         <el-button size="small" :disabled="!run || isTerminal" @click="onAction('pause')">暂停</el-button>

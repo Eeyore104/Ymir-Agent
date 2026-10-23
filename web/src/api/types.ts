@@ -53,6 +53,15 @@ export interface RunCreatePayload {
   pipeline_id?: string
   mode?: RunMode
   context_refs?: string[]
+  /**
+   * 模板 id（v1.2，docs/09 §4.1.2）：模板是**运行参数**而非流水线拓扑，
+   * 缺省 ``null`` = 通用模式（行为与 v1.1 一致）。
+   */
+  template_id?: string | null
+  /** 基线产物 id（须属于本项目且 ``type=baseline``）；缺省 ``null`` = 从零生成。 */
+  baseline_artifact_id?: string | null
+  /** 基线版本号；缺省 ``null`` = 该基线产物的当前版本。 */
+  baseline_version?: number | null
 }
 
 /** 运行控制动作。 */
@@ -321,4 +330,104 @@ export interface SandboxSession {
   status: string
   created_at: string
   destroyed_at: string | null
+}
+
+/** 模板摘要（GET /templates、GET /templates/{id}）。 */
+export interface TemplateSummary {
+  id: string
+  version: string
+  name: string
+  description: string
+  supports: string[]
+  /** stack 原样透传：``dependencies`` 即依赖白名单。 */
+  stack: Record<string, unknown>
+  /** layout 原样透传：``required_dirs`` 即目录规范。 */
+  layout: Record<string, unknown>
+  conventions: string[]
+  /** 保留路径：逐字节要求精确，模型不得改动。 */
+  reserved_paths: string[]
+  /** 种子路径：允许整文件重写（须输出完整版）。 */
+  seed_paths: string[]
+  checks: Array<Record<string, unknown>>
+  /** 角色 -> 追加约束文本（**骨架正文永远不在这里**）。 */
+  prompting: Record<string, string>
+  prompting_roles: string[]
+  /** 加载失败原因（``null`` 表示模板可用；非空表示该模板不可选）。 */
+  loading_error: string | null
+}
+
+/** 基线上传结果（POST /projects/{id}/baselines，201）。 */
+export interface BaselineUploadResult {
+  artifact_id: string
+  version: number
+  file_count: number
+  content_hash: string
+  size_bytes: number
+}
+
+/** 推送目标（对应后端 ``ExportTarget``，``extra="forbid"``：多一个键即 1001）。 */
+export interface ExportTargetPayload {
+  kind?: 'github'
+  /** ``owner/name``。 */
+  repo: string
+  /** ``null`` -> 后端生成 ``ymir/<artifact>-v<n>``。 */
+  branch?: string | null
+  /** monorepo 子目录（空 = 根）。 */
+  path_prefix?: string
+  create_repo?: boolean
+  private?: boolean
+  commit_message?: string | null
+  /** 显式允许推 main/master（缺省 false，后端拒绝）。 */
+  allow_protected_branch?: boolean
+  strict_secret_check?: boolean
+}
+
+/**
+ * 推送请求体（v1.2 T3.4）。
+ *
+ * 后端 ``ExportCreate`` 为 ``extra="forbid"``：**绝不接受 token/pat 字段**，
+ * 凭证只从服务端环境变量读取。
+ */
+export interface ExportCreatePayload {
+  target: ExportTargetPayload
+  artifact_id: string
+  /** 缺省 ``null`` = 最新版本。 */
+  artifact_version?: number | null
+  /** ``files`` = 原产物 / ``merged`` = 基线⊕补丁（推荐）。 */
+  tree?: 'files' | 'merged'
+  /** 缺省预演（前端确认后才真推）。 */
+  dry_run?: boolean
+  strict_secret_check?: boolean
+}
+
+/** 被拦截 / 被跳过的文件（``path`` + ``reason``，**不含正文**）。 */
+export interface BlockedFile {
+  path: string
+  reason: string
+}
+
+/** 推送回执（POST/GET /projects/{id}/exports）。 */
+export interface ExportReceipt {
+  id: string
+  artifact_id: string
+  artifact_version: number
+  tree: string
+  target_kind: string
+  repo: string
+  branch: string
+  path_prefix: string
+  status: string
+  /** 真推成功时的提交 sha（预演为 ``null``）。 */
+  commit_sha: string | null
+  file_count: number
+  blocked_count: number
+  skipped_count: number
+  error_code: number | null
+  error_class: string | null
+  error_message: string | null
+  idempotency_key: string
+  dry_run: boolean
+  blocked_files: BlockedFile[]
+  skipped_files: BlockedFile[]
+  created_at: string
 }

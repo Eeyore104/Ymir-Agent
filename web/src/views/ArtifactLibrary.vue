@@ -1,17 +1,23 @@
 <!--
   产物库（/artifacts?project_id=...）：产物列表 / 版本历史 / 版本内容 / 版本 diff
   （验收点④：驳回重跑后的版本递增 lineage 一目了然）。
+
+  v1.2 T4.3 增补：基线面板（vN / 文件数 / hash 前 8 位 / 上传时间）、
+  跨产物对比（基线 vs 基线⊕补丁，复用 DiffView）、推送三步对话框。
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
+import BaselinePanel from '@/components/BaselinePanel.vue'
 import DiffView from '@/components/DiffView.vue'
 import MarkdownView from '@/components/MarkdownView.vue'
-import { exportProjectZip } from '@/api/artifacts'
+import PushExportDialog from '@/components/PushExportDialog.vue'
+import { exportProjectZip, fetchArtifact, fetchProjectArtifacts } from '@/api/artifacts'
 import { useArtifactsStore } from '@/stores/artifacts'
-import { useProjectsStore } from '@/stores/projects'
-import type { Artifact, ArtifactVersion } from '@/api/types'
+import { messageOf, useProjectsStore } from '@/stores/projects'
+import { buildDiffRef } from '@/utils/baseline'
+import type { Artifact, ArtifactDetail, ArtifactVersion } from '@/api/types'
 
 const route = useRoute()
 const projectsStore = useProjectsStore()
@@ -25,8 +31,18 @@ const selectedPath = ref<string | null>(null)
 const diffV1 = ref<number>(0)
 const diffV2 = ref<number>(0)
 
+/** 项目基线详情（type=baseline 的产物；null = 该项目没有基线）。 */
+const baselineDetail = ref<ArtifactDetail | null>(null)
+const baselineLoading = ref(false)
+
+/** 推送对话框可见性（T4.3 第三步流程的入口）。 */
+const pushDialogVisible = ref(false)
+
 const artifacts = computed<Artifact[]>(() => artifactsStore.items)
 const currentArtifact = computed(() => artifactsStore.current)
+
+/** 基线最新版本号（基线对比「一键」按钮用；0 = 无基线）。 */
+const latestBaselineVersion = computed<number>(() => baselineDetail.value?.versions.at(-1)?.version ?? 0)
 
 onMounted(async () => {
   await projectsStore.loadProjects()
@@ -35,14 +51,72 @@ onMounted(async () => {
     typeof queryProject === 'string' && queryProject
       ? queryProject
       : (projectsStore.items[0]?.id ?? '')
-  if (projectId.value) await artifactsStore.loadProjectArtifacts(projectId.value)
+  if (projectId.value) {
+    await artifactsStore.loadProjectArtifacts(projectId.value)
+    await loadBaselineDetail(projectId.value)
+  }
 })
 
 watch(projectId, async (next) => {
   if (!next) return
   selectedArtifactId.value = ''
+  baselineDetail.value = null
+  artifactsStore.clearDiffAcross()
   await artifactsStore.loadProjectArtifacts(next)
+  await loadBaselineDetail(next)
 })
+
+/**
+ * 加载项目基线详情：在产物列表里找 ``type=baseline`` 的产物，再拉其版本历史。
+ *
+ * 失败降级为「无基线」并提示，不打断主流程。
+ */
+async function loadBaselineDetail(targetProjectId: string): Promise<void> {
+  if (!targetProjectId) {
+    baselineDetail.value = null
+    return
+  }
+  baselineLoading.value = true
+  try {
+    const list = artifactsStore.items.length
+      ? artifactsStore.items
+      : await fetchProjectArtifacts(targetProjectId)
+    const baseline = list.find((item) => item.type === 'baseline') ?? null
+    baselineDetail.value = baseline ? await fetchArtifact(baseline.id) : null
+  } catch (e) {
+    baselineDetail.value = null
+    ElMessage.error(`基线信息加载失败：${messageOf(e)}`)
+  } finally {
+    baselineLoading.value = false
+  }
+}
+
+/**
+ * 「与基线对比」：GET /projects/{id}/diff-across。
+ *
+ * ``base`` = ``baseline@N``；``target`` = 当前产物 ``name@M``（无选中产物时用 ``code``）。
+ * 返回体与 ``ArtifactDiff`` 同构，因此直接交给 ``DiffView`` 渲染（不另写 diff 组件）。
+ */
+async function onCompareBaseline(baselineVersion: number): Promise<void> {
+  if (!projectId.value || baselineVersion <= 0) return
+  const target = currentArtifact.value
+  const baseRef = buildDiffRef(baselineDetail.value?.name || 'baseline', baselineVersion)
+  const targetRef = buildDiffRef(target?.name || 'code', target?.current_version ?? null)
+  activeTab.value = 'baseline-diff'
+  await artifactsStore.loadDiffAcross(projectId.value, baseRef, targetRef)
+  if (artifactsStore.error) {
+    ElMessage.error(`基线对比失败：${artifactsStore.error}`)
+  }
+}
+
+/** 打开发起推送对话框前的校验。 */
+function openPushDialog(): void {
+  if (!currentArtifact.value) {
+    ElMessage.warning('请先选择左侧产物')
+    return
+  }
+  pushDialogVisible.value = true
+}
 
 watch(selectedArtifactId, async (artifactId: string) => {
   if (!artifactId) return
@@ -142,8 +216,23 @@ function downloadBlob(blob: Blob, filename: string): void {
         >
           导出 zip
         </el-button>
+        <el-button
+          size="small"
+          type="primary"
+          :disabled="!projectId || !currentArtifact"
+          @click="openPushDialog"
+        >
+          推送到 Git
+        </el-button>
       </div>
     </div>
+
+    <!-- 基线面板（T4.3 ①：vN / 文件数 / hash 前 8 位 / 上传时间） -->
+    <BaselinePanel
+      :detail="baselineDetail"
+      :loading="baselineLoading"
+      @compare="onCompareBaseline"
+    />
 
     <div class="library-body">
       <!-- 产物列表 -->
@@ -258,10 +347,41 @@ function downloadBlob(blob: Blob, filename: string): void {
               </div>
               <DiffView :diff="artifactsStore.diff" :loading="artifactsStore.loading" />
             </el-tab-pane>
+
+            <!-- 基线对比（T4.3 ②：diff-across，复用 DiffView） -->
+            <el-tab-pane label="与基线对比" name="baseline-diff">
+              <div class="diff-controls">
+                <span class="diff-hint">
+                  基线 {{ baselineDetail?.name || 'baseline' }} v{{ latestBaselineVersion || '-' }}
+                  vs
+                  {{ currentArtifact.name }} v{{ currentArtifact.current_version }}
+                </span>
+                <el-button
+                  type="primary"
+                  size="small"
+                  :disabled="!baselineDetail || latestBaselineVersion <= 0"
+                  :loading="artifactsStore.loading"
+                  @click="onCompareBaseline(latestBaselineVersion)"
+                >
+                  与基线对比
+                </el-button>
+              </div>
+              <div class="diff-hint diff-hint-block">
+                左侧 = 基线快照，右侧 = 基线 ⊕ 本次补丁（仅新增/修改参与，逐字节相同即丢弃）。
+              </div>
+              <DiffView :diff="artifactsStore.diffAcross" :loading="artifactsStore.loading" />
+            </el-tab-pane>
           </el-tabs>
         </template>
       </div>
     </div>
+
+    <!-- 推送三步对话框（T4.3 ③：预演 -> 真推 -> 结果） -->
+    <PushExportDialog
+      v-model="pushDialogVisible"
+      :project-id="projectId"
+      :artifact="currentArtifact"
+    />
   </div>
 </template>
 
@@ -380,5 +500,15 @@ function downloadBlob(blob: Blob, filename: string): void {
 
 .diff-arrow {
   color: #909399;
+}
+
+.diff-hint {
+  font-size: 12px;
+  color: #909399;
+}
+
+.diff-hint-block {
+  margin-bottom: 10px;
+  line-height: 1.7;
 }
 </style>

@@ -1,6 +1,7 @@
 /**
  * 产物库 Store（Pinia setup 风格）：项目产物列表 / 产物详情（版本历史）/
- * 版本内容 / 版本 diff（ArtifactLibrary 与运行详情的产物面板共用）。
+ * 版本内容 / 版本 diff（ArtifactLibrary 与运行详情的产物面板共用）；
+ * v1.2 增补：跨产物对比（基线 vs 合并结果，T4.3）。
  */
 
 import { defineStore } from 'pinia'
@@ -15,6 +16,8 @@ export const useArtifactsStore = defineStore('artifacts', () => {
   const current = ref<ArtifactDetail | null>(null)
   const content = ref<ArtifactContent | null>(null)
   const diff = ref<ArtifactDiff | null>(null)
+  /** 跨产物对比结果（基线 vs 基线⊕补丁）；与同产物 ``diff`` 分开，互不覆盖。 */
+  const diffAcross = ref<ArtifactDiff | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
 
@@ -82,11 +85,34 @@ export const useArtifactsStore = defineStore('artifacts', () => {
     diff.value = null
   }
 
+  /**
+   * 跨产物对比（GET /projects/{id}/diff-across）：``base`` / ``target`` 形如
+   * ``name`` 或 ``name@version``。返回体与 :class:`ArtifactDiff` 同构，
+   * 因此 ``DiffView.vue`` 零改动即可渲染。
+   */
+  async function loadDiffAcross(projectId: string, base: string, target: string): Promise<void> {
+    loading.value = true
+    error.value = null
+    try {
+      diffAcross.value = await artifactsApi.fetchDiffAcross(projectId, base, target)
+    } catch (e) {
+      diffAcross.value = null
+      error.value = messageOf(e)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  function clearDiffAcross(): void {
+    diffAcross.value = null
+  }
+
   function reset(): void {
     items.value = []
     current.value = null
     content.value = null
     diff.value = null
+    diffAcross.value = null
     error.value = null
   }
 
@@ -95,14 +121,17 @@ export const useArtifactsStore = defineStore('artifacts', () => {
     current,
     content,
     diff,
+    diffAcross,
     loading,
     error,
     loadProjectArtifacts,
     loadArtifact,
     loadVersionContent,
     loadDiff,
+    loadDiffAcross,
     clearContent,
     clearDiff,
+    clearDiffAcross,
     reset,
   }
 })
