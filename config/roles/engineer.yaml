@@ -13,4 +13,10 @@ outputs: [code]
 output_schema: CodeBundle
 retry: { max_attempts: 2 }
 temperature: 0.2
-max_tokens: 8192
+# v1.2：8192 -> 16384。角色级值优先于 models.yaml（gateway.py:204），**这是
+# CodeBundle 被截断的直接原因**：engineer 要一次性输出完整 JSON（全栈项目 =
+# 后端多文件 + 前端多文件），8192 处必然断在 JSON 中途，角色层报
+# 「无法从模型输出提取 JSON 对象」。
+# 16384 为该模型（deepseek-chat）实测可真实输出的上限，已单独验证
+# completion_tokens=16384 / finish=length。
+max_tokens: 16384

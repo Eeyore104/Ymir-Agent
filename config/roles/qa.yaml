@@ -13,4 +13,6 @@ outputs: [evaluation_report]
 output_schema: EvalSummary
 retry: { max_attempts: 2 }
 temperature: 0.2
-max_tokens: 4096
+# v1.2：4096 -> 8192。角色级值优先于 models.yaml（gateway.py:204）。
+# 评测报告含四维明细 + 证据列表，4096 对含合并树证据的报告偏紧。
+max_tokens: 8192

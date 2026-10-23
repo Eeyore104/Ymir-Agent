@@ -12,4 +12,8 @@ outputs: [prd]
 output_schema: PRDDocument
 retry: { max_attempts: 2 }
 temperature: 0.4
-max_tokens: 8192
+# v1.2：8192 -> 32768。角色级 max_tokens **优先于** config/models.yaml 的模型级值
+# （gateway.py:204 先看角色传入值），所以只改 models.yaml 不生效。
+# PRD 含需求池 + 用户故事 + 验收标准，全栈需求下 8192 会中途截断
+# （2026-10-23 T5.1 实测 completion_tokens 顶死 8191/8192，下游拿到半份 PRD）。
+max_tokens: 32768

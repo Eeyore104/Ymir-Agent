@@ -22,12 +22,22 @@ providers:
         tier: planner   # 推理模型：PM / 架构师 等规划类角色
         price_in: 4.0
         price_out: 12.0
-        max_tokens: 8192
+        # v1.2 起 8192 -> 32768：模板约束注入 + 全栈需求让输出显著变长，
+        # 8192 会在 PRD / 架构文档中途截断（2026-10-23 T5.1 实测：三次 planner
+        # 调用的 completion_tokens 分别顶死在 8191 / 8192 / 8192，finish=length）。
+        # 截断的文档再喂给下游，等于让架构师基于半份 PRD 做设计。
+        # 注意：max_tokens 只是**上限**，按实际输出计费，调高本身不增加成本。
+        max_tokens: 32768
       deepseek-chat:
         tier: executor  # 快模型：工程师 / QA 等执行类角色
         price_in: 1.0
         price_out: 2.0
-        max_tokens: 8192
+        # v1.2 起 8192 -> 16384：engineer 要一次性输出 CodeBundle 的完整 JSON
+        # （全栈项目 = 后端多文件 + 前端多文件），8192 处必然截断 ——
+        # 2026-10-23 T5.1 实测两次尝试 completion_tokens 都是 8192、finish=length，
+        # 下游报「无法从模型输出提取 JSON 对象」（JSON 不完整）。
+        # 已单独实测该模型可真实输出 16384 tokens（finish=length 顶到 16384 才停）。
+        max_tokens: 16384
 
 # 分级路由：tier -> 候选模型优先级列表（左侧优先，失败沿链降级）。
 # 未配置密钥的 provider 会被自动跳过（见 providers.is_available）。

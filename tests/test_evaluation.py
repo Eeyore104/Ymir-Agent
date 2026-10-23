@@ -1509,9 +1509,14 @@ def test_sandbox_dockerfile_has_v12_packages() -> None:
     for package in (
         "fastapi>=0.115",
         "uvicorn>=0.30",
-        "sqlalchemy>=2.0",
+        # [asyncio] extra 提供 greenlet —— 缺了 FastAPI 异步 session 一 import 就报
+        # "The SQLAlchemy asyncio module requires greenlet"（T5.1 真跑实测）
+        "sqlalchemy[asyncio]>=2.0",
         "aiosqlite>=0.20",
         "alembic>=1.13",
+        # 模型为 FastAPI 生成的 conftest 常规会 import pytest_asyncio，
+        # 缺了 collection 直接 exit 4（T5.1 真跑实测）
+        "pytest-asyncio>=0.23,<1",
     ):
         assert package in text, package
     assert "pytest / pytest-cov / httpx / pydantic" in text  # :7 预装清单已同步

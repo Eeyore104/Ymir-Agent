@@ -275,7 +275,14 @@ class RoleStageExecutor:
 
         stored = {path: out1.files[path] for path in out1.manifest.changed_paths
                   if path in out1.files}
-        stored[PATCH_MANIFEST_NAME] = out1.manifest_json()
+        # 只有**增量**（patch）产物才写簿记文件。from_scratch 不是"变更集"：
+        # 一旦写 manifest，下游会把它当增量 —— 评测侧按 changed_paths 做 judge
+        # 语料分级，会把**全量**文件当"变更文件"喂全文（成本白涨），且与
+        # docs/09 §9-T2.4 DoD ⑨「from_scratch 剥掉 manifest、changed_paths=None」冲突。
+        # 2026-10-23 T5.1 真跑实测：from_scratch 产物里出现了 changed_paths=32 的
+        # patch_manifest.json，即此处无条件写入所致。
+        if out1.manifest.mode == "patch":
+            stored[PATCH_MANIFEST_NAME] = out1.manifest_json()
         output.files = stored
         return out1
 

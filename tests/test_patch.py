@@ -639,7 +639,9 @@ class TestSkeletonPersistence:
         assert saved["ruff.toml"] == "line-length = 100\n"
         assert saved["requirements.txt"] == "fastapi>=0.115\n"
         assert saved["app/api/users.py"] == "x = 1\n"
-        assert PATCH_MANIFEST_NAME in saved
+        # from_scratch 不是"变更集"，**不写**簿记文件（docs/09 §9-T2.4 DoD ⑨）。
+        # 写了会让评测侧按 changed_paths 做 judge 语料分级，把全量文件当"变更文件"喂全文。
+        assert PATCH_MANIFEST_NAME not in saved
 
         from ymir.artifacts.versioning import compute_content_hash
 
@@ -793,12 +795,15 @@ class TestManifestShape:
     async def test_patch_manifest_has_no_timestamp(
         self, session_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # 必须在 **patch** 场景断言：from_scratch 不写 manifest（§9-T2.4 DoD ⑨），
+        # 只有增量产物才有簿记文件可查。加 use_baseline 即进入 patch 模式。
         fx = await _stage_fixture(
             session_factory,
             tmp_path,
             monkeypatch,
             patch_files={"app/api/users.py": "x = 1\n"},
             use_template=True,
+            use_baseline=True,
         )
         await fx.executor.execute(run=fx.run, stage=_coding_stage(), attempt=1)
         raw = fx.store.saved[-1][PATCH_MANIFEST_NAME]
