@@ -25,7 +25,7 @@ v1.1 起再加一层：**评测不达标会自动回边返工**——失败检�
 
 ## 项目进度
 
-按严格依赖链分五批推进，**T01–T05 全部完成，v1.0 收官**：
+按严格依赖链分五批推进，**T01–T05 全部完成，v1.0 收官**（v1.1 基准评测 + 自愈回环、v1.2 垂直模板库 + 增量 patch + GitHub 推送见下文对应章节）：
 
 | 批次 | 内容 | 状态 |
 |---|---|---|
@@ -53,7 +53,7 @@ v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回
 
 **验收**：10 条验收线全过；7 份 QA 证书（含 T5 补签，均独立对抗验证 + 变异测试）；CI 后端 + 前端双 job 全绿。已知限制与遗留见 `docs/08-验收报告-v1.1.md` §7 / §9。
 
-当前测试基线 **439 passed**（302 → 384 → 404 → 410 → 437 → 439 递增，全部 mock LLM、0 费用）＋ 前端 vitest **33**。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；**验收结论见 `docs/08-验收报告-v1.1.md`**。
+当时测试基线 **439 passed**（302 → 384 → 404 → 410 → 437 → 439 递增，全部 mock LLM、0 费用）＋ 前端 vitest **33**。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；**验收结论见 `docs/08-验收报告-v1.1.md`**。
 
 ### v1.1 基准表（benchmark-12 · **12 任务全量**）
 
@@ -101,7 +101,7 @@ uv run python scripts/run_eval.py --project-name <项目名> --versions v1 --no-
 
 完整基线表字段、12 任务口径与 `--resume / --budget-cny / --report-only` 用法见 `docs/04-使用手册.md` §9.1。
 
-### v1.2（实施完成 2026-10-23）：垂直模板库 + 增量 patch + GitHub 推送
+### v1.2（验收完成 2026-10-26）：垂直模板库 + 增量 patch + GitHub 推送
 
 从「从零生成一个能跑的项目」升级为「**按用户既有工程的规矩把改动增量合进去，并安全推到自己的仓库**」。
 
@@ -112,14 +112,14 @@ uv run python scripts/run_eval.py --project-name <项目名> --versions v1 --no-
 | 人工可审 | 跨产物 `diff-across` 复用既有 `DiffView`；骨架冲突与改动面（added / modified / noop）在审批卡片可见 |
 | 安全推送 | Git Data API **1 次推送 = 1 个 commit**；dry-run 前置；密钥双层过滤（路径黑名单 + 内容指纹）；默认推新分支 `ymir/<artifact>-v<n>` |
 
-**质量数据（v1.2 验收证书实测）**：后端 **720 passed**（8 轮全量 0 失败）· 前端 **63 passed / 12 files** ·
+**质量数据（v1.2 验收证书实测）**：后端 **724 passed**（8 轮全量 0 失败；含 T5.1 真跑后新增的 4 条 `CodeBundle` 语法预检用例）· 前端 **63 passed / 12 files** ·
 `ruff check` / `scripts/check_import_graph.py`（分层 + 循环依赖）/ `alembic check`（新增 1 个迁移 `0004_add_exports`，双向可逆）全绿 ·
 前端构建 `index.js` **483.58 kB（gzip 163.92）** / `vue-vendor` 157.37 / `markdown` 93.60 / `css` 173.60，1896 modules，`vue-tsc` 零错。
 
 **零费用复现（不调真实模型、不依赖 Docker）**
 
 ```bash
-uv run pytest -q                                # 720 passed
+uv run pytest -q                                # 724 passed
 uv run python scripts/check_import_graph.py     # 分层护栏 PASS
 cd web && npx vitest run && npm run build       # 63 passed / 12 files
 ```
@@ -130,7 +130,10 @@ cd web && npx vitest run && npm run build       # 63 passed / 12 files
 > （未处理 argparse 错误路径 / 重写 `tests/conftest.py` 破坏既有测试），**不是模板或合并机制的问题**。
 > **推送链路已端到端验证**（2026-10-26，测试仓库 `Eeyore104/ymir-export-test`）：dry-run 与真推均通过，
 > `base_tree` 传 tree sha 未出现 422，`.env` 被拦（`path_blacklist`）、`.env.example` 已推、分支保护生效。
-> 12 任务全量基线**尚未执行**。
+> **12 任务全量基线已完成**（批次 `20261026-1`，`--no-judge`）：首轮 **58.3%（7/12）→ 最终 83.3%（10/12）**，
+> ¥3.2370 / 25 分钟，其中 3 个任务靠**自愈回环**转通过（净增益 **+25 个百分点**）。
+> judge 对比（批次 `20261026-judge`）首轮 75.0% → 最终 91.7%、¥3.6313，但两种口径**不可逐题对比**
+> （同一 run 可一过一不过），正式口径仍取确定性版。
 > 完整数据（每轮 token/成本/耗时/verdict）见 `docs/09` §15；限制说明见 `docs/04` §10.4。
 
 ## 架构一览
@@ -166,7 +169,7 @@ flowchart LR
 | 编排 | 自研状态机 + 声明式 SOP（YAML / Pydantic）+ 事件 / 消息总线（SSE） |
 | 模型网关 | OpenAI SDK（DeepSeek 先行；qwen / glm / kimi 同构预留）+ Anthropic 适配器接口 |
 | 执行沙箱 | Docker（python:3.12-slim，限额 + 断网；LocalSandbox 降级） |
-| 工程化 | uv · pytest（439 用例，全部 mock LLM）· vitest（33 用例）· ruff · GitHub Actions（后端 + 前端 job） |
+| 工程化 | uv · pytest（**724** 用例，全部 mock LLM）· vitest（**63** 用例）· ruff · GitHub Actions（后端 + 前端 job） |
 | 前端 | Vue 3 · Element Plus · Pinia · vue-router · Vite · TypeScript |
 
 ## 快速开始
@@ -338,6 +341,7 @@ ymir-agent/
 | `docs/06-验收报告-v1.0.md` | v1.0 版本验收报告（六大验收线 / 探针证据 / 遗留清单） |
 | `docs/07-增量设计与任务列表-v1.1.md` | v1.1 实施口径与任务分解（基准评测 + 自愈回环，T1–T5） |
 | `docs/08-验收报告-v1.1.md` | v1.1 版本验收报告（验收线 / 质量数据 / 真跑基线 / 缺陷与缺口台账 / 遗留） |
+| `docs/09-增量设计与任务列表-v1.2.md` | v1.2 实施口径与任务分解（模板库 / 增量 patch / GitHub 推送，T1.1–T5.3）；**§15 为 T5.1 真跑验收记录**（四场景 verdict、成本表、5 个缺陷、12 任务基线 + judge 对比、已知限制） |
 
 ## License
 
