@@ -24,10 +24,11 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ymir.common.errors import BizCode, YmirError
 
@@ -66,6 +67,41 @@ class CodeBundle(BaseModel):
     #: ★增量模式（v1.2，docs/09 §4.2.2）：要从基线删除的相对路径。
     #: 缺省 ``[]`` ⇒ v1.1 旧 JSON（无该键）反序列化行为不变，非增量路径完全忽略。
     deleted: list[str] = Field(default_factory=list, description="要从基线删除的相对路径")
+
+    @model_validator(mode="after")
+    def _check_python_syntax(self) -> CodeBundle:
+        """对 ``.py`` 文件做语法预检（v1.2 T5.1 真跑后新增）。
+
+        **为什么需要**：CodeBundle 的字段都是「合法字符串」，模型写出语法错误的
+        Python 也能通过校验；错误要等沙箱执行 ``pytest`` 才暴露 —— 那时一整轮
+        模型调用（含 planner 的 PRD / 架构）已经花掉，评测直接判 fail。
+
+        **实测案例**（2026-10-26，连续两次同一模式）：``@pytest.fixture()`` 之后的
+        ``def`` 多了**一个前导空格**，触发 ``IndentationError: unexpected indent``：
+        - run v12-fastapi-scratch-4：``tests/conftest.py:18``
+        - run v12-fastapi-scratch-5：``tests/test_tasks_api.py:14``
+
+        在此用 ``ast.parse`` 预检，失败即抛错 —— 角色层的重试机制
+        （``runtime._retry_instruction``）会把含文件名与行号的错误详情回喂模型，
+        让它有机会在第二次尝试中自行修正。
+
+        只检查 ``.py``：``.vue`` / ``.js`` / ``.toml`` 等交给模板的结构检查与沙箱。
+        """
+        problems: list[str] = []
+        for item in self.files:
+            if not item.path.endswith(".py"):
+                continue
+            try:
+                ast.parse(item.content, filename=item.path)
+            except SyntaxError as exc:
+                snippet = (exc.text or "").strip()[:60]
+                problems.append(f"{item.path}:{exc.lineno} {exc.msg}（该行内容：`{snippet}`）")
+        if problems:
+            raise ValueError(
+                "Python 语法错误，请逐处修正后重新输出**完整** JSON："
+                + " | ".join(problems[:5])
+            )
+        return self
 
 
 # ------------------------------------------------------- 模板结构规则（v1.2，docs/09 §4.1.1）
