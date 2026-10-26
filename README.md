@@ -55,25 +55,36 @@ v1.0（面试旗舰 MVP）总验收目标：全链路浏览器可跑 / 驳回回
 
 当前测试基线 **439 passed**（302 → 384 → 404 → 410 → 437 → 439 递增，全部 mock LLM、0 费用）＋ 前端 vitest **33**。设计与任务分解见 `docs/07-增量设计与任务列表-v1.1.md`；**验收结论见 `docs/08-验收报告-v1.1.md`**。
 
-### v1.1 基准表（benchmark-12 · 部分执行）
+### v1.1 基准表（benchmark-12 · **12 任务全量**）
 
 > 环境：Windows 11 / Python 3.12 / Docker `ymir-sandbox:latest`（pytest 8.4.2 + ruff 0.6.9 预置，`network=none`）
 > 模型：planner=`deepseek-reasoner` / executor=`deepseek-chat`，**judge 关闭**（`--no-judge`）
-> 批次 `20261021-b`｜跑分时间 2026-10-21T06:30Z｜流水线 software-dev v1.1 / 套件 benchmark-12 v1.1
+> 批次 `20261026-1`｜跑分时间 2026-10-26T02:35Z｜流水线 software-dev v1.1 / 套件 benchmark-12 v1.1
 
 | 任务 | 场景 | 首轮 | 修复后 | 最终通过 | 修复轮次 | 成本(¥) | 时长(s) |
 |---|---|---|---|---|---|---|---|
-| task-rest-crud-01 | REST CRUD | 47.6 ❌ | **97.2** | ✅ | 2 | 0.3297 | 132.7 |
-| task-cli-notes-02 | CLI 工具 | 96.7 ✅ | 96.7 | ✅ | 0 | 0.3138 | 123.5 |
-| task-data-clean-03 | 数据清洗 | 69.3 ❌ | **97.2** | ✅ | 1 | 0.2393 | 103.6 |
+| task-rest-crud-01 | REST CRUD | 93.3 ✅ | 93.3 | ✅ | 0 | 0.2418 | 122.9 |
+| task-cli-notes-02 | CLI 工具 | 97.7 ✅ | 97.7 | ✅ | 0 | 0.2860 | 135.7 |
+| task-data-clean-03 | 数据清洗 | 68.2 ❌ | 66.0 | ❌ | 2 | 0.3431 | 165.0 |
+| task-file-batch-04 | 文件批处理 | 46.0 ❌ | 65.7 | ❌ | 2 | 0.3568 | 208.7 |
+| task-parse-html-05 | HTML 解析 | 70.7 ❌ | **91.2** | ✅ | 2 | 0.2539 | 139.0 |
+| task-algo-lru-06 | 算法库 | 97.2 ✅ | 97.2 | ✅ | 0 | 0.1604 | 74.9 |
+| task-config-ini-07 | 配置解析 | 57.6 ❌ | **97.7** | ✅ | 2 | 0.4287 | 221.3 |
+| task-text-wordcount-08 | 文本处理 | 72.7 ❌ | **98.0** | ✅ | 2 | 0.2929 | 151.1 |
+| task-state-order-09 | 状态机 | 97.2 ✅ | 97.2 | ✅ | 0 | 0.1693 | 76.5 |
+| task-validator-form-10 | 表单校验 | 98.4 ✅ | 98.4 | ✅ | 0 | 0.1743 | 81.8 |
+| task-sql-query-11 | SQL 查询 | 97.2 ✅ | 97.2 | ✅ | 0 | 0.2279 | 101.0 |
+| task-json-transform-12 | JSON 转换 | 90.5 ✅ | 90.5 | ✅ | 0 | 0.3021 | 146.9 |
 
-- 执行 3 / 跳过 9（`limit=3` 部分执行）：**首轮通过率 33.3%（1/3）→ 最终通过率 100.0%（3/3）**；实测成本 **¥0.8828**；评分来源 pipeline 3 / fallback 0。
-- 第一行是自愈回环的典型样本：47.6 未达双门槛 → 定向修复 2 轮 → 97.2（失败检查定向回灌 + 上一版产物注入）。
-- 复现（需 Docker 与 `.env` 密钥；judge 关闭，成本仅来自四角色模型调用，3 任务约 ¥0.9）：
+- **12 任务全量**：首轮通过率 **58.3%（7/12）→ 最终通过率 83.3%（10/12）**；实测成本 **¥3.2370**（均价 ¥0.27/任务）；评分来源 pipeline 12 / fallback 0。
+- **自愈回环贡献 +25 个百分点**：`parse-html-05`（70.7→91.2）、`config-ini-07`（57.6→97.7）、`text-wordcount-08`（72.7→98.0）三个任务首轮未达双门槛，经 2 轮定向修复后转为通过。
+- 两个未通过任务（`data-clean-03`、`file-batch-04`）失败分类均为「检查失败」——沙箱内 `pytest` 存在失败用例；修复后分数虽升至 66.0 / 65.7，仍未达 `total≥75 ∧ runnability≥60` 双门槛。
+- **与旧表不可逐题对比**：上一版是批次 `20261021-b` 的 3 任务部分执行，且本轮 `max_tokens` 由 8192 提高到 planner 32768 / executor 16384（v1.2 修复），生成质量基线已变。本表取代旧表作为 v1.2 的正式基线。
+- 复现（需 Docker 与 `.env` 密钥；judge 关闭，12 任务约 ¥3.2）：
 
 ```bash
 docker build -f docker/sandbox.Dockerfile -t ymir-sandbox:latest .
-uv run python scripts/run_benchmark.py --suite benchmark-12 --limit 3 --no-judge
+uv run python scripts/run_benchmark.py --suite benchmark-12 --no-judge
 ```
 
 - 零费用复现（对已有产物做确定性评测，不发起 run、不调模型）：
