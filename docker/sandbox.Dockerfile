@@ -28,9 +28,15 @@ FROM python:3.12-slim
 # 可覆盖的 PyPI 索引（构建期参数，不写死在层里）
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
+# 网络容错（2026-10-26）：本机经 VPN 到镜像源速率不稳，单包下载偶发超时会让
+# pip 放弃 wheel 回退到源码构建 —— greenlet 是 C 扩展，slim 镜像无 gcc，
+# 于是报 "Failed building wheel for greenlet"。实测单独装 greenlet 只需 1 秒
+# （3.5.6 有 cp312 manylinux wheel），dry-run 解析也正常，所以这不是版本问题，
+# 是传输稳定性问题。对策：加大 retries/timeout + 把 greenlet 前置单独安装。
 RUN pip config set global.index-url "${PIP_INDEX_URL}" \
-    && pip install --no-cache-dir "pytest>=8.2,<9" pytest-cov httpx pydantic "ruff>=0.6,<0.7" \
-    && pip install --no-cache-dir "fastapi>=0.115" "uvicorn>=0.30" "sqlalchemy[asyncio]>=2.0" "aiosqlite>=0.20" "alembic>=1.13" "pytest-asyncio>=0.23,<1"
+    && pip install --no-cache-dir --retries 10 --timeout 120 "pytest>=8.2,<9" pytest-cov httpx pydantic "ruff>=0.6,<0.7" \
+    && pip install --no-cache-dir --retries 10 --timeout 120 "greenlet>=3.5,<4" \
+    && pip install --no-cache-dir --retries 10 --timeout 120 "fastapi>=0.115" "uvicorn>=0.30" "sqlalchemy[asyncio]>=2.0" "aiosqlite>=0.20" "alembic>=1.13" "pytest-asyncio>=0.23,<1"
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
