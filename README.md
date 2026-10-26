@@ -111,7 +111,9 @@ cd web && npx vitest run && npm run build       # 63 passed / 12 files
 > `fastapi-vue3 × 从零` 达 **`conditional`** —— 沙箱内 `pytest` **20 passed**、后端需求 R-1~R-6 全覆盖；
 > `python-cli × 从零` 与两个**增量**场景为 **`fail`**，原因都是**模型生成代码的缺陷**
 > （未处理 argparse 错误路径 / 重写 `tests/conftest.py` 破坏既有测试），**不是模板或合并机制的问题**。
-> 推送真推（`base_tree` 契约）与 12 任务全量基线**尚未覆盖**。
+> **推送链路已端到端验证**（2026-10-26，测试仓库 `Eeyore104/ymir-export-test`）：dry-run 与真推均通过，
+> `base_tree` 传 tree sha 未出现 422，`.env` 被拦（`path_blacklist`）、`.env.example` 已推、分支保护生效。
+> 12 任务全量基线**尚未执行**。
 > 完整数据（每轮 token/成本/耗时/verdict）见 `docs/09` §15；限制说明见 `docs/04` §10.4。
 
 ## 架构一览
