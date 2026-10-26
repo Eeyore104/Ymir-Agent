@@ -107,8 +107,12 @@ uv run python scripts/check_import_graph.py     # 分层护栏 PASS
 cd web && npx vitest run && npm run build       # 63 passed / 12 files
 ```
 
-> **待补**：模板**端到端真跑**（2 模板 × 从零 / 增量，benchmark 式基线）因开发环境 Docker 未启动**尚未执行**，
-> 上述 720 条为单元/集成用例。限制与补跑口径见 `docs/04-使用手册.md` §10.4。
+> **模板端到端真跑（2026-10-26 已执行 11 次，¥3.40 / 743,959 tokens）**：
+> `fastapi-vue3 × 从零` 达 **`conditional`** —— 沙箱内 `pytest` **20 passed**、后端需求 R-1~R-6 全覆盖；
+> `python-cli × 从零` 与两个**增量**场景为 **`fail`**，原因都是**模型生成代码的缺陷**
+> （未处理 argparse 错误路径 / 重写 `tests/conftest.py` 破坏既有测试），**不是模板或合并机制的问题**。
+> 推送真推（`base_tree` 契约）与 12 任务全量基线**尚未覆盖**。
+> 完整数据（每轮 token/成本/耗时/verdict）见 `docs/09` §15；限制说明见 `docs/04` §10.4。
 
 ## 架构一览
 
