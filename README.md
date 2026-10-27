@@ -20,7 +20,7 @@ v1.1 起再加一层：**评测不达标会自动回边返工**——失败检�
 - **四维评测体系**（差异化核心）：`需求符合度 / 可运行率 / 规范符合度 / 架构合理性` 加权总分 + **双门槛**（总分 ≥ 75 且可运行率 ≥ 60）+ **逐分证据链**，报告作为一等产物可版本 diff；批量跑分输出「性价比榜单」（total_score vs cost）。
 - **声明式自愈回环（v1.1）**：评测裁决 `fail` → 自动作废 coding/evaluation 的 completed 执行并回边重跑；失败检查命令 + 错误摘要 + **上一版产物**定向注入工程师提示词（不回灌全量日志，受 `max_detail_chars` 预算约束）；轮次上限 + 单 run 预算**fail-closed** 预检；耗尽后支持 `accept-best` / `extend-repair` / `cancel` 三动作人工介入。
 - **评测任务绑定与基准套件（v1.1）**：套件支持 `single` / `per_task` 两种绑定模式；`per_task` 下每个基准任务绑定自己的项目产物，未绑定或产物缺失**零成本跳过**（不启沙箱、不调 judge），跨项目零取材；内置 `benchmark-12`（12 任务 / 12 场景 / 执行型检查）。
-- **模板约束注入（v1.2）**：垂直模板以声明式 YAML 定义技术栈 / 目录规范 / 规范文件集 / 依赖白名单 / 检查命令，并携带 3–5 个**骨架文件**（`pyproject.toml` / `ruff.toml` / `requirements.txt` / `app/main.py` / `.env.example`）；约束同时注入四角色提示词并驱动评测检查口径，两套模板：`fastapi-vue3` + `python-cli`。
+- **模板约束注入（v1.2 / v1.3）**：垂直模板以声明式 YAML 定义技术栈 / 目录规范 / 规范文件集 / 依赖白名单 / 检查命令，并携带 3–5 个**骨架文件**（`pyproject.toml` / `ruff.toml` / `requirements.txt` / `app/main.py` / `.env.example`）；约束同时注入四角色提示词并驱动评测检查口径。**v1.3 起四套模板**：`fastapi-vue3`（全栈）/ `python-cli`（脚本）/ `data-pipeline`（数据）/ `node-express`（Node 服务端）。
 - **增量合入与安全推送（v1.2）**：上传基线 → 只产出新增/修改（`noop` 自动丢弃）→ 「基线 ⊕ 补丁」合并树评测 → 跨产物 diff 人审 → GitHub 推送（Git Data API 单 commit、dry-run 前置、密钥双层过滤、默认推新分支）。
 
 ## 项目进度
@@ -136,17 +136,31 @@ cd web && npx vitest run && npm run build       # 63 passed / 12 files
 > （同一 run 可一过一不过），正式口径仍取确定性版。
 > 完整数据（每轮 token/成本/耗时/verdict）见 `docs/09` §15；限制说明见 `docs/04` §10.4。
 
-### v1.3（规划中，待评审）：增量质量硬化 + 前端构建校验 + 模板库扩充
+### v1.3（已验收）：增量质量硬化 + 模板库扩充 + 工程化收口
 
 v1.2 真跑暴露的核心问题：**模型在增量模式下会重写 `tests/conftest.py`，导致基线既有测试集体失效**——场景 ②③ 双双复现，补了三段提示词约束后**仍然复现**。这说明它不是提示词问题，而是缺少服务端硬约束。
 
 | 主线 | 解决什么 |
 |---|---|
-| **增量质量硬化** | 受保护路径（`reject` / `ignore` 双策略）+ 基线测试独立执行（分离「谁弄坏的」）+ 改动面告警 |
-| **前端构建校验** | 沙箱镜像加 Node 20 + 离线依赖缓存，`fastapi-vue3` 前端从「结构静态检查」升级为「真的能 build」 |
-| **模板库扩充** | 2 套 → 4 套（建议新增 `data-pipeline` + `node-express`，与既有全栈 / CLI 形成四象限） |
+| **增量质量硬化** | 受保护路径（`reject` / `ignore` 双策略 + 1 次定向重试 + 兜底不报废）+ 基线测试独立执行（分离「谁弄坏的」）+ 改动面告警 |
+| **模板库扩充** | 2 套 → **4 套**（见下表），与既有全栈 / CLI 形成四象限 |
+| **前端构建校验** | 沙箱镜像加 Node 20 + 离线依赖池（`/opt/fe-baseline`、`/opt/node-baseline`），`fastapi-vue3` 前端从「结构静态检查」升级为**真的能 build**（`fe-build web`，断网可执行、阻断项） |
+| **工程化收口** | 单跑与批量**同一装配点**（`evaluation/run_task.py`，口径一致性有容差 0 的用例）、CI 周检沙箱镜像可构建 |
 
-设计与任务分解见 **`docs/11-增量设计与任务列表-v1.3.md`**（3 条主线 / 4 组任务 / 18 个子任务 / 4 项待拍板）。
+**四套模板（`config/templates/*.yaml`）**
+
+| 模板 | 场景 | 语言 / 栈 | 骨架（reserved / seed） | 检查命令 |
+|---|---|---|---|---|
+| `fastapi-vue3` | 全栈 Web（后端真执行 + 前端静态检查 **+ 真构建**） | python / FastAPI + Vue3 | 5：`pyproject.toml`、`ruff.toml`、`.env.example`（reserved）/ `requirements.txt`、`app/main.py`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "from app.main import app"` / **`fe-build web`** |
+| `python-cli` | 命令行工具 / 自动化脚本 | python / 标准库或 typer | 4：`pyproject.toml`、`ruff.toml`（reserved）/ `ymir_cli/__init__.py`、`requirements.txt`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "import ymir_cli"` |
+| `data-pipeline` | 数据清洗 / ETL / 定时任务 | python / pandas（镜像已预装） | 4：`pyproject.toml`、`ruff.toml`（reserved）/ `pipeline/__init__.py`、`requirements.txt`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "import pipeline"` / `python -c "import pandas"` |
+| `node-express` | 单服务端 Node 服务 | typescript / Express + TS | 5：`package.json`、`tsconfig.json`、`.env.example`（reserved）/ `src/index.ts`、`src/app.ts`（seed） | `node-build .` / `node --test dist` / `npx tsc --noEmit`（均声明 `requires`，工具缺失则**跳过不扣分**） |
+
+> **镜像边界（v1.3 已就位）**：`pandas` 2.3.3 / `numpy` 2.5.4 与 node 20 工具链（node / npm / npx）已预装，两个离线依赖池在**构建期**用 `npm ci` 生成；`SANDBOX_IMAGE_PACKAGES` / `SANDBOX_IMAGE_NODE_PACKAGES` 与 `docker/sandbox.Dockerfile` **同一 PR** 扩表（B14）。断网下 `fe-build web` 走「`npm ci --offline` → 回退基线 `node_modules`」两条路径，均退出 0 并产出 `dist/`。
+>
+> **口径断点（v1.2 → v1.3）**：`fastapi-vue3` 启用**分组配分**（backend 10 / frontend_static 10 / frontend_build 10，折算总分 10/10/10），另三套模板与无模板路径仍是 v1.2 老口径；同时修掉了"`allowed_prefixes` 把模板自己的根级文件判越界"的旧规则。**因此 v1.3 的基线分数不能与 v1.2 直接横比**（详见 `docs/04` §11.6/§11.7）。
+
+设计与任务分解见 **`docs/11-增量设计与任务列表-v1.3.md`**。
 
 ## 架构一览
 
@@ -355,7 +369,8 @@ ymir-agent/
 | `docs/08-验收报告-v1.1.md` | v1.1 版本验收报告（验收线 / 质量数据 / 真跑基线 / 缺陷与缺口台账 / 遗留） |
 | `docs/09-增量设计与任务列表-v1.2.md` | v1.2 实施口径与任务分解（模板库 / 增量 patch / GitHub 推送，T1.1–T5.3）；**§15 为 T5.1 真跑验收记录**（四场景 verdict、成本表、5 个缺陷、12 任务基线 + judge 对比、已知限制） |
 | `docs/10-验收报告-v1.2.md` | **v1.2 版本验收报告**（结论 / 12 条验收线 / 质量数据 / 双口径基线 / 四场景真跑 / 5 个缺陷 / 已知限制 / 交付物） |
-| `docs/11-增量设计与任务列表-v1.3.md` | **v1.3 规划（待评审）**：增量质量硬化 + 前端构建校验 + 模板库扩充，18 个子任务 / 4 项待拍板 |
+| `docs/11-增量设计与任务列表-v1.3.md` | **v1.3 设计与实施记录**：增量质量硬化 + 前端构建校验 + 模板库扩充，18 个子任务；**§7 实施设计、§8 as-built（19 条偏离）** |
+| `docs/12-验收报告-v1.3.md` | **v1.3 版本验收报告**（结论 / 14 条验收线 / 质量数据 / 镜像与断网构建 / 分数口径断点 / F1–F9 缺陷台账 / L1–L8 已知限制 / 遗留） |
 
 ## License
 

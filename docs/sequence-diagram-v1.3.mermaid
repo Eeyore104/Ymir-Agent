@@ -1,0 +1,59 @@
+%% ymir-agent v1.3 时序图：① 受保护路径三段式（T1.1）与 ② 基线独立执行（T1.2）
+
+sequenceDiagram
+    autonumber
+    participant E as OrchestrationEngine
+    participant RE as RoleStageExecutor
+    participant RT as RoleRuntime
+    participant MG as merge_trees_纯函数
+    participant ST as ArtifactStore
+    participant HS as EvaluationHarness
+    participant PB as probe_baseline
+    participant SB as SandboxSession
+    participant GT as HarnessEvaluationGate
+
+    Note over E,RE: ① T1.1 受保护路径（reject → 1 次定向重试 → 兜底 ignore）
+    E->>RE: execute(run, stage=engineer, attempt=1)
+    RE->>RE: _load_template_spec(run) → spec.protected / scoring
+    RE->>ST: _load_baseline(run) → base_files
+    RE->>RT: execute(engineer, stage_input)
+    RT-->>RE: StageOutput(files=模型输出)
+    RE->>MG: merge_trees(base, patch, mode="patch", protected_paths, on_protected_hit="reject")
+    MG-->>RE: raise ProtectedPathConflict(paths=["tests/conftest.py"])
+    Note right of RE: 成本照记：首轮 tokens/cost 累加到最终 StageOutput
+    RE->>RT: execute(engineer, replace(stage_input, feedback=[受保护清单+替代方案], attempt=2))
+    RT-->>RE: StageOutput(修订后)
+    RE->>MG: merge_trees(..., on_protected_hit="reject")（第二次）
+    alt 第二次不再命中
+        MG-->>RE: MergeResult（正常合入）
+    else 仍然命中（模型撞墙第 2 次）
+        MG-->>RE: raise ProtectedPathConflict(paths=[...])
+        RE->>MG: merge_trees(..., on_protected_hit="ignore")（零成本兜底，纯函数）
+        MG-->>RE: MergeResult + warnings=["protected_path_forced_ignore:1"] + conflicts[reason=protected_path]
+        Note right of RE: 阶段继续，不整轮失败（T5.1 ②）
+    end
+    RE->>RE: payload["patch"] += {change_ratio, warnings, protected_hits, protected_retry}
+    RE->>ST: save(artifact, files=changed_paths + patch_manifest.json)
+    RE-->>E: StageOutcome
+
+    Note over E,GT: ② T1.2 基线独立执行 + 回归分类
+    E->>GT: evaluate(run, stage=evaluation, attempt=1)
+    GT->>GT: build_task_for_run(run)（唯一装配点：模板 checks / layout / scoring / baseline_ref）
+    GT->>HS: evaluate_task(task, project_id, suite)
+    HS->>ST: _load_task(...) → workdir + base_files（基线正文）
+    HS->>PB: probe_baseline(files=base_files, checks=task.checks, provider)
+    PB->>PB: cache.get(sha256(base_hash + checks_fingerprint)) → miss
+    PB->>SB: 独立会话：写入基线文件
+    PB->>SB: exec(每条 check)（不跑 judge、不跑另外三维）
+    SB-->>PB: exit_code / timed_out / output
+    PB->>PB: 全部通过 → healthy（否则 unhealthy；环境缺失 → skipped）
+    PB-->>HS: BaselineProbe(status, checks, duration_ms)
+    HS->>SB: 主会话：写入合并树 workdir
+    HS->>HS: 四维评估并行（runnability 用 run_checks + 分组配分）
+    HS->>HS: regression = (probe=healthy) and 任一 CheckRun.failed
+    HS->>HS: blocking_failed = [blocking 且 failed 的命令]
+    HS-->>GT: TaskOut(+baseline_runnability / regression / blocking_failed / skipped_checks)
+    GT->>GT: _to_verdict：baseline 不健康 → unknown(baseline_unhealthy, 不阻断)
+    GT->>GT: blocking_failed 非空 → fail(check_failed)（Q4）
+    GT->>ST: save(name="eval_verdict", files=report)
+    GT-->>E: EvalVerdict（orchestrator 只认这份不可变快照）

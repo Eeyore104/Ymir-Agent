@@ -1,0 +1,237 @@
+%% ymir-agent v1.3 类图（只画相对 v1.2 的增量与受影响类；基线类见 class-diagram-v1.2.mermaid）
+%% 上层包（rank 1）在上、内层（rank 5）在下；跨层只传纯数据。
+
+classDiagram
+    direction TB
+
+    %% ---------------- templates（rank 2） ----------------
+    class ProtectedSpec {
+        +list~str~ paths
+        +str on_hit = reject
+        +float max_change_ratio = 0.5
+    }
+    class ScoringSpec {
+        +dict~str,float~ runnability_points
+        +bool frontend_scored_in_runnability = false
+    }
+    class CheckSpec {
+        +str type = command
+        +str run
+        +float weight = 1.0
+        +str group
+        +bool blocking = false
+        +str requires
+        +float timeout_s = null
+    }
+    class TemplateSpec {
+        +str id
+        +StackSpec stack
+        +LayoutSpec layout
+        +ProtectedSpec protected
+        +ScoringSpec scoring
+        +list~CheckSpec~ checks
+        +protected_paths() frozenset
+        +to_layout_rules() LayoutRules
+        +to_scoring_rules() ScoringRules
+    }
+    class Loader {
+        +load_template(id) TemplateSpec
+        +list_templates() list~TemplateEntry~
+        +check_reserved_subset()
+        +_validate(spec, stem, known_roles) TemplateSpec
+    }
+
+    %% ---------------- common（rank 5，纯数据合同） ----------------
+    class LayoutRules {
+        +list~str~ required_dirs
+        +FrontendRules frontend
+    }
+    class ScoringRules {
+        +dict~str,float~ runnability_points
+        +bool frontend_scored_in_runnability
+        +enabled() bool
+    }
+    class EvalVerdict {
+        +str status
+        +str failure_class
+        +bool degraded
+        +str reason
+    }
+
+    %% ---------------- artifacts（rank 3，纯函数 + 异常） ----------------
+    class MergeResult {
+        +dict~str,str~ files
+        +PatchManifest manifest
+        +manifest_json() str
+    }
+    class PatchManifest {
+        +str mode
+        +str base_content_hash
+        +PatchCounts counts
+        +list~str~ changed_paths
+        +list~ManifestConflict~ conflicts
+        +float change_ratio
+        +list~str~ warnings
+    }
+    class PatchCounts {
+        +int added
+        +int modified
+        +int deleted
+        +int skeleton_added
+        +int protected_hits
+    }
+    class ProtectedPathConflict {
+        +tuple~str~ paths
+        +str reason = protected_path
+    }
+    class Merge {
+        <<module>>
+        +detect_protected_hits(patch, protected) tuple
+        +compute_change_ratio(changed, base_count) float
+        +merge_trees(..., protected_paths, on_protected_hit, max_change_ratio) MergeResult
+    }
+
+    %% ---------------- evaluation（rank 1） ----------------
+    class EvalCheck {
+        +str type
+        +str run
+        +float weight
+        +str group
+        +bool blocking
+        +str requires
+        +float timeout_s
+    }
+    class CheckRun {
+        +str command
+        +str group
+        +str status
+        +int exit_code
+        +bool timed_out
+        +bool blocking
+        +str skipped_reason
+        +str output
+    }
+    class EvalTask {
+        +list~EvalCheck~ checks
+        +ScoringRules scoring
+        +frozenset changed_paths
+        +dict baseline_ref
+        +LayoutRules layout
+    }
+    class EvalContext {
+        +EvalTask task
+        +dict workdir
+        +LayoutRules layout
+        +ScoringRules scoring
+    }
+    class EvalScore {
+        +str name
+        +float score
+        +list~CheckRun~ check_runs
+        +bool degraded
+    }
+    class RunnabilityEvaluator {
+        +evaluate(ctx) EvalScore
+    }
+    class ConventionEvaluator {
+        +evaluate(ctx) EvalScore
+        +_template_structure_component(ctx)
+    }
+    class BaselineProbe {
+        +str status
+        +float score
+        +tuple checks
+        +str reason
+        +bool cached
+    }
+    class BaselineProbeCache {
+        -dict _entries
+        +get(key) BaselineProbe
+        +put(key, probe)
+    }
+    class Probe {
+        <<module baseline_probe>>
+        +probe_baseline(files, checks, provider, ...) BaselineProbe
+    }
+    class RunTask {
+        <<module run_task>>
+        +build_task_for_run(run, ...) tuple
+        +evaluate_run(harness, run, ...) TaskOut
+    }
+    class TaskOut {
+        +str id
+        +float total_score
+        +float runnability
+        +bool passed
+        +BaselineProbeOut baseline_runnability
+        +bool regression
+        +list~str~ blocking_failed
+        +list~SkippedCheckOut~ skipped_checks
+        +list~str~ warnings
+    }
+    class EvaluationHarness {
+        +evaluate_task(task, project_id, ...) TaskOut
+        -_load_task(...) tuple
+    }
+    class HarnessEvaluationGate {
+        +evaluate(run, stage, attempt) EvalVerdict
+        -_to_verdict(suite, outcome, round) EvalVerdict
+    }
+    class BenchmarkRunner {
+        +run(options) BenchmarkState
+        -_score(...) dict
+        -_row_from_fallback(...) dict
+    }
+    class ClassifyFailure {
+        <<module function>>
+        +classify_failure(signals) tuple
+    }
+    class FailureSignals {
+        +bool has_code_artifact
+        +str baseline_status
+        +bool regression
+        +list~str~ blocking_failed
+    }
+
+    %% ---------------- orchestrator（rank 1） ----------------
+    class RoleStageExecutor {
+        +execute(run, stage, attempt) StageOutcome
+        -_apply_patch_contract(...) MergeResult
+        -_execute_with_patch_contract(...) tuple
+    }
+    class TemplateContext {
+        +frozenset protected_paths
+        +float change_ratio_threshold
+    }
+
+    %% ---------------- 关系 ----------------
+    TemplateSpec *-- ProtectedSpec
+    TemplateSpec *-- ScoringSpec
+    TemplateSpec *-- "0..n" CheckSpec
+    TemplateSpec ..> ScoringRules : to_scoring_rules()
+    TemplateSpec ..> LayoutRules : to_layout_rules()
+    Loader ..> TemplateSpec : 21 条校验
+    Merge ..> MergeResult
+    MergeResult *-- PatchManifest
+    PatchManifest *-- PatchCounts
+    Merge ..> ProtectedPathConflict : on_hit=reject
+    RoleStageExecutor ..> Merge : 调用纯函数
+    RoleStageExecutor ..> ProtectedPathConflict : 捕获→重试
+    RoleStageExecutor ..> TemplateContext
+    EvalTask *-- EvalCheck
+    EvalTask *-- ScoringRules
+    EvalContext --> EvalTask
+    RunnabilityEvaluator ..> CheckRun
+    RunnabilityEvaluator ..> ScoringRules : 分组配分
+    ConventionEvaluator ..> ScoringRules : 跳过前端规则
+    EvalScore *-- CheckRun
+    EvaluationHarness ..> Probe : baseline_ref 存在时
+    Probe ..> BaselineProbe
+    BaselineProbeCache ..> BaselineProbe
+    EvaluationHarness ..> TaskOut
+    TaskOut *-- BaselineProbe
+    HarnessEvaluationGate ..> RunTask : 唯一装配点
+    BenchmarkRunner ..> RunTask
+    HarnessEvaluationGate ..> EvalVerdict
+    BenchmarkRunner ..> ClassifyFailure
+    ClassifyFailure --> FailureSignals
