@@ -151,7 +151,7 @@ v1.2 真跑暴露的核心问题：**模型在增量模式下会重写 `tests/co
 
 | 模板 | 场景 | 语言 / 栈 | 骨架（reserved / seed） | 检查命令 |
 |---|---|---|---|---|
-| `fastapi-vue3` | 全栈 Web（后端真执行 + 前端静态检查 **+ 真构建**） | python / FastAPI + Vue3 | 5：`pyproject.toml`、`ruff.toml`、`.env.example`（reserved）/ `requirements.txt`、`app/main.py`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "from app.main import app"` / **`fe-build web`** |
+| `fastapi-vue3` | 全栈 Web（后端真执行 + 前端静态检查 **+ 真构建**） | python / FastAPI + Vue3 | 5：`pyproject.toml`、`ruff.toml`、`.env.example`（reserved）/ `requirements.txt`、`app/main.py`（seed） | `compileall` / `pytest` / **`ruff check --ignore B008 .`** / `python -c "from app.main import app"` / **`fe-build web`**（阻断项） |
 | `python-cli` | 命令行工具 / 自动化脚本 | python / 标准库或 typer | 4：`pyproject.toml`、`ruff.toml`（reserved）/ `ymir_cli/__init__.py`、`requirements.txt`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "import ymir_cli"` |
 | `data-pipeline` | 数据清洗 / ETL / 定时任务 | python / pandas（镜像已预装） | 4：`pyproject.toml`、`ruff.toml`（reserved）/ `pipeline/__init__.py`、`requirements.txt`（seed） | `compileall` / `pytest` / `ruff check .` / `python -c "import pipeline"` / `python -c "import pandas"` |
 | `node-express` | 单服务端 Node 服务 | typescript / Express + TS | 5：`package.json`、`tsconfig.json`、`.env.example`（reserved）/ `src/index.ts`、`src/app.ts`（seed） | `node-build .` / `node --test dist` / `npx tsc --noEmit`（均声明 `requires`，工具缺失则**跳过不扣分**） |
@@ -160,7 +160,27 @@ v1.2 真跑暴露的核心问题：**模型在增量模式下会重写 `tests/co
 >
 > **口径断点（v1.2 → v1.3）**：`fastapi-vue3` 启用**分组配分**（backend 10 / frontend_static 10 / frontend_build 10，折算总分 10/10/10），另三套模板与无模板路径仍是 v1.2 老口径；同时修掉了"`allowed_prefixes` 把模板自己的根级文件判越界"的旧规则。**因此 v1.3 的基线分数不能与 v1.2 直接横比**（详见 `docs/04` §11.6/§11.7）。
 
-设计与任务分解见 **`docs/11-增量设计与任务列表-v1.3.md`**。
+> **B008 为何要豁免**：`B008`（禁止函数调用作参数默认值）与 FastAPI 的依赖注入写法 `db: Session = Depends(get_db)` 天然冲突。模板做了**两层**修复——骨架 `ruff.toml` 加 `ignore = ["B008"]`（管 `from_scratch` 与缺配置的基线）、检查命令加 `--ignore B008`（管「基线自带旧配置」；`merge_trees` 的骨架优先级是「基线已有该路径 ⇒ 骨架不参与」）。实测只放过 B008 一条，`F401`/`UP035`/`SIM108` 等照常生效。
+
+### v1.3 验收结果
+
+| 项 | v1.2 | v1.3 |
+|---|---|---|
+| 后端测试 | 724 | **823** |
+| 前端测试 | 63 | **68** |
+| 模板库 | 2 套 | **4 套**（全部通过 21 条加载期校验） |
+| 沙箱镜像 | 326 MB | **968 MB**（+642 MB；断网 `fe-build` 主路径 4 s） |
+| 失败分类 | 6 类 | **8 类**（+`regression` / +`baseline_unhealthy`） |
+
+**真跑验收**：4 次真实模型 + 真实 Docker 沙箱，累计 ¥1.52（证据归档在 `data/v13/`，不入库）。T1.2 的回归归因在 `python-cli` 上完整达成（基线 healthy → 合并树回归 → `failure_class="regression"`）。
+
+**三条如实标注的能力边界**（详见 `docs/12` §7 的 L1–L9）：
+
+1. **受保护路径真跑未被触发** —— 4 次运行模型都没改 `tests/conftest.py`，该能力目前仅由 38 条单测证明；且真跑显示**保护面窄于破坏面**（模型改既有业务入口 `ymir_cli/cli.py` 同样能破坏 24 个用例）
+2. **T1.2 对存量产物结构性失效（L9）** —— 探针用**当前模板的 checks** 度量基线，而基线可能是旧模板产物；`baseline_status=unhealthy` ⇒ gate `unknown` ⇒ `regression` 永不触发。该能力只在「v1.3 新生成的健康基线」上有效
+3. **增量模式 QA verdict 失真（L8/F9）** —— QA 只看得到增量产物、看不到基线文件，会把「基线里本来就有的文件」判成缺失
+
+设计与任务分解见 **`docs/11-增量设计与任务列表-v1.3.md`**，验收结论与已知限制见 **`docs/12-验收报告-v1.3.md`**。
 
 ## 架构一览
 
