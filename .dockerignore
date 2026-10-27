@@ -20,7 +20,7 @@
 .pytest_cache
 .ruff_cache
 
-# 前端（镜像不含 Node，v1.3 才有前端构建变体）
+# 前端（仓库自带的 web/ 与 node_modules/ 不进镜像；镜像自带离线依赖池，见下）
 web
 node_modules
 
@@ -43,3 +43,18 @@ docker-compose.yml
 *.log
 *.tmp
 .DS_Store
+
+# ---------------------------------------------------------------------------
+# v1.3 构建资产白名单（**只放开这三处**，其余 docker/ 内容不进上下文）
+#
+# 沙箱镜像要 COPY 它们：两个离线依赖池（构建期 npm ci）+ 两个构建脚本。
+# 顺序很重要：Docker 以「最后匹配的规则」为准，因此这三条必须在所有忽略规则之后。
+# 反例（禁止）：不要把 web/ 或任意 node_modules/ 放开 —— 依赖由镜像内 /opt/*-baseline
+# 在构建期生成，把本地 node_modules 塞进上下文只会让构建慢几十秒且平台不匹配。
+# ---------------------------------------------------------------------------
+!docker/bin
+!docker/bin/**
+!docker/fe-baseline
+!docker/fe-baseline/**
+!docker/node-baseline
+!docker/node-baseline/**

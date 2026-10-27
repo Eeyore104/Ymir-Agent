@@ -43,6 +43,16 @@ conventions:
   - { path: README.md, required: true }
   - { path: .gitignore, required: true }
 
+# 受保护路径（v1.3 T1.1，docs/11 §7.2.6）：增量模式下基线自带的测试基础设施
+# 不可被静默覆盖 —— 两次实测都是"模型重写 tests/conftest.py ⇒ 基线既有用例集体失效"。
+# on_hit=reject（Q1 定案 A）：命中即抛 ProtectedPathConflict（1003/409），
+# 编排层随后做「1 次定向重试 + 兜底 ignore」，整轮不报废。
+protected:
+  paths:
+    - tests/conftest.py
+  on_hit: reject
+  max_change_ratio: 0.5
+
 skeleton:
   max_files: 5
   max_bytes: 32768
@@ -64,6 +74,14 @@ skeleton:
 
         [lint]
         select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
+        # FastAPI 的依赖注入写法是 `x: T = Depends(...)`，与 B008（禁止函数调用作
+        # 参数默认值）天然冲突；业界通行做法是在 FastAPI 项目里忽略 B008，
+        # 否则**任何**合规代码都恒被判违规（T5.1 真跑实测：基线 4 条 B008 把基线
+        # 探针判成 unhealthy，导致 regression 归因失效）。
+        # ★ 只忽略 B008：其余规则（含 F401 未使用导入）照常生效。
+        ignore = ["B008"]
+        # 注：本骨架只在"基线没有 ruff.toml"时生效；模板 checks 里的
+        # `ruff check --ignore B008 .` 负责覆盖"基线自带旧配置"的情形（两者互补）。
     - path: requirements.txt
       reserved: false
       content: |
@@ -83,14 +101,52 @@ skeleton:
         APP_ENV=dev
         DATABASE_URL=
 
+# v1.3（T2.3）：checks 分三组（group），配合 scoring 做**分组配分**：
+#   backend         —— Python 四件套（编译 / 测试 / lint / 导入）
+#   frontend_build  —— `fe-build web`：镜像内**离线**构建脚本（npm ci --offline →
+#                      回退 /opt/fe-baseline/node_modules → npm run build）
+# frontend_static 没有 check：由前端结构规则打分（见 evaluation/runnability.py）
+#
+# ★ `blocking: true` 落在构建检查上（Q4）：构建失败 ⇒ `TaskOut.passed=False`
+#   ⇒ verdict 直接 fail，但**分数照算照披露**（报告会写「未通过：阻断项失败」）。
+# ★ `requires: node`：镜像里没有 node 工具链时该检查 `skipped`（**不扣分、不阻断**），
+#   报告标注「前端构建未执行（环境缺失）」—— 绝不因环境缺失把好代码判 fail。
 checks:
-  - { type: command, run: "python -m compileall -q app", weight: 1 }
-  - { type: command, run: "python -m pytest -q", weight: 2 }
-  - { type: command, run: "ruff check .", weight: 1 }
-  - { type: command, run: 'python -c "from app.main import app"', weight: 1 }
+  - { type: command, run: "python -m compileall -q app", weight: 1, group: backend }
+  - { type: command, run: "python -m pytest -q", weight: 2, group: backend }
+  # ★ `--ignore B008` 是**基线无关**的那一半修复（另一半是骨架 ruff.toml 里的 ignore）：
+  #   骨架优先级 1 规定"基线已有该路径 ⇒ 骨架完全不参与"（记 skipped_existing），
+  #   所以当基线**自带** ruff.toml（例如 v1.2 时代生成的既有工程）时，合并树用的是
+  #   基线那份旧配置 —— 只改骨架对这类基线无效。CLI 的 `--ignore` 在 ruff 0.6.9 上是
+  #   **追加**语义（实测：配置里 ignore E501 仍生效），因此这一条对"骨架注入"与
+  #   "基线自带配置"两种形态都生效，且只多忽略 B008 这一条。
+  - { type: command, run: "ruff check --ignore B008 .", weight: 1, group: backend }
+  - { type: command, run: 'python -c "from app.main import app"', weight: 1, group: backend }
+  - type: command
+    run: "fe-build web"
+    weight: 2
+    group: frontend_build
+    blocking: true
+    requires: node
+    timeout_s: 300
+
+# 分组配分（Q3）：runnability 维度内按组计点，合计 30 点 = 该维度满分。
+# ∵ runnability 维度权重 0.30，1 个内点 = 1 个总分点
+# ∴ 前端（静态 10 + 构建 10）占 **总分 20 分**，后端占 **总分 10 分**。
+# ★ 四维权重（30/30/20/20）与双门槛（75/60）**一字未改**。
+scoring:
+  runnability_points:
+    backend: 10
+    frontend_static: 10
+    frontend_build: 10
+  frontend_scored_in_runnability: true
 
 prompting:
   pm: PRD 必须声明后端为 FastAPI、前端为 Vue3，并说明数据持久化方案（SQLAlchemy + SQLite）。
   architect: 设计文档的目录结构必须与模板 layout 一致，不得引入 Django/Flask；前端只做结构设计。
   engineer: 严格遵守模板目录规范；固定提供的文件不要输出；给了最小版本的文件须输出完整版；新增依赖写入 requirements.txt。
-  qa: 证据链须引用模板检查命令的执行输出；前端结论必须标注「静态检查（未构建）」。
+  qa: >-
+    证据链须引用模板检查命令的执行输出；前端要分成两条结论：
+    ①「结构静态检查」看目录/SFC 结构/禁用依赖；②「前端构建」看 `fe-build web` 的退出码
+    与 dist 产物。构建失败属**阻断项**（不可交付）；若构建因环境缺失被跳过，
+    必须标注「前端构建未执行（环境缺失）」，不得据此判代码失败。

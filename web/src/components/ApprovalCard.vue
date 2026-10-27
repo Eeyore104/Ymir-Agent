@@ -7,9 +7,11 @@
     引擎作废该阶段最新完成记录 -> attempt+1 重跑 -> 产物版本递增。
 -->
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
+import { fetchVersionContent } from '@/api/artifacts'
 import type { Approval, ApprovalDecision, ArtifactRef, FeedbackItem } from '@/api/types'
+import PatchSummaryTag from '@/components/PatchSummaryTag.vue'
 import {
   APPROVAL_STATUS_LABELS,
   APPROVAL_STATUS_TAG_TYPES,
@@ -17,6 +19,7 @@ import {
   RUN_MODE_LABELS,
   STAGE_META,
 } from '@/constants'
+import { parsePatchSummary, type PatchSummary } from '@/utils/patchSummary'
 
 interface Props {
   /** 审批记录（含 run 摘要与历史反馈链）；null 时渲染空态。 */
@@ -105,6 +108,46 @@ function feedbackFrom(item: FeedbackItem): string {
 
 /** 历史反馈链（列表接口已内联；缺省空数组）。 */
 const feedbackHistory = computed<FeedbackItem[]>(() => props.approval?.feedback_history ?? [])
+
+/** 产物内机器簿记文件名（与非增量产物的区分点，docs/11 §7.4）。 */
+const PATCH_MANIFEST_PATH = 'patch_manifest.json'
+
+/** 增量改动面摘要（v1.3 T1.3）：非增量产物 / 拉取失败 ⇒ null（整块隐藏）。 */
+const patchSummary = ref<PatchSummary | null>(null)
+
+/**
+ * 拉取待审产物内的 `patch_manifest.json` 并解析。
+ *
+ * 纪律：**任何失败都静默隐藏**（404 / 网络错误 / 坏 JSON）—— 这是审批卡片的辅助
+ * 信息，不能因为它让卡片报错或白屏（docs/11 §7.5-2）。
+ */
+async function loadPatchSummary(): Promise<void> {
+  const refs = artifactRefs.value
+  const target = refs.find((item) => item.name === 'code') ?? refs[0]
+  const version = target?.version
+  if (!target || version === undefined || version === null) {
+    patchSummary.value = null
+    return
+  }
+  try {
+    const content = await fetchVersionContent(
+      String(target.artifact_id),
+      Number(version),
+      PATCH_MANIFEST_PATH,
+    )
+    patchSummary.value = parsePatchSummary(content.content ?? null)
+  } catch {
+    patchSummary.value = null
+  }
+}
+
+watch(
+  () => props.approval?.artifact_refs,
+  () => {
+    void loadPatchSummary()
+  },
+  { immediate: true, deep: true },
+)
 </script>
 
 <template>
@@ -135,7 +178,11 @@ const feedbackHistory = computed<FeedbackItem[]>(() => props.approval?.feedback_
 
     <!-- 待审产物 -->
     <div class="section">
-      <div class="section-title">待审产物</div>
+      <div class="section-title">
+        待审产物
+        <!-- 增量改动面徽标（v1.3 T1.3）：无数据时组件自身隐藏 -->
+        <PatchSummaryTag :summary="patchSummary" />
+      </div>
       <div v-if="artifactRefs.length === 0" class="section-empty">（无产物引用）</div>
       <div v-else class="artifact-list">
         <el-button
@@ -254,6 +301,11 @@ const feedbackHistory = computed<FeedbackItem[]>(() => props.approval?.feedback_
   font-weight: 600;
   color: #606266;
   margin-bottom: 6px;
+  /* v1.3：容纳「待审产物」标题右侧的改动面徽标 */
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
 .section-empty {

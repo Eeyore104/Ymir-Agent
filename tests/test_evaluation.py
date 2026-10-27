@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 from ymir.artifacts.store import ArtifactStore
+from ymir.common.contracts import FrontendRules, LayoutRules, ScoringRules
 from ymir.common.errors import NotFoundError
 from ymir.config import PROJECT_ROOT
 from ymir.evaluation import (
@@ -55,8 +56,12 @@ from ymir.evaluation.evaluators.architecture import (
     _layer_rank,
     _module_name,
 )
+from ymir.evaluation.evaluators.base import CheckRun, run_checks, score_by_points
 from ymir.evaluation.evaluators.convention import _ConventionJudgement
 from ymir.evaluation.evaluators.requirement import _ItemJudgement, _RequirementJudgement
+from ymir.evaluation.report import BaselineProbeOut
+from ymir.evaluation.run_task import resolve_checks, template_spec_for_run
+from ymir.evaluation.suite import Thresholds
 from ymir.sandbox.base import ExecResult, NetworkPolicy, SandboxSession
 from ymir.storage.repositories import ProjectRepository
 
@@ -207,6 +212,8 @@ def _ctx(
     sandbox: SandboxSession | None = None,
     judge: Any = None,
     requirement: str = "",
+    layout: LayoutRules | None = None,
+    scoring: ScoringRules | None = None,
 ) -> EvalContext:
     task = EvalTask(id="t", requirement=requirement, checks=checks or [])
     return EvalContext(
@@ -215,6 +222,8 @@ def _ctx(
         references=references or {},
         sandbox=sandbox,
         judge=judge,
+        layout=layout,
+        scoring=scoring,
     )
 
 
@@ -1384,17 +1393,14 @@ class TestNoCrossProjectLeakage:
 class TestTemplateChecksInjection:
     """DoD ①：模板 ``checks`` 覆盖套件 ``checks``；无模板时与套件逐条一致。"""
 
-    def _gate(self) -> Any:
-        from ymir.evaluation.gate import HarnessEvaluationGate
-
-        return HarnessEvaluationGate(harness=EvaluationHarness(store=object()), store=object())
+    # v1.3（T4.1）：装配逻辑从 gate 私有方法迁到 ``run_task``（唯一装配点），
+    # 这里改测同一实现的公共函数，断言口径不变。
 
     def test_checks_follow_template_and_fall_back_to_suite(self) -> None:
         from types import SimpleNamespace
 
         from ymir.templates import load_template
 
-        gate = self._gate()
         spec = load_template("fastapi-vue3")
         run = SimpleNamespace(
             id="run-tpl", context={"template": {"id": "fastapi-vue3", "version": "1.0"}}
@@ -1403,31 +1409,37 @@ class TestTemplateChecksInjection:
             id="t", checks=[EvalCheck(type="command", run="suite-only-cmd", weight=3)]
         )
 
-        checks = gate._resolve_checks(run, base)
+        checks = resolve_checks(template_spec_for_run(run), base)
         assert [item.run for item in checks] == [item.run for item in spec.checks]
         assert [item.weight for item in checks] == [item.weight for item in spec.checks]
         # 字段名是 type（不是 kind）
         assert {item.type for item in checks} == {"command"}
 
         # 无模板 → 与套件逐条一致
-        plain = gate._resolve_checks(SimpleNamespace(id="run-plain", context={}), base)
+        plain = resolve_checks(
+            template_spec_for_run(SimpleNamespace(id="run-plain", context={})), base
+        )
         assert plain == list(base.checks)
         assert [item.run for item in plain] == ["suite-only-cmd"]
 
         # 模板不可读 → 退回套件（只告警，不让裁决失败）
-        missing = gate._resolve_checks(
-            SimpleNamespace(id="run-missing", context={"template": {"id": "no-such"}}), base
+        missing = resolve_checks(
+            template_spec_for_run(
+                SimpleNamespace(id="run-missing", context={"template": {"id": "no-such"}})
+            ),
+            base,
         )
         assert [item.run for item in missing] == ["suite-only-cmd"]
 
     def test_layout_resolved_only_for_template_runs(self) -> None:
         from types import SimpleNamespace
 
-        gate = self._gate()
-        assert gate._resolve_layout(SimpleNamespace(id="r0", context={})) is None
-        layout = gate._resolve_layout(
+        assert template_spec_for_run(SimpleNamespace(id="r0", context={})) is None
+        spec = template_spec_for_run(
             SimpleNamespace(id="r1", context={"template": {"id": "fastapi-vue3"}})
         )
+        assert spec is not None
+        layout = spec.to_layout_rules()
         assert layout is not None
         assert layout.required_dirs == ["app", "tests", "web/src"]
         # 前缀带尾斜杠（否则 app 会误匹配 application/）
@@ -1500,10 +1512,13 @@ class TestConventionLayoutParameterization:
         assert frontend_evidence, [item.detail for item in score.evidence]
 
 
-def test_sandbox_dockerfile_has_v12_packages() -> None:
-    """DoD ④：Dockerfile 三处改动静态核对（**真机 docker build 待用户手动验证**）。
+def test_sandbox_dockerfile_has_v13_toolchain() -> None:
+    """镜像静态核对（CI 不跑 docker build，真机构建由 scripts/verify 手动执行）。
 
-    CI 不跑构建（团队约定），因此这里只钉住文本形态：预装清单 / Node 注释 / pip 行。
+    钉住 v1.3 的三处**结构性**改动（改错会静默让断网构建失败）：
+    ① pip 预装清单包含 pandas / numpy（B14：与 ``SANDBOX_IMAGE_PACKAGES`` 同一 PR）；
+    ② Node 20 走**多阶段拷贝**，不出现 NodeSource 的 ``curl | bash``；
+    ③ 两个离线依赖池在构建期各跑一次 ``npm ci``，且 npm 缓存在 ``/opt/npm-cache``。
     """
     text = (PROJECT_ROOT / "docker" / "sandbox.Dockerfile").read_text(encoding="utf-8")
     for package in (
@@ -1517,11 +1532,87 @@ def test_sandbox_dockerfile_has_v12_packages() -> None:
         # 模型为 FastAPI 生成的 conftest 常规会 import pytest_asyncio，
         # 缺了 collection 直接 exit 4（T5.1 真跑实测）
         "pytest-asyncio>=0.23,<1",
+        # v1.3：data-pipeline 模板的 `python -c "import pandas"` 依赖它们
+        "pandas>=2.2,<3",
+        "numpy>=1.26,<3",
     ):
         assert package in text, package
-    assert "pytest / pytest-cov / httpx / pydantic" in text  # :7 预装清单已同步
-    assert "Node 预装与前端构建校验留待 v1.3 镜像变体" in text
-    assert "v1.2 前端只做静态检查" in text
+    assert "pytest / pytest-cov / httpx / pydantic" in text  # 预装清单注释已同步
+
+    # ② Node：多阶段拷贝，禁止外网安装脚本
+    assert "FROM node:20-slim AS node-runtime" in text
+    assert "COPY --from=node-runtime /usr/local/bin/node" in text
+    assert "COPY --from=node-runtime /usr/local/lib/node_modules" in text
+    # 只查**可执行行**：注释里出现 "NodeSource 的 curl|bash" 是解释，不算违规
+    runnable = [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any("curl " in line for line in runnable), "禁止 curl|bash 装 Node"
+    assert not any("apt-get install" in line for line in runnable), "Node 走拷贝，不装 apt 包"
+
+    # ③ 离线依赖池 + 构建脚本
+    assert "ENV npm_config_cache=/opt/npm-cache" in text
+    assert "COPY docker/fe-baseline /opt/fe-baseline" in text
+    assert "COPY docker/node-baseline /opt/node-baseline" in text
+    assert "cd /opt/fe-baseline && npm ci" in text
+    assert "cd /opt/node-baseline && npm ci" in text
+    assert "COPY docker/bin/fe-build docker/bin/node-build /usr/local/bin/" in text
+
+
+def test_dockerignore_whitelists_only_build_assets() -> None:
+    """``.dockerignore`` 只放开三处构建资产（构建上下文最小化）。
+
+    反例：放开 ``web`` 或任意 ``node_modules`` 会让上下文涨几百 MB 且平台不匹配
+    （本地 node_modules 里是 win32 原生包，镜像里跑不起来）。
+    """
+    text = (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    whitelisted = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("!") and not line.strip().startswith("#")
+    ]
+    assert whitelisted, "缺少构建资产白名单"
+    allowed_roots = {"docker/bin", "docker/fe-baseline", "docker/node-baseline"}
+    for pattern in whitelisted:
+        target = pattern.lstrip("!").rstrip("*/")
+        root = "/".join(target.split("/")[:2])
+        assert root in allowed_roots, pattern
+    # 三个目录都已忽略⇒放开的顺序正确（白名单必须在忽略规则之后）
+    last_ignore = max(
+        index
+        for index, line in enumerate(text.splitlines())
+        if line.strip() and not line.strip().startswith(("#", "!"))
+    )
+    first_whitelist = min(
+        index
+        for index, line in enumerate(text.splitlines())
+        if line.strip().startswith("!")
+    )
+    assert first_whitelist > last_ignore
+
+
+def test_offline_build_scripts_are_lf_and_executable_shebang() -> None:
+    """``docker/bin`` 脚本必须是 **LF + ``#!/bin/sh``**（CRLF 会让容器内 exec 报错）。"""
+    for name in ("fe-build", "node-build"):
+        raw = (PROJECT_ROOT / "docker" / "bin" / name).read_bytes()
+        assert b"\r\n" not in raw, f"{name} 含 CRLF，容器内 /bin/sh 会报 not found"
+        text = raw.decode("utf-8")
+        assert text.startswith("#!/bin/sh\n"), name
+        # 只查**可执行行**（注释里写"禁止 npm install"是规范说明，不是用法）
+        runnable = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        joined = "\n".join(runnable)
+        assert "npm ci --offline" in joined, name
+        assert "cp -an /opt/" in joined, name  # 回退基线 node_modules 且不覆盖模型文件
+        assert "npm install" not in joined, name  # 断网必失败
+        assert "npx -y" not in joined, name
+        if name == "node-build":
+            assert "npx --no-install" in joined, name  # tsc 兜底不联网
 
 
 def test_find_cycles_is_independent_of_node_order() -> None:
@@ -1598,3 +1689,348 @@ def test_find_cycles_is_stable_across_hash_seeds() -> None:
         outputs.append(completed.stdout.strip())
     assert len(set(outputs)) == 1, f"不同 hash 种子下环列表不一致: {outputs}"
     assert outputs[0].count("["), outputs[0]  # 至少确实返回了环
+
+
+# ================================================ v1.3（T1.2 / Q4）：检查结构化与阻断项
+
+
+async def test_run_checks_returns_structured_results() -> None:
+    """``run_checks``：结构化 ``CheckRun`` + **证据字符串格式保持 v1.2 原样**。"""
+    session = FakeSandboxSession(exit_codes={"pytest": 1})
+    checks = [
+        EvalCheck(run="python -m pytest -q", weight=2.0),
+        EvalCheck(run="ruff check .", weight=1.0),
+    ]
+    evidence: list[Any] = []
+    runs = await run_checks(session, checks, exec_timeout=5.0, evidence=evidence)
+
+    assert [run.status for run in runs] == ["failed", "passed"]
+    assert runs[0].exit_code == 1
+    assert runs[1].exit_code == 0
+    assert session.executed == ["python -m pytest -q", "ruff check ."]
+    # gate / benchmark 的既有正则仍能匹配（格式未变）
+    assert evidence[0].detail.startswith("exit=1 timed_out=False duration=1ms｜")
+
+
+async def test_run_checks_skips_when_sandbox_missing() -> None:
+    """无沙箱 ⇒ 全部 ``skipped``（不进分母），不伪装成失败。"""
+    runs = await run_checks(None, [EvalCheck(run="python -m pytest -q")])
+    assert len(runs) == 1
+    assert runs[0].status == "skipped"
+    assert runs[0].skipped_reason == "no_sandbox"
+    assert not runs[0].passed and not runs[0].failed
+
+
+async def test_runnability_fills_check_runs_and_keeps_legacy_score() -> None:
+    """老口径不变（按权重归一）：2 权重失败 + 1 权重通过 ⇒ 33.33 分。"""
+    session = FakeSandboxSession(exit_codes={"pytest": 1})
+    checks = [
+        EvalCheck(run="python -m pytest -q", weight=2.0),
+        EvalCheck(run="ruff check .", weight=1.0),
+    ]
+    ctx = _ctx(workdir={"app.py": "x = 1\n"}, checks=checks, sandbox=session)
+    score = await RunnabilityEvaluator(weight=0.3).evaluate(ctx)
+
+    assert score.score == pytest.approx(100 / 3, rel=1e-6)
+    assert [run.status for run in score.check_runs] == ["failed", "passed"]
+    assert len(score.evidence) == 2  # 证据条数与 v1.2 一致
+
+
+def test_task_out_blocking_failed_forces_passed_false() -> None:
+    """Q4：阻断项失败 ⇒ ``passed=False``（分数照算，通过判定收紧）。"""
+    task = TaskOut(id="t", passed=True, total_score=78.0, blocking_failed=["fe-build web"])
+    assert task.passed is False
+    assert task.total_score == pytest.approx(78.0)  # 分数不被改写
+
+
+def test_report_markdown_unchanged_without_incremental_fields() -> None:
+    """兼容性红线：无新字段 ⇒ markdown **不出现**任何 v1.3 行（与 v1.2 逐字节一致）。"""
+    task = TaskOut(id="t", dimensions=[], total_score=80.0, runnability=80.0, passed=True)
+    report = EvaluationReport.build(
+        suite_id="default",
+        suite_version="1.0",
+        project_id="p",
+        weights={REQUIREMENT: 0.3, RUNNABILITY: 0.3, CONVENTION: 0.2, ARCHITECTURE: 0.2},
+        thresholds=Thresholds(total=75.0, runnability=60.0),
+        tasks=[task],
+        wall_time_ms=1,
+    )
+    markdown = report.to_markdown()
+    for marker in ("基线检查", "回归：", "阻断项失败", "已跳过检查"):
+        assert marker not in markdown
+    assert task.baseline_runnability is None
+
+
+def test_report_markdown_renders_incremental_lines_when_present() -> None:
+    """有新字段时才追加人读行（T1.2 / Q4 的可观测性）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=78.0,
+        runnability=50.0,
+        passed=False,
+        baseline_runnability=BaselineProbeOut(
+            status="healthy", score=100.0, passed=True, reason=""
+        ),
+        regression=True,
+        regression_reason="基线通过，合并树在 `python -m pytest -q` 失败",
+        blocking_failed=["fe-build web"],
+    )
+    report = EvaluationReport.build(
+        suite_id="default",
+        suite_version="1.0",
+        project_id="p",
+        weights={REQUIREMENT: 0.3, RUNNABILITY: 0.3, CONVENTION: 0.2, ARCHITECTURE: 0.2},
+        thresholds=Thresholds(total=75.0, runnability=60.0),
+        tasks=[task],
+        wall_time_ms=1,
+    )
+    markdown = report.to_markdown()
+    assert "基线检查：健康" in markdown
+    assert "回归：基线通过，合并树在" in markdown
+    assert "阻断项失败：fe-build web" in markdown
+
+
+# ============================================ v1.3（T2.3 / T2.4 / Q3 / Q4）：分组配分
+
+
+class TestGroupedScoring:
+    """Q3：分组配分 10/10/10 —— 前端（静态+构建）占 20 总分点，后端占 10。"""
+
+    def test_score_by_points_basic_math(self) -> None:
+        runs = [
+            CheckRun(command="a", group="backend", status="passed", weight=1.0),
+            CheckRun(command="b", group="backend", status="failed", weight=1.0),
+            CheckRun(command="c", group="frontend_build", status="passed", weight=2.0),
+        ]
+        score, reason = score_by_points(
+            runs,
+            points={"backend": 10, "frontend_build": 10},
+        )
+        # backend 50 分、frontend_build 100 分 ⇒ 等权 ⇒ 75
+        assert score == pytest.approx(75.0)
+        assert "backend 50.0" in reason and "frontend_build 100.0" in reason
+
+    def test_score_by_points_includes_static_group(self) -> None:
+        runs = [CheckRun(command="a", group="backend", status="passed", weight=1.0)]
+        score, reason = score_by_points(
+            runs,
+            points={"backend": 10, "frontend_static": 10},
+            static_scores={"frontend_static": 40.0},
+        )
+        # (10×100 + 10×40) / 20 = 70
+        assert score == pytest.approx(70.0)
+        assert "（静态）" in reason
+
+    def test_score_by_points_skips_groups_without_valid_checks(self) -> None:
+        """**关键兜底**：某组全部 skipped ⇒ 该组**不进分母**（环境缺失不扣分）。"""
+        runs = [
+            CheckRun(command="a", group="backend", status="passed", weight=1.0),
+            CheckRun(
+                command="fe-build web",
+                group="frontend_build",
+                status="skipped",
+                weight=2.0,
+                skipped_reason="requires_missing:node",
+            ),
+        ]
+        score, reason = score_by_points(
+            runs, points={"backend": 10, "frontend_build": 10}
+        )
+        assert score == pytest.approx(100.0)  # 而不是 50
+        assert "frontend_build" not in reason
+
+    def test_score_by_points_no_checks_at_all(self) -> None:
+        score, reason = score_by_points([], points={"backend": 10})
+        assert score == 0.0
+        assert "无可用检查" in reason
+
+    async def test_runnability_grouped_matches_10_10_10(self) -> None:
+        """端到端（维度级）：三组各 10 点，只有构建失败 ⇒ (100+100+0)/3 ≈ 66.67。"""
+        session = FakeSandboxSession(exit_codes={"fe-build": 1})
+        checks = [
+            EvalCheck(run="python -m pytest -q", weight=2.0, group="backend"),
+            EvalCheck(run="fe-build web", weight=2.0, group="frontend_build"),
+        ]
+        layout = LayoutRules(
+            required_dirs=["web/src"],
+            frontend=FrontendRules(required_dirs=["web/src"]),
+        )
+        ctx = _ctx(
+            workdir={"web/src/App.vue": "<template><div/></template>\n"},
+            checks=checks,
+            sandbox=session,
+        )
+        ctx.scoring = ScoringRules(
+            runnability_points={
+                "backend": 10,
+                "frontend_static": 10,
+                "frontend_build": 10,
+            },
+            frontend_scored_in_runnability=True,
+        )
+        ctx.layout = layout
+        score = await RunnabilityEvaluator(weight=0.3).evaluate(ctx)
+        assert score.score == pytest.approx(200 / 3, rel=1e-6)
+        assert "分组配分" in score.rationale
+        # 静态组证据并入（与 convention 同源）
+        assert any("静态检查（未构建）" in item.detail for item in score.evidence)
+
+    async def test_runnability_without_scoring_keeps_legacy_formula(self) -> None:
+        """红线：``scoring is None`` ⇒ 老口径（权重归一），分数与 v1.2 完全一致。"""
+        session = FakeSandboxSession(exit_codes={"fe-build": 1})
+        checks = [
+            EvalCheck(run="python -m pytest -q", weight=2.0, group="backend"),
+            EvalCheck(run="fe-build web", weight=2.0, group="frontend_build"),
+        ]
+        ctx = _ctx(workdir={"a.py": "x = 1\n"}, checks=checks, sandbox=session)
+        score = await RunnabilityEvaluator(weight=0.3).evaluate(ctx)
+        assert score.score == pytest.approx(50.0)  # 2/4 权重通过
+        assert "分组配分" not in score.rationale
+
+    async def test_convention_skips_frontend_when_relocated(self) -> None:
+        """Q3：前端结构分移到 runnability 后，convention 不重复计（否则扣两次）。"""
+        layout = LayoutRules(
+            required_dirs=["web/src"],
+            frontend=FrontendRules(required_dirs=["web/src"]),
+        )
+        base_ctx = _ctx(
+            workdir={"web/src/App.vue": "<template><div/></template>\n"}, layout=layout
+        )
+        with_frontend = await ConventionEvaluator(weight=0.2).evaluate(base_ctx)
+        assert any(
+            item.ref == "web/src" and "静态检查（未构建）" in item.detail
+            for item in with_frontend.evidence
+        )
+
+        relocated_ctx = _ctx(
+            workdir={"web/src/App.vue": "<template><div/></template>\n"}, layout=layout
+        )
+        relocated_ctx.scoring = ScoringRules(
+            runnability_points={"frontend_static": 10},
+            frontend_scored_in_runnability=True,
+        )
+        relocated = await ConventionEvaluator(weight=0.2).evaluate(relocated_ctx)
+        assert not any("静态检查（未构建）" in item.detail for item in relocated.evidence)
+
+
+class TestAllowedFilesWhitelist:
+    """B4（QA 裁决）：``conventions`` 里的**根级文件**自动纳入允许集。"""
+
+    async def test_prefix_rule_passes_with_root_conventions(self) -> None:
+        rules = LayoutRules(
+            required_dirs=["app"],
+            allowed_prefixes=["app/", "tests/"],
+            allowed_files=["README.md", ".gitignore"],
+        )
+        ctx = _ctx(
+            workdir={
+                "app/main.py": "x = 1\n",
+                "tests/test_x.py": "def test_x():\n    assert 1\n",
+                "README.md": "# demo\n",
+                ".gitignore": "*.pyc\n",
+            },
+            layout=rules,
+        )
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+        prefix_evidence = [e for e in score.evidence if e.ref == "allowed_prefixes"]
+        assert prefix_evidence, [e.ref for e in score.evidence]
+        assert "全部路径均在前缀内" in prefix_evidence[0].detail
+
+    async def test_prefix_rule_still_flags_real_outside_paths(self) -> None:
+        """没有被白名单放开的越界路径仍必须报出来（放宽的是根级 convention，不是全部）。"""
+        rules = LayoutRules(
+            required_dirs=["app"],
+            allowed_prefixes=["app/"],
+            allowed_files=["README.md"],
+        )
+        ctx = _ctx(
+            workdir={
+                "app/main.py": "x = 1\n",
+                "README.md": "# d\n",
+                "scripts/x.sh": "echo\n",
+            },
+            layout=rules,
+        )
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+        prefix_evidence = [e for e in score.evidence if e.ref == "allowed_prefixes"]
+        assert prefix_evidence and "scripts/x.sh" in prefix_evidence[0].detail
+
+
+def test_template_layout_rules_carry_allowed_files() -> None:
+    """B4：四套模板的 layout 都带 ``allowed_files``（conventions + skeleton 的根级文件）。
+
+    两类来源缺一不可：只算 conventions 的话，模板自己落位的根文件
+    （``pyproject.toml`` / ``package.json`` …）仍算越界 ⇒ 规则照样恒失败。
+    """
+    from ymir.templates import load_template
+
+    expected = {
+        "fastapi-vue3": {
+            "README.md",
+            ".gitignore",
+            "pyproject.toml",
+            "ruff.toml",
+            "requirements.txt",
+            ".env.example",
+        },
+        "python-cli": {
+            "README.md",
+            ".gitignore",
+            "pyproject.toml",
+            "ruff.toml",
+            "requirements.txt",
+        },
+        "data-pipeline": {
+            "README.md",
+            ".gitignore",
+            "pyproject.toml",
+            "ruff.toml",
+            "requirements.txt",
+        },
+        "node-express": {
+            "README.md",
+            ".gitignore",
+            "package.json",
+            "tsconfig.json",
+            ".env.example",
+        },
+    }
+    for template_id, files in expected.items():
+        rules = load_template(template_id).to_layout_rules()
+        assert set(rules.allowed_files) == files, template_id
+        # 根级文件**不进**前缀清单（前缀是 startswith 语义，会把 README.md.bak 放行）
+        assert not any(item in rules.allowed_prefixes for item in rules.allowed_files)
+
+
+async def test_prefix_rule_passes_for_all_four_templates() -> None:
+    """B4（端到端）：四套模板的"路径落在允许前缀内"规则**不再恒失败**。
+
+    构造输入 = 骨架 + conventions + 一个模块 + 一个测试（都在模板允许范围内）。
+    修复前该规则对四套模板全部为 False（模板自己的根级文件被算越界）。
+    """
+    from ymir.templates import load_template
+
+    extra = {
+        "fastapi-vue3": {"tests/test_app.py": "def test_ok():\n    assert True\n"},
+        "python-cli": {
+            "ymir_cli/main.py": "def main():\n    return 0\n",
+            "tests/test_main.py": "def test_ok():\n    assert True\n",
+        },
+        "data-pipeline": {
+            "pipeline/main.py": "def run():\n    return None\n",
+            "tests/test_main.py": "def test_ok():\n    assert True\n",
+        },
+        "node-express": {"tests/app.test.ts": "export {};\n"},
+    }
+    for template_id, files in extra.items():
+        spec = load_template(template_id)
+        workdir = dict(spec.skeleton_files())
+        for item in spec.conventions:
+            workdir[item.path] = "# doc\n"
+        workdir.update(files)
+        ctx = _ctx(workdir=workdir, layout=spec.to_layout_rules())
+        score = await ConventionEvaluator(weight=0.2).evaluate(ctx)
+        prefix = [e for e in score.evidence if e.ref == "allowed_prefixes"]
+        assert prefix, template_id
+        assert "全部路径均在前缀内" in prefix[0].detail, (template_id, prefix[0].detail)

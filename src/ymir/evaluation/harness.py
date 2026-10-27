@@ -37,6 +37,12 @@ from ymir.artifacts.merge import (
 from ymir.artifacts.store import BASELINE_TYPE
 from ymir.config import Settings
 from ymir.evaluation.aggregator import aggregate
+from ymir.evaluation.baseline_probe import (
+    BaselineProbe,
+    BaselineProbeCache,
+    baseline_cache_key,
+    probe_baseline,
+)
 from ymir.evaluation.evaluators import default_evaluators
 from ymir.evaluation.evaluators.base import (
     DIMENSION_ORDER,
@@ -52,8 +58,11 @@ from ymir.evaluation.report import (
     SKIP_MISSING_ARTIFACT,
     SKIP_UNBOUND_TASK,
     STATUS_EVALUATED,
+    BaselineCheckOut,
+    BaselineProbeOut,
     DimensionOut,
     EvaluationReport,
+    SkippedCheckOut,
     TaskOut,
 )
 from ymir.evaluation.suite import EvalSuite
@@ -83,6 +92,17 @@ _REFERENCE_MAX_BYTES: int = 1024 * 1024
 BASELINE_UNAVAILABLE_WARNING: str = (
     "本次未使用基线（基线不可用），只评了补丁自身，分数与「基于基线」的运行不可比"
 )
+
+#: 基线自身就失败（T1.2 三态之二）：**按 unknown 降级、不阻断**，但必须披露。
+BASELINE_UNHEALTHY_WARNING: str = (
+    "基线自身检查未通过（基线不健康）：本次分数与「基于健康基线」的运行不可比"
+)
+
+#: 前端构建未执行（T2.4 降级路径；本批次无 frontend_build 组，属前向兼容常量）。
+FRONTEND_BUILD_SKIPPED_WARNING: str = "前端构建未执行（环境缺失：node/npm 不可用）"
+
+#: 前端构建组名（与模板 ``scoring.runnability_points`` 的键同口径）。
+_FRONTEND_BUILD_GROUP: str = "frontend_build"
 
 
 def _within_reference_budget(files: Mapping[str, str]) -> bool:
@@ -151,6 +171,9 @@ class EvaluationHarness:
         self._session_factory = session_factory
         # 可选事件总线注入（L6）：CLI/脚本带 run_id 时据此补发 evaluation.completed
         self._events = events
+        #: 基线探测进程内 LRU（v1.3 T1.2，docs/11 §7.7-R2 ②）：
+        #: 同一批次同一基线多次评测只付一次探测成本。
+        self._probe_cache = BaselineProbeCache()
 
     @property
     def store(self) -> Any:
@@ -158,7 +181,7 @@ class EvaluationHarness:
 
     def with_evaluators(self, evaluators: Sequence[Evaluator]) -> EvaluationHarness:
         """返回替换了评估器集合的新 harness（权重随套件变化时用）。"""
-        return EvaluationHarness(
+        clone = EvaluationHarness(
             store=self._store,
             evaluators=evaluators,
             judge=self._judge,
@@ -167,6 +190,9 @@ class EvaluationHarness:
             session_factory=self._session_factory,
             events=self._events,
         )
+        # 共享同一份探测缓存（同一批次里换评估器不应让缓存失效）
+        clone._probe_cache = self._probe_cache
+        return clone
 
     async def emit_evaluation_completed(self, run_id: str, report: EvaluationReport) -> None:
         """补发 ``evaluation.completed`` 事件（L6：harness/CLI 无 run 绑定时不发）。
@@ -215,7 +241,7 @@ class EvaluationHarness:
                 started=started,
             )
 
-        workdir, artifact_ref, references = await self._load_task(
+        workdir, artifact_ref, references, base_files = await self._load_task(
             task, project_id, version_override, allow_default_fallback=allow_default_fallback
         )
         if not allow_default_fallback and artifact_ref.get("name") is None:
@@ -242,6 +268,31 @@ class EvaluationHarness:
             DimensionOut.from_score(score, weight=result.weights.get(score.name, score.weight))
             for score in scores
         ]
+
+        # ---- v1.3 增量健康度装配（T1.2 / Q4）：本段只在有基线 / 有新检查结构时产出 ----
+        runs = [run for score in scores for run in score.check_runs]
+        blocking_failed = [
+            run.command for run in runs if run.blocking and run.status == "failed"
+        ]
+        skipped_checks = [
+            SkippedCheckOut(command=run.command, reason=run.skipped_reason)
+            for run in runs
+            if run.status == "skipped"
+        ]
+        probe = await self._probe(task, base_files)
+        regression, regression_reason = self._regression(probe, runs)
+
+        warnings: list[str] = []
+        if task.baseline_unavailable:
+            warnings.append(BASELINE_UNAVAILABLE_WARNING)
+        if probe is not None and probe.unhealthy:
+            warnings.append(BASELINE_UNHEALTHY_WARNING)
+        if any(
+            run.group == _FRONTEND_BUILD_GROUP and run.status == "skipped"
+            for run in runs
+        ):
+            warnings.append(FRONTEND_BUILD_SKIPPED_WARNING)
+
         wall_time_ms = int((time.perf_counter() - started) * 1000)
         return TaskOut(
             id=task.id,
@@ -255,7 +306,8 @@ class EvaluationHarness:
             dimensions=dimensions,
             total_score=result.total_score,
             runnability=result.runnability,
-            passed=result.passed,
+            # Q4：阻断项失败 ⇒ 不可交付（TaskOut.model_post_init 亦有同一不变量）
+            passed=bool(result.passed and not blocking_failed),
             thresholds={
                 "total": (limits.total if limits else 75.0),
                 "runnability": (limits.runnability if limits else 60.0),
@@ -263,10 +315,49 @@ class EvaluationHarness:
             wall_time_ms=wall_time_ms,
             cost_cny=round(sum(score.cost_cny for score in scores), 6),
             tokens=sum(score.tokens for score in scores),
-            warnings=(
-                [BASELINE_UNAVAILABLE_WARNING] if task.baseline_unavailable else []
-            ),
+            warnings=warnings,
+            baseline_runnability=_probe_out(probe),
+            regression=regression,
+            regression_reason=regression_reason,
+            blocking_failed=blocking_failed,
+            skipped_checks=skipped_checks,
         )
+
+    async def _probe(
+        self, task: EvalTask, base_files: dict[str, str]
+    ) -> BaselineProbe | None:
+        """基线独立执行（T1.2）：**只在增量模式 + 基线正文可用时**探测。
+
+        关闭条件（docs/11 §7.5-7）：``baseline_ref`` 为空（非增量）或基线正文不可用
+        （``base_files == {}``）⇒ 直接返回 ``None`` ⇒ ``TaskOut`` 全字段与 v1.2 一致。
+        """
+        if not task.baseline_ref or not base_files:
+            return None
+        checks = list(task.checks)
+        return await probe_baseline(
+            files=base_files,
+            checks=checks,
+            sandbox_provider=self._sandbox_provider,
+            exec_timeout=self._exec_timeout,
+            cache=self._probe_cache,
+            cache_key=baseline_cache_key(base_files, checks),
+        )
+
+    @staticmethod
+    def _regression(
+        probe: BaselineProbe | None, runs: Sequence[Any]
+    ) -> tuple[bool, str]:
+        """「基线健康 + 合并树有失败」= 回归（T1.2 三态之三）。
+
+        构造上互斥（``probe.healthy`` 才可能命中）⇒ 与 ``check_failed`` 不重叠
+        （docs/11 §7.7-R7 ①）。
+        """
+        if probe is None or not probe.healthy:
+            return False, ""
+        failed = [run for run in runs if run.status == "failed"]
+        if not failed:
+            return False, ""
+        return True, f"基线通过，合并树在 `{failed[0].command}` 失败"
 
     def _skipped(
         self,
@@ -359,6 +450,7 @@ class EvaluationHarness:
             judge=self._bound_judge(task),
             exec_timeout=self._exec_timeout,
             layout=task.layout,
+            scoring=task.scoring,
         )
         raw = await asyncio.gather(
             *(self._safe_evaluate(evaluator, ctx) for evaluator in self._evaluators)
@@ -466,11 +558,15 @@ class EvaluationHarness:
         version_override: int | None,
         *,
         allow_default_fallback: bool = True,
-    ) -> tuple[dict[str, str], dict[str, Any], dict[str, dict[str, str]]]:
+    ) -> tuple[dict[str, str], dict[str, Any], dict[str, dict[str, str]], dict[str, str]]:
         """加载任务产物（``allow_default_fallback=False`` 时禁止回退 ``code``）。
 
-        返回值第三项为「同项目其它产物」引用集（四维交叉引用用）；
-        产物未命中时返回 ``artifact_ref={"name": None, ...}``，由调用方决定短路。
+        返回值：``(workdir, artifact_ref, references, base_files)``。
+
+        - 第三项为「同项目其它产物」引用集（四维交叉引用用）；
+        - **第四项为基线正文**（v1.3 T1.2 / B6：基线解析完原本就被丢弃，现在多带
+          一份给「基线独立执行」，**零额外 DB 读取**）；无基线时恒为 ``{}``；
+        - 产物未命中时返回 ``artifact_ref={"name": None, ...}``，由调用方决定短路。
 
         v1.2 增量（docs/09 §4.2.5）：
         - 产物内**有 ``patch_manifest.json``** → ``workdir`` 返回**合并树**
@@ -495,7 +591,7 @@ class EvaluationHarness:
             task, by_name, allow_default_fallback=allow_default_fallback
         )
         if target is None:
-            return {}, {"name": None, "version": None}, references
+            return {}, {"name": None, "version": None}, references, {}
 
         version = version_override if version_override is not None else task.version
         loaded = await self._store.load(target.id, version)
@@ -507,7 +603,7 @@ class EvaluationHarness:
         workdir = loaded.files
         manifest = parse_patch_manifest(workdir.get(PATCH_MANIFEST_NAME))
         if manifest is None:
-            return workdir, artifact_ref, references
+            return workdir, artifact_ref, references, {}
 
         # 产物内的簿记文件不是源码，永远不进评测工作区（不参与 lint / 测试）
         client_files = {
@@ -517,7 +613,7 @@ class EvaluationHarness:
         }
         if not manifest.base_content_hash:
             # ``from_scratch`` + 模板骨架：产物本身就是整树、没有基线可合
-            return client_files, artifact_ref, references
+            return client_files, artifact_ref, references, {}
 
         base_files = await self._resolve_baseline(
             task, manifest.base_content_hash, project_id
@@ -533,7 +629,7 @@ class EvaluationHarness:
                 task.id,
                 manifest.base_content_hash[:12],
             )
-            return client_files, artifact_ref, references
+            return client_files, artifact_ref, references, {}
 
         merged = merge_trees(
             base_files, client_files, mode="merge", deleted=manifest.deleted
@@ -544,7 +640,7 @@ class EvaluationHarness:
             for name, files in references.items()
             if _within_reference_budget(files)
         }
-        return merged.files, artifact_ref, references
+        return merged.files, artifact_ref, references, dict(base_files)
 
     async def _resolve_baseline(
         self,
@@ -711,6 +807,30 @@ def _normalized(weights: Mapping[str, float]) -> dict[str, float]:
     from ymir.evaluation.aggregator import normalize_weights
 
     return normalize_weights(weights)
+
+
+def _probe_out(probe: BaselineProbe | None) -> BaselineProbeOut | None:
+    """``BaselineProbe`` -> 报告形态（``None`` 原样返回，保证旧报告逐字节一致）。"""
+    if probe is None:
+        return None
+    return BaselineProbeOut(
+        status=probe.status,
+        score=probe.score,
+        passed=probe.passed,
+        checks=[
+            BaselineCheckOut(
+                command=item.command,
+                exit_code=item.exit_code,
+                timed_out=item.timed_out,
+                skipped=item.skipped,
+                output=item.output,
+            )
+            for item in probe.checks
+        ],
+        reason=probe.reason,
+        duration_ms=probe.duration_ms,
+        cached=probe.cached,
+    )
 
 
 def build_eval_harness(

@@ -19,6 +19,16 @@ runner / 基线表复用。
 """
 
 from ymir.evaluation.aggregator import AggregateResult, aggregate, normalize_weights
+from ymir.evaluation.baseline_probe import (
+    BASELINE_HEALTHY,
+    BASELINE_SKIPPED,
+    BASELINE_UNHEALTHY,
+    BaselineCheck,
+    BaselineProbe,
+    BaselineProbeCache,
+    baseline_cache_key,
+    probe_baseline,
+)
 from ymir.evaluation.evaluators import (
     ARCHITECTURE,
     CONVENTION,
@@ -28,6 +38,7 @@ from ymir.evaluation.evaluators import (
     REQUIREMENT,
     RUNNABILITY,
     ArchitectureEvaluator,
+    CheckRun,
     ConventionEvaluator,
     EvalCheck,
     EvalContext,
@@ -41,6 +52,7 @@ from ymir.evaluation.evaluators import (
     RequirementConformanceEvaluator,
     RunnabilityEvaluator,
     default_evaluators,
+    run_checks,
 )
 from ymir.evaluation.harness import (
     BackendSandboxProvider,
@@ -55,10 +67,18 @@ from ymir.evaluation.report import (
     SKIP_UNBOUND_TASK,
     STATUS_EVALUATED,
     STATUS_SKIPPED,
+    BaselineCheckOut,
+    BaselineProbeOut,
     DimensionOut,
     EvaluationReport,
     EvidenceOut,
+    SkippedCheckOut,
     TaskOut,
+)
+from ymir.evaluation.run_task import (
+    build_task_for_run,
+    evaluate_run,
+    resolve_suite_id,
 )
 from ymir.evaluation.runner import (
     BatchEntry,
@@ -76,6 +96,9 @@ from ymir.evaluation.suite import (
 
 __all__ = [
     "ARCHITECTURE",
+    "BASELINE_HEALTHY",
+    "BASELINE_SKIPPED",
+    "BASELINE_UNHEALTHY",
     "BINDING_MODE_PER_TASK",
     "BINDING_MODE_SINGLE",
     "CONVENTION",
@@ -93,10 +116,16 @@ __all__ = [
     "AggregateResult",
     "ArchitectureEvaluator",
     "BackendSandboxProvider",
+    "BaselineCheck",
+    "BaselineCheckOut",
+    "BaselineProbe",
+    "BaselineProbeCache",
+    "BaselineProbeOut",
     "BatchEntry",
     "BatchReport",
     "BatchTarget",
     "BindingMode",
+    "CheckRun",
     "ConventionEvaluator",
     "DimensionOut",
     "EvalCheck",
@@ -115,11 +144,18 @@ __all__ = [
     "RequirementConformanceEvaluator",
     "RunnabilityEvaluator",
     "SandboxProvider",
+    "SkippedCheckOut",
     "TaskOut",
     "Thresholds",
     "aggregate",
+    "baseline_cache_key",
     "build_eval_harness",
+    "build_task_for_run",
     "default_evaluators",
+    "evaluate_run",
     "normalize_weights",
+    "probe_baseline",
+    "resolve_suite_id",
     "run_batch",
+    "run_checks",
 ]

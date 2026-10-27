@@ -1,0 +1,15 @@
+{
+  "name": "ymir-node-baseline",
+  "private": true,
+  "version": "0.0.0",
+  "description": "沙箱 Node 依赖池（v1.3 T3.2）：node-express 模板的最小依赖集，构建期 npm ci 生成 node_modules",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.1",
+    "typescript": "^5.6.3"
+  }
+}

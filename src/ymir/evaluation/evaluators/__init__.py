@@ -17,6 +17,7 @@ from ymir.evaluation.evaluators.base import (
     DIMENSION_ORDER,
     REQUIREMENT,
     RUNNABILITY,
+    CheckRun,
     EvalCheck,
     EvalContext,
     EvalScore,
@@ -26,6 +27,7 @@ from ymir.evaluation.evaluators.base import (
     Judge,
     JudgeOutcome,
     LLMJudge,
+    run_checks,
 )
 from ymir.evaluation.evaluators.convention import ConventionEvaluator
 from ymir.evaluation.evaluators.requirement import RequirementConformanceEvaluator
@@ -54,6 +56,7 @@ __all__ = [
     "REQUIREMENT",
     "RUNNABILITY",
     "ArchitectureEvaluator",
+    "CheckRun",
     "ConventionEvaluator",
     "EvalCheck",
     "EvalContext",
@@ -67,4 +70,5 @@ __all__ = [
     "RequirementConformanceEvaluator",
     "RunnabilityEvaluator",
     "default_evaluators",
+    "run_checks",
 ]

@@ -1583,3 +1583,64 @@ async def test_first_round_pass_emits_no_repair_completed(
     assert "evaluation.completed" in types
     assert "repair.completed" not in types
     assert "repair.started" not in types
+
+
+# ============================================ v1.3（T1.2 / Q4）：history 追加 3 键
+
+
+async def test_record_verdict_history_adds_incremental_keys(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``history`` 条目**只增不改**：既有键原样，新增 3 键有值形态正确。"""
+    async with session_factory() as session:
+        _project_id, run_id = await _new_run(session)
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    controller = RepairController(
+        session_factory=session_factory, events=events, messages=messages
+    )
+    verdict = EvalVerdict(
+        status="fail",
+        passed=False,
+        total_score=70.0,
+        runnability=80.0,
+        failed_checks=(
+            FailedCheck(command="python -m pytest -q", exit_code=1, output="AssertionError"),
+        ),
+        failure_class="check_failed",
+        baseline_status="healthy",
+        regression=True,
+        blocking_failed=("fe-build web",),
+    )
+    state = await controller.record_verdict(run_id, verdict)
+    entry = state["history"][-1]
+
+    # 新键（v1.3）
+    assert entry["baseline_status"] == "healthy"
+    assert entry["regression"] is True
+    assert entry["blocking_failed"] == ["fe-build web"]
+    # 既有键一个都没改（旧状态文件重放不受影响）
+    assert entry["failed_checks"] == ["python -m pytest -q"]
+    assert entry["failed_check_details"][0]["exit_code"] == 1
+    assert entry["total"] == pytest.approx(70.0)
+    assert entry["verdict"] == "fail"
+
+
+async def test_record_verdict_defaults_keep_old_shape(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """不带新字段的裁决 ⇒ 三键取默认值（``""`` / ``False`` / ``[]``）。"""
+    async with session_factory() as session:
+        _project_id, run_id = await _new_run(session)
+    events = EventPublisher(session_factory)
+    messages = MessagePublisher(session_factory, events)
+    controller = RepairController(
+        session_factory=session_factory, events=events, messages=messages
+    )
+    state = await controller.record_verdict(
+        run_id, EvalVerdict(status="pass", passed=True, total_score=90.0)
+    )
+    entry = state["history"][-1]
+    assert entry["baseline_status"] == ""
+    assert entry["regression"] is False
+    assert entry["blocking_failed"] == []

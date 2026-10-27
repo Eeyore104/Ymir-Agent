@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -22,7 +23,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
-from ymir.common.contracts import LayoutRules
+from ymir.common.contracts import FrontendRules, LayoutRules, ScoringRules
 from ymir.common.jsonx import extract_json
 from ymir.sandbox.base import SandboxSession
 
@@ -94,6 +95,11 @@ class EvalScore:
     tokens: int = 0
     #: 该维度是否因「评估器异常 / 沙箱降级」而未走完正常判定（QA-10）
     degraded: bool = False
+    #: 本次维度执行过的结构化检查结果（v1.3 T1.2）。
+    #: 缺省空列表 ⇒ 既有评估器 / 测试零改动；``runnability`` 负责填充，
+    #: 供 harness 判定 ``regression`` / ``blocking_failed`` / ``skipped_checks``，
+    #: 让下游不必再用正则解析证据字符串。
+    check_runs: list[CheckRun] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.score = clamp(self.score)
@@ -112,12 +118,70 @@ class EvalScore:
         }
 
 
+@dataclass
+class CheckRun:
+    """单条检查的**结构化**执行结果（v1.3 T1.2，docs/11 §7.2.4）。
+
+    取代「靠正则解析证据字符串」的老做法；`status` 三态里 ``skipped``
+    **不进评分分母**（环境缺失不扣分，与「未绑定任务零成本跳过」同口径）。
+    """
+
+    command: str
+    group: str = ""
+    status: str = "failed"  # passed | failed | skipped
+    #: 该检查的权重（来自 ``EvalCheck.weight``）—— 分组配分公式
+    #: ``Σ权重(通过)/Σ权重(非 skipped)`` 需要它；v1.3 追加，默认 1.0。
+    weight: float = 1.0
+    exit_code: int | None = None
+    timed_out: bool = False
+    blocking: bool = False
+    skipped_reason: str = ""
+    output: str = ""
+    duration_ms: int = 0
+
+    @property
+    def passed(self) -> bool:
+        """是否通过（``skipped`` 不计为通过也不计为失败）。"""
+        return self.status == "passed"
+
+    @property
+    def failed(self) -> bool:
+        """是否失败（``skipped`` 不算失败）。"""
+        return self.status == "failed"
+
+    def to_dict(self) -> dict[str, Any]:
+        """消息 / 报告 payload 形态。"""
+        return {
+            "command": self.command,
+            "group": self.group,
+            "status": self.status,
+            "weight": self.weight,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+            "blocking": self.blocking,
+            "skipped_reason": self.skipped_reason,
+            "duration_ms": self.duration_ms,
+        }
+
+
 class EvalCheck(BaseModel):
-    """套件里声明的确定性检查（§12.2 checks）。"""
+    """套件里声明的确定性检查（§12.2 checks）。
+
+    v1.3（docs/11 §7.2.4）追加四字段，与 ``templates.models.CheckSpec`` 同构且
+    全部带默认值 ⇒ 旧套件 YAML / 旧调用方零改动。
+    """
 
     type: str = "command"
     run: str = ""
     weight: float = Field(default=1.0, gt=0)
+    #: 分组名（分组配分用；空 = 不分组，走 v1.2 按权重归一）
+    group: str = ""
+    #: 阻断项：失败即 ``passed=False``（分数照算）
+    blocking: bool = False
+    #: 前置可执行文件名（node/npm/npx…）：缺失则 ``skipped``，**不扣分**
+    requires: str = ""
+    #: 单条超时（秒）；None = 用执行上下文缺省（``EvalContext.exec_timeout``）
+    timeout_s: float | None = Field(default=None, gt=0)
 
 
 class EvalTask(BaseModel):
@@ -154,8 +218,12 @@ class EvalTask(BaseModel):
     #: 此时**不合并**、只评补丁自身，并在报告里显式标注"不可比"（R9 禁止自动重放）。
     baseline_unavailable: bool = False
     #: ★模板结构规则（v1.2，docs/09 §4.1.3）：``None`` = 非模板 ⇒ 评估器走 v1.1 原逻辑。
-    #: 由 ``evaluation/gate`` 从 ``TemplateSpec.to_layout_rules()`` 注入（纯数据跨层）。
+    #: 由 ``evaluation/run_task`` 从 ``TemplateSpec.to_layout_rules()`` 注入（纯数据跨层）。
     layout: LayoutRules | None = None
+    #: ★模板打分口径（v1.3 Q3）：``None`` = 未声明 ``scoring`` ⇒ 走 v1.2 老口径
+    #: （按 ``checks[].weight`` 归一）。由 ``evaluation/run_task`` 从
+    #: ``TemplateSpec.to_scoring_rules()`` 注入（纯数据跨层）。
+    scoring: ScoringRules | None = None
 
 
 @dataclass
@@ -178,6 +246,8 @@ class EvalContext:
     #: 模板结构规则（v1.2，docs/09 §4.1.3）：``None`` = 与 v1.1 完全一致的行为。
     #: 由 harness 从 ``EvalTask.layout`` 透传（跨层载体是 ``common.contracts.LayoutRules``）。
     layout: LayoutRules | None = None
+    #: 模板打分口径（v1.3 Q3）：``None``/未启用 ⇒ 老口径；启用 ⇒ ``score_by_points``。
+    scoring: ScoringRules | None = None
 
     def reference(self, name: str) -> dict[str, str]:
         """取同项目某产物的文件集（不存在返回空）。"""
@@ -355,8 +425,214 @@ class Evaluator(ABC):
 
 # --------------------------------------------------------------------- 共享工具
 
+_STREAM_LIMIT = 600
+
+
+async def run_checks(
+    sandbox: SandboxSession | None,
+    checks: Sequence[EvalCheck],
+    *,
+    exec_timeout: float = 120.0,
+    evidence: list[Evidence] | None = None,
+) -> list[CheckRun]:
+    """逐条执行 ``checks``，返回结构化结果（顺序 = 声明顺序，确定性）。
+
+    单条规则（v1.3 T1.2，docs/11 §7.3-3）：
+
+    1. ``requires`` 非空 → 先 ``command -v <bin>`` 探测；非 0 ⇒
+       ``status="skipped"`` + ``skipped_reason="requires_missing:<bin>"``（**不进分母**）；
+    2. 超时取 ``check.timeout_s or exec_timeout``；
+    3. ``exit_code == 0 and not timed_out`` ⇒ ``passed``，否则 ``failed``；
+    4. 证据 detail **保持 v1.2 原样**（``exit=… timed_out=… duration=…ms｜片段``），
+       仅当 ``check.blocking`` 时末尾追加 `` blocking=True``（``gate._EVIDENCE_RE``
+       用的是 ``search``，仍能匹配）。
+
+    设计取舍：``sandbox is None`` 时**不执行**，全部记 ``skipped``（``no_sandbox``）——
+    调用方（``runnability``）本来就有"无沙箱走静态判定"的分支，这里不重复实现降级。
+    """
+    runs: list[CheckRun] = []
+    for check in checks:
+        if check.type != "command" or not check.run.strip():
+            continue
+        command = check.run
+        group = check.group or ""
+        blocking = bool(check.blocking)
+        requires = (check.requires or "").strip()
+        timeout = check.timeout_s or exec_timeout
+        if sandbox is None:
+            runs.append(
+                CheckRun(
+                    command=command,
+                    group=group,
+                    status="skipped",
+                    weight=check.weight,
+                    blocking=blocking,
+                    skipped_reason="no_sandbox",
+                )
+            )
+            continue
+        if requires:
+            probe = await sandbox.exec(f"command -v {requires}", timeout=timeout)
+            if probe.exit_code != 0 or probe.timed_out:
+                runs.append(
+                    CheckRun(
+                        command=command,
+                        group=group,
+                        status="skipped",
+                        weight=check.weight,
+                        blocking=blocking,
+                        skipped_reason=f"requires_missing:{requires}",
+                    )
+                )
+                continue
+        result = await sandbox.exec(command, timeout=timeout)
+        state = "passed" if result.exit_code == 0 and not result.timed_out else "failed"
+        snippet = (result.stdout or result.stderr or "").strip()[:_STREAM_LIMIT]
+        run = CheckRun(
+            command=command,
+            group=group,
+            status=state,
+            weight=check.weight,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            blocking=blocking,
+            output=snippet,
+            duration_ms=result.duration_ms,
+        )
+        runs.append(run)
+        if evidence is not None:
+            detail = (
+                f"exit={result.exit_code} timed_out={result.timed_out} "
+                f"duration={result.duration_ms}ms｜{snippet}"
+            )
+            if blocking:
+                detail += " blocking=True"
+            evidence.append(Evidence("command", command, detail))
+    return runs
+
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}|[\u4e00-\u9fff]{2,}")
 _PY_SUFFIXES = (".py",)
+
+
+def workdir_directories(files: Mapping[str, str]) -> list[str]:
+    """产物中出现过的目录（含中间层，如 ``web/src/components`` 产出 web、web/src、…）。
+
+    v1.3 从 ``convention`` 下沉到本模块：前端结构规则（``frontend_structure_rules``）
+    也要用它，而 ``convention`` 与本模块同包同层，放这里可保持**单一实现**。
+    """
+    dirs: set[str] = set()
+    for path in files:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            dirs.add("/".join(parts[:index]))
+    return sorted(dirs)
+
+
+def frontend_structure_rules(
+    frontend: FrontendRules,
+    workdir: Mapping[str, str],
+    evidence: list[Evidence],
+) -> list[tuple[bool, str]]:
+    """前端结构静态规则（§7.3-3；由 ``convention._frontend_rules`` **原样下沉**）。
+
+    证据文案保持 v1.2 原样（含「静态检查（未构建）」字样）：
+    本轮即便加了**真的构建检查**（``fe-build``），这条静态规则也不改口径 ——
+    它证明的是"结构对"，与"能 build"是两件事，报告里要能分开读。
+    """
+    rules: list[tuple[bool, str]] = []
+    dirs = workdir_directories(workdir)
+    for required in frontend.required_dirs:
+        ok = any(item == required or item.startswith(f"{required}/") for item in dirs)
+        rules.append((ok, f"前端目录 {required}"))
+        evidence.append(
+            Evidence(
+                "metric" if ok else "file",
+                required,
+                f"前端目录 {required} {'已存在' if ok else '缺失'}（静态检查（未构建））",
+            )
+        )
+    for pattern in frontend.required_glob:
+        matched = [path for path in workdir if fnmatch.fnmatch(path, pattern)]
+        ok = bool(matched)
+        rules.append((ok, f"前端文件模式 {pattern}"))
+        evidence.append(
+            Evidence(
+                "metric" if ok else "file",
+                pattern,
+                f"命中 {len(matched)} 个文件"
+                if ok
+                else f"未命中任何文件（静态检查（未构建））：{pattern}",
+            )
+        )
+    for name in frontend.forbidden_imports:
+        offenders = sorted(
+            path
+            for path, content in workdir.items()
+            if name in content and path.endswith((".vue", ".js", ".ts", ".json"))
+        )
+        ok = not offenders
+        rules.append((ok, f"前端禁止依赖 {name}"))
+        evidence.append(
+            Evidence(
+                "metric" if ok else "file",
+                name,
+                f"未出现 {name}" if ok else f"出现禁止依赖 {name}：{offenders[:3]}",
+            )
+        )
+    return rules
+
+
+def score_by_points(
+    runs: Sequence[CheckRun],
+    *,
+    points: Mapping[str, float],
+    static_scores: Mapping[str, float] | None = None,
+) -> tuple[float, str]:
+    """分组配分（v1.3 Q3）：返回 ``(0-100 维度分, 人读理由)``。
+
+    算式（与 docs/11 §7.5-4 逐字对应）::
+
+        group_score(g) = Σ权重(通过) / Σ权重(非 skipped) × 100     # 分母剔除 skipped
+        维度分         = Σ_g points[g] × group_score(g) / Σ_g points[g]
+
+    - ``skipped``（``requires`` 缺失）**不进分母**：环境缺失不扣分（T2.4 兜底）；
+    - **无有效检查的组不进分母**：该组的 ``points`` 一并不计入，避免"没装 node ⇒
+      前端组 0 分"这种把环境问题当代码问题的结论；
+    - ``static_scores``：静态组（``frontend_static``）没有对应 check，由
+      :func:`frontend_structure_rules` 算出的 0-100 分直接作为该组得分；
+    - 全部组均无有效检查 ⇒ ``(0.0, "无可用检查")``。
+    """
+    if not points:
+        return 0.0, "未声明分组配分（不应走到此分支）"
+    static = {name: float(value) for name, value in (static_scores or {}).items()}
+    by_group: dict[str, list[CheckRun]] = {}
+    for run in runs:
+        by_group.setdefault(run.group, []).append(run)
+
+    weighted = 0.0
+    total_points = 0.0
+    parts: list[str] = []
+    for group, point in points.items():
+        if point <= 0:
+            continue
+        if group in static:
+            group_score = clamp(static[group])
+            total_points += float(point)
+            weighted += float(point) * group_score
+            parts.append(f"{group} {group_score:.1f}（静态）")
+            continue
+        executed = [run for run in by_group.get(group, []) if run.status != "skipped"]
+        total_weight = sum(run.weight for run in executed)
+        if not executed or total_weight <= 0:
+            continue  # 无有效检查 ⇒ 该组不进分母
+        passed_weight = sum(run.weight for run in executed if run.status == "passed")
+        group_score = clamp(passed_weight / total_weight * SCORE_MAX)
+        total_points += float(point)
+        weighted += float(point) * group_score
+        parts.append(f"{group} {group_score:.1f}")
+    if total_points <= 0:
+        return 0.0, "无可用检查（分组配分）"
+    return clamp(weighted / total_points), "分组配分：" + "；".join(parts)
 
 
 def _join_files(files: Mapping[str, str]) -> str:

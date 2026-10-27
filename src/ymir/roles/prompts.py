@@ -87,7 +87,12 @@ class PromptRenderer:
             lines += _template_lines(role.id, stage_input.template)
 
         if stage_input.baseline is not None and role.id in _PATCH_ROLES:
-            lines += _patch_lines(stage_input.baseline)
+            threshold = (
+                stage_input.template.change_ratio_threshold
+                if stage_input.template is not None
+                else 0.5
+            )
+            lines += _patch_lines(stage_input.baseline, threshold=threshold)
 
         # 上游产物：先把「与上一版同名」的项过滤掉，**剩余非空才输出标题**
         # （否则修复轮会留下一个空的「## 上游产物」小节，往模型上下文里塞噪音）
@@ -221,11 +226,12 @@ def _same_as_previous(
 
 
 def _template_lines(role_id: str, template: TemplateContext) -> list[str]:
-    """按渲染范围组装模板段（docs/09 §4.1.2）。
+    """按渲染范围组装模板段（docs/09 §4.1.2；v1.3 追加受保护路径段）。
 
     - ``## 技术栈模板`` → **四角色都渲染**（含 prompting 里本角色的追加约束）；
     - ``## 目录规范`` → architect / engineer；
     - ``## 模板模式例外`` + 两个骨架清单 + 依赖白名单 → **仅 engineer**；
+    - ``## 受保护路径`` → **仅 engineer**，且 ``protected_paths`` 非空才渲染（v1.3）；
     - ``## 检查命令口径`` → qa。
     """
     lines: list[str] = []
@@ -234,6 +240,7 @@ def _template_lines(role_id: str, template: TemplateContext) -> list[str]:
         lines += _layout_lines(template)
     if role_id in _SKELETON_ROLES:
         lines += _skeleton_lines(template)
+        lines += _protected_lines(template)
     if role_id in _CHECK_ROLES:
         lines += _check_lines(template)
     return lines
@@ -305,6 +312,30 @@ def _layout_lines(template: TemplateContext) -> list[str]:
     return ["## 目录规范（设计必须遵守）", "", *entries, ""]
 
 
+def _protected_lines(template: TemplateContext) -> list[str]:
+    """「受保护路径」段（**仅 engineer**，v1.3 T1.1，docs/11 §7.7-R1 ③）。
+
+    ``protected_paths`` 为空时返回空列表 ⇒ **该节完全不渲染** ⇒ 未配置模板的
+    提示词逐字节不变（兼容性红线，docs/11 §7.5-7）。
+
+    双通道告知（R1 ③）：模板 ``prompting.engineer`` 是一通道，本节是第二通道 ——
+    两处都要给清单，且必须**给出替代路径**（只说"禁止"会让模型卡死）。
+    """
+    paths = sorted(template.protected_paths)
+    if not paths:
+        return []
+    lines: list[str] = ["## 受保护路径（不可修改，由基线提供）", ""]
+    lines += [f"- {path}" for path in paths]
+    lines += [
+        "",
+        "- 这些文件由基线提供且必须保持原样：不要重写、不要删除、不要拆分它们的夹具；",
+        "- 需要新增测试或夹具时**新建文件**（例如 `tests/test_<新功能>.py`），"
+        "不要改动上列文件；新增夹具请在自己的新文件里定义；",
+        "",
+    ]
+    return lines
+
+
 def _skeleton_lines(template: TemplateContext) -> list[str]:
     """「模板模式例外」+ 「骨架文件（分两类）」段（**仅 engineer**）。
 
@@ -336,8 +367,8 @@ def _skeleton_lines(template: TemplateContext) -> list[str]:
     return lines
 
 
-def _patch_lines(baseline: BaselineContext) -> list[str]:
-    """「增量模式」段（**仅 engineer**，docs/09 §4.2.2）。
+def _patch_lines(baseline: BaselineContext, *, threshold: float = 0.5) -> list[str]:
+    """「增量模式」段（**仅 engineer**，docs/09 §4.2.2；v1.3 追加改动面阈值）。
 
     要害是把"只输出增量"讲清楚：模型受 v1.1 「实现全部模块」提示词影响，极易重出
     整棵树。服务端虽然会丢弃 noop（容错），但白烧 token 与改动面判断 —— 所以提示词
@@ -366,6 +397,9 @@ def _patch_lines(baseline: BaselineContext) -> list[str]:
         "**向后兼容的追加**，不得改动既有签名与导入方式；",
         "- **改动面最小化**：只改实现新需求所必需的代码，不要顺手重构无关模块"
         "（如数据库层、迁移框架、构建脚本）；某文件只是看起来可以更好，就不要动它。",
+        # v1.3 T1.3：把阈值写成具体数字（服务端超阈值只告警、不阻断，提示词先劝一次）
+        f"- 本次改动面建议不超过基线的 {_pct(threshold)}：超出会触发「改动面过大，建议"
+        "人工复核」告警，请优先缩小改动范围。",
         "",
     ]
     paths = list(baseline.paths)
@@ -391,6 +425,18 @@ def _check_lines(template: TemplateContext) -> list[str]:
             lines.append(f"- `{command}`（权重 {_fmt_weight(weight)}）")
     lines.append("")
     return lines
+
+
+def _pct(ratio: float) -> str:
+    """把 0-1 的比例渲染成人读百分比（``0.5`` -> ``50%``；非数值回退 ``50%``）。"""
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        value = 0.5
+    if value <= 0 or value > 1:
+        value = 0.5
+    percent = value * 100
+    return f"{percent:.0f}%" if percent.is_integer() else f"{percent:.1f}%"
 
 
 def _fmt_weight(value: object) -> str:

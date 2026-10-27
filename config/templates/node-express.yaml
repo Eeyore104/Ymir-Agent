@@ -1,0 +1,149 @@
+# Node / Express + TypeScript 模板（v1.3，docs/11 §7.2.6 / §7.4 T3.2）
+#
+# 定位：与 fastapi-vue3（全栈）/ python-cli（脚本）/ data-pipeline（数据）形成第四象限 ——
+# 单服务端 Node（Express + TS），零前端。
+#
+# 骨架清单（恰 5 个 = max_files 上限）：
+#   ① package.json     reserved —— 脚本口径（build / test），改它等于改检查口径
+#   ② tsconfig.json    reserved —— 编译口径（outDir=dist / strict）
+#   ③ .env.example     reserved —— 只写空值，禁止真实密钥
+#   ④ src/index.ts     seed     —— 最小启动入口，模型须输出完整版
+#   ⑤ src/app.ts       seed     —— 最小 Express app，模型在其上挂路由
+#
+# ★ ★ 依赖白名单（B14 硬规则，docs/11 §7.7-R4）：Node 工具链（node 20 / npm / npx）
+#   与 `express` / `typescript` / `@types/*` 随 `docker/sandbox.Dockerfile` 的
+#   多阶段 Node 镜像 + `docker/node-baseline` 在 **同一 PR** 落地，
+#   `SANDBOX_IMAGE_NODE_PACKAGES` 与之同步（现在非空 ⇒ 本清单可以被校验 4 接受）。
+#
+# ★ ★ checks 口径：三条命令都带 `requires`（只写可执行文件名，docs/11 §7.5-3）。
+#   镜像里没有 node 工具链时，`run_checks` 会把它们记为 `skipped`（skipped_reason=
+#   requires_missing:<bin>）—— **不扣分、不阻断**，绝不把"环境缺失"判成代码缺陷。
+#   禁止写 `npm ci` / `npx -y`：前者断网必失败，后者会尝试联网（校验 14 虽只拦字面量，
+#   但规范里显式禁写，见 docs/11 §7.7-R4 ②）。
+
+id: node-express
+version: "1.0"
+name: Node / Express + TypeScript
+description: 单服务端 Express + TypeScript 的工程规范包（零前端，node 工具链随镜像预装）
+supports: [from_scratch, patch]
+
+stack:
+  language: typescript
+  runtime: "20"
+  backend: express
+  frontend: none
+  # node 包表已随 v1.3 与镜像同批落地（B14），故可直接声明（校验 4 通过）
+  dependencies: [express, typescript, "@types/express", "@types/node"]
+  package_manager: npm
+
+layout:
+  required_dirs: [src, tests]
+  required_files: [package.json]
+  any_of_files:
+    - [package.json, package-lock.json]
+  forbidden_dirs: [node_modules, dist]
+  snake_case_py: true
+  max_file_lines: 600
+  allowed_prefixes: [src/, tests/]
+
+conventions:
+  - { path: README.md, required: true }
+  - { path: .gitignore, required: true }
+
+# 受保护路径（v1.3 T1.1）：node 侧对应的测试夹具（基线提供的 setup 不可被重写）。
+protected:
+  paths:
+    - tests/setup.ts
+  on_hit: reject
+  max_change_ratio: 0.5
+
+skeleton:
+  max_files: 5
+  max_bytes: 32768
+  files:
+    - path: package.json
+      reserved: true
+      content: |
+        {
+          "name": "app",
+          "private": true,
+          "version": "0.1.0",
+          "type": "module",
+          "scripts": {
+            "build": "tsc -p tsconfig.json",
+            "test": "node --test dist"
+          }
+        }
+    - path: tsconfig.json
+      reserved: true
+      content: |
+        {
+          "compilerOptions": {
+            "target": "ES2022",
+            "module": "NodeNext",
+            "moduleResolution": "NodeNext",
+            "strict": true,
+            "outDir": "dist",
+            "rootDir": ".",
+            "skipLibCheck": true
+          },
+          "include": ["src/**/*.ts", "tests/**/*.ts"]
+        }
+    - path: .env.example
+      reserved: true
+      content: |
+        # 复制为 .env 后填写；真实密钥禁止入库
+        PORT=3000
+        DATABASE_URL=
+    - path: src/index.ts
+      reserved: false
+      content: |
+        import { createApp } from "./app.js";
+
+        const port = Number(process.env.PORT ?? 3000);
+        createApp().listen(port, () => {
+          console.log(`listening on ${port}`);
+        });
+    - path: src/app.ts
+      reserved: false
+      content: |
+        import express, { type Express } from "express";
+
+        export function createApp(): Express {
+          const app = express();
+          app.use(express.json());
+          return app;
+        }
+
+checks:
+  - type: command
+    run: "node-build ."
+    weight: 2
+    requires: node-build
+    timeout_s: 300
+  - type: command
+    run: "node --test dist"
+    weight: 2
+    requires: node
+    timeout_s: 300
+  - type: command
+    run: "npx tsc --noEmit"
+    weight: 1
+    requires: npx
+    timeout_s: 300
+
+prompting:
+  pm: >-
+    PRD 必须声明为单服务端 Node 服务（Express + TypeScript），给出路由清单、
+    请求/响应 schema 与错误码；不得引入前端、数据库 ORM 或额外框架（Nest/Koa 等）。
+  architect: >-
+    设计文档的目录结构必须与模板 layout 一致（src/ + tests/）；必须区分
+    app（可测试的 Express 实例工厂）与 index（监听端口的入口），路由按资源拆分模块。
+  engineer: >-
+    严格遵守模板目录规范；固定提供的文件不要输出（package.json / tsconfig.json /
+    .env.example）；给了最小版本的文件须输出完整版；**不要**执行 npm install / npx -y
+    （沙箱断网，依赖由镜像提供）；测试用 Node 内置 `node --test`（不要引入 jest）；
+    导出可测试的 `createApp()`，不要在被导入时监听端口。
+  qa: >-
+    证据链须引用模板检查命令的执行输出；node 工具链缺失时检查会被跳过（requires），
+    报告中须标注「环境缺失」而非代码缺陷，不得据此判 fail。

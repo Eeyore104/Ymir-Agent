@@ -1,0 +1,111 @@
+# 数据管道 / 定时任务模板（v1.3，docs/11 §7.2.6 / §7.4 T3.2）
+#
+# 定位：与 fastapi-vue3（全栈）/ python-cli（脚本）形成第三象限 ——
+# "读数据 → 清洗 → 落库/落文件"的批处理与定时任务。
+#
+# 骨架清单（4 个，**未达 max_files=5 上限**，刻意不硬凑第 5 个）：
+#   ① pyproject.toml        reserved —— 打包/测试口径
+#   ② ruff.toml             reserved —— checks 里跑 `ruff check .`，line-length=100
+#   ③ pipeline/__init__.py  seed     —— 包入口，模型须输出完整版（含版本号等）
+#   ④ requirements.txt      seed     —— 新增依赖出口
+# 注：骨架**不含任何测试文件**（docs/09 §12-3）：`has_tests` 会把"存在 tests/ 下 py 文件"
+#     直接算通过，骨架带测试等于白送结构分。
+#
+# ★ 依赖白名单口径（B14 硬规则，docs/11 §7.7-R4）：
+#   v1.3 起 `pandas` / `numpy` 已**预装进沙箱镜像**（`docker/sandbox.Dockerfile` 的
+#   pip 行），`SANDBOX_IMAGE_PACKAGES` 与之**同一 PR** 扩表 —— 本清单里的四个包
+#   都是镜像内真实可 import 的，不存在"能加载但跑不通"。
+#
+# ★ checks 口径：`python -c "import pandas"` 现在**真能通过**（v1.3 起 pandas / numpy 已预装进
+#   镜像，断网可跑）。刻意**不**写成 `|| true`：假绿会掩盖镜像漂移。
+
+id: data-pipeline
+version: "1.0"
+name: 数据管道 / 定时任务
+description: pandas 数据处理 + 定时任务场景（ETL / 报表 / 清洗脚本，零前端）
+supports: [from_scratch, patch]
+
+stack:
+  language: python
+  runtime: "3.12"
+  backend: none
+  frontend: none
+  # 只列镜像**确实预装**的包（校验 4 唯一权威表；pandas 见文件头说明）
+  dependencies: [pytest, ruff, pandas, numpy]
+  package_manager: uv
+
+layout:
+  required_dirs: [pipeline, tests]
+  required_files: [pyproject.toml]
+  any_of_files:
+    - [pyproject.toml, requirements.txt]
+  forbidden_dirs: [venv, .venv]
+  snake_case_py: true
+  max_file_lines: 600
+  allowed_prefixes: [pipeline/, tests/]
+
+conventions:
+  - { path: README.md, required: true }
+  - { path: .gitignore, required: true }
+
+# 受保护路径（v1.3 T1.1）：增量模式下基线自带的测试基础设施不可被静默覆盖。
+protected:
+  paths:
+    - tests/conftest.py
+  on_hit: reject
+  max_change_ratio: 0.5
+
+skeleton:
+  max_files: 5
+  max_bytes: 32768
+  files:
+    - path: pyproject.toml
+      reserved: true
+      content: |
+        [project]
+        name = "pipeline"
+        requires-python = ">=3.12"
+
+        [tool.pytest.ini_options]
+        pythonpath = ["."]
+    - path: ruff.toml
+      reserved: true
+      content: |
+        line-length = 100
+        target-version = "py312"
+
+        [lint]
+        select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
+    - path: pipeline/__init__.py
+      reserved: false
+      content: |
+        """pipeline 包入口。"""
+
+        __version__ = "0.1.0"
+    - path: requirements.txt
+      reserved: false
+      content: |
+        pytest>=8.2
+
+checks:
+  - { type: command, run: "python -m compileall -q pipeline", weight: 1 }
+  - { type: command, run: "python -m pytest -q", weight: 2 }
+  - { type: command, run: "ruff check .", weight: 1 }
+  - { type: command, run: 'python -c "import pipeline"', weight: 1 }
+  # pandas 检查：镜像已预装 pandas / numpy（v1.3 T2.2），断网可跑、真能通过
+  - { type: command, run: 'python -c "import pandas"', weight: 1 }
+
+prompting:
+  pm: >-
+    PRD 必须说明数据来源（文件/数据库/接口）、字段映射、清洗规则与调度方式
+    （cron 或 `--dry-run` 单次执行），不得引入 Web 框架与前端。
+  architect: >-
+    设计文档的目录结构必须与模板 layout 一致（pipeline/ + tests/）；数据读取、清洗、
+    写出三个阶段必须拆成可单测的纯函数；不得引入 Django/Flask/FastAPI。
+  engineer: >-
+    严格遵守模板目录规范；固定提供的文件不要输出；给了最小版本的文件须输出完整版；
+    新增依赖写入 requirements.txt；数据处理逻辑必须是纯函数（输入 DataFrame → 输出
+    DataFrame），I/O 与调度放在最外层，便于测试；既有测试是回归防线。
+  qa: >-
+    证据链须引用模板检查命令的执行输出；数据类结论必须给出输入样本与期望输出，
+    pandas 相关检查若因镜像缺包失败，须在报告中显式标注「环境缺失」而非代码缺陷。

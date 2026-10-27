@@ -1,13 +1,15 @@
-"""模板数据模型（v1.2，docs/09 §4.1.1）。
+"""模板数据模型（v1.3，docs/09 §4.1.1 / docs/11 §7.2.1）。
 
-一个模板 = ``config/templates/<id>.yaml`` 一个文件，六类声明：
+一个模板 = ``config/templates/<id>.yaml`` 一个文件，八类声明：
 
-- ``stack``：技术栈与依赖基线（``dependencies`` 必须 ⊆ 镜像清单）；
+- ``stack``：技术栈与依赖基线（``dependencies`` 必须 ⊆ 该语言的镜像清单）；
 - ``layout``：目录与命名规范（加载期过 ``normalize_rel_path``）；
 - ``conventions``：**模型必须产出**的规范文件集（不提供内容）；
 - ``skeleton``：**我们提供**的关键骨架（3–5 个配置类文件，≤32KB）；
 - ``checks``：确定性检查命令（进 ``EvalTask.checks``）；
-- ``prompting``：给四角色追加的约束文本（键必须是已注册角色 id）。
+- ``prompting``：给四角色追加的约束文本（键必须是已注册角色 id）；
+- ``protected``（v1.3）：受保护路径与命中策略（增量模式硬约束，T1.1）；
+- ``scoring``（v1.3）：分组配分口径（纯数据出口 ``to_scoring_rules()``，Q3）。
 
 **本模块只做数据定义，不做 IO**（读文件与校验在 :mod:`ymir.templates.loader`）。
 所有 model 一律 ``extra="forbid"``：模板作者拼错字段必须**加载期 1001**，
@@ -25,7 +27,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ymir.common.contracts import FrontendRules, LayoutRules
+from ymir.common.contracts import FrontendRules, LayoutRules, ScoringRules
 
 # 密钥指纹**实现在** ``common.secrets``（v1.2 r4 架构收口）：推送过滤在
 # ``artifacts``(rank 3)，若沿用 ``templates``(rank 2) 的定义就是逆层。
@@ -33,11 +35,14 @@ from ymir.common.contracts import FrontendRules, LayoutRules
 # 引用可用；**禁止**在此重新定义第二份正则（骨架校验 11 与推送过滤必须同源）。
 from ymir.common.secrets import SECRET_FINGERPRINTS as SECRET_FINGERPRINTS
 
-#: 沙箱镜像清单（**唯一权威**：docs/09 §8「镜像清单」表）。
+#: 沙箱镜像清单（**唯一权威**：docs/09 §8「镜像清单」表 + docs/11 §7.2.7）。
 #:
 #: 模板 ``stack.dependencies`` 必须 ⊆ 本表（加载期校验 4，违反即 1001）。
 #: 与「基准任务白名单（benchmark-12）」是**两张独立的表**，口径禁止互相借用
 #: （docs/09 §13「依赖三表」：\"模板能用\" ≠ \"任务能用\"）。
+#:
+#: ★ **B14 硬规则**：扩表必须与 ``docker/sandbox.Dockerfile`` 的 ``pip install`` 行
+#: **同一 PR** —— 否则会出现"模板能加载、沙箱里 import 不到"的谎报。
 SANDBOX_IMAGE_PACKAGES: frozenset[str] = frozenset(
     {
         "pytest",
@@ -50,8 +55,33 @@ SANDBOX_IMAGE_PACKAGES: frozenset[str] = frozenset(
         "sqlalchemy",
         "aiosqlite",
         "alembic",
+        # v1.3（B14：与 docker/sandbox.Dockerfile 的 pip 行同一 PR）——
+        # data-pipeline 模板的 `python -c "import pandas"` 检查依赖它们
+        "pandas",
+        "numpy",
     }
 )
+
+#: Node 侧镜像清单（校验 4 按语言选表；v1.3 已与 Dockerfile 同批落地）。
+#:
+#: 镜像内实际来源：多阶段 ``node:20-slim`` 拷贝的 node/npm/npx +
+#: ``/opt/node-baseline``（``docker/node-baseline/package.json`` 构建期 ``npm ci``）。
+#: ★ 改本表**必须**同步改 ``docker/node-baseline/package.json`` 与
+#: ``docker/sandbox.Dockerfile``（B14：表与镜像同一 PR，否则"能加载但跑不通"）。
+SANDBOX_IMAGE_NODE_PACKAGES: frozenset[str] = frozenset(
+    {
+        "express",
+        "typescript",
+        "@types/express",
+        "@types/node",
+    }
+)
+
+#: 允许的模板主语言（v1.3 校验 3 的口径，docs/11 §7.2.7）。
+#:
+#: 新增语言必须同时补齐：① 对应镜像包表（本模块）；② 镜像内工具链（Dockerfile）；
+#: ③ 模板骨架与 checks。三者缺一即"能加载但跑不通"。
+ALLOWED_LANGUAGES: frozenset[str] = frozenset({"python", "typescript"})
 
 #: 允许的模板模式（``supports`` 的取值集合，与 ``run.context`` 的模式同构）。
 RunMode = Literal["from_scratch", "patch"]
@@ -71,6 +101,20 @@ class CheckSpec(BaseModel):
     type: Literal["command"] = Field(default="command", description="检查类型（v1.2 只有 command）")
     run: str = Field(default="", description="在沙箱工作区执行的命令行")
     weight: float = Field(default=1.0, gt=0, description="权重（>0）")
+    # ---- v1.3（docs/11 §7.2.1）四个新字段，全部带默认值 ⇒ 旧模板行为不变 ----
+    group: str = Field(
+        default="", description="分组名（分组配分用：backend/frontend_static/frontend_build…）"
+    )
+    blocking: bool = Field(
+        default=False, description="阻断项：失败即不可交付（passed=False），分数照算"
+    )
+    requires: str = Field(
+        default="",
+        description="前置可执行文件名（只写文件名，如 node/npm/npx）；缺失则该检查 skipped 不扣分",
+    )
+    timeout_s: float | None = Field(
+        default=None, gt=0, description="单条检查超时（秒）；None = 用执行上下文缺省"
+    )
 
 
 class SkeletonFile(BaseModel):
@@ -139,7 +183,10 @@ class StackSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(default="python", description="主语言（v1.2 只支持 python）")
+    language: str = Field(
+        default="python",
+        description="主语言（v1.3：python | typescript，见 ALLOWED_LANGUAGES）",
+    )
     runtime: str = Field(default="", description="运行时版本，如 3.12")
     backend: str = Field(default="none", description="后端框架标识，如 fastapi")
     frontend: str = Field(default="none", description="前端框架标识，如 vue3 / none")
@@ -164,6 +211,47 @@ class LayoutSpec(BaseModel):
     frontend: FrontendRules | None = Field(default=None)
 
 
+class ProtectedSpec(BaseModel):
+    """受保护路径声明（v1.3 T1.1 / T1.3，docs/11 §7.2.1）。
+
+    典型用途：``tests/conftest.py`` 由基线提供且必须保持原样 —— 模型在增量模式下
+    重写它会静默毁掉基线既有测试（两次实测复现，docs/11 §1.1）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(
+        default_factory=list,
+        description="受保护路径；尾斜杠 = 目录前缀（同 layout.allowed_prefixes 约定）",
+    )
+    on_hit: Literal["reject", "ignore"] = Field(
+        default="reject",
+        description="命中策略（Q1 定案 A=reject）：reject 抛冲突；ignore 保留基线版本",
+    )
+    max_change_ratio: float = Field(
+        default=0.5,
+        gt=0,
+        le=1,
+        description="改动面告警阈值（T1.3；与 artifacts.merge.DEFAULT_MAX_CHANGE_RATIO 同源）",
+    )
+
+
+class ScoringSpec(BaseModel):
+    """打分口径声明（v1.3 Q3，docs/11 §7.2.1）。
+
+    ★ 只有需要「显式分组配分」的模板才声明；未声明 ⇒ 走 v1.2 老口径（分数零变化）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runnability_points: dict[str, float] = Field(
+        default_factory=dict, description="组名 -> 可运行率维度内点数（空 = 不启用）"
+    )
+    frontend_scored_in_runnability: bool = Field(
+        default=False, description="True ⇒ 前端结构规则只在 runnability 内计分"
+    )
+
+
 class TemplateSpec(BaseModel):
     """一个垂直场景模板（约束包 + 关键骨架）。"""
 
@@ -182,6 +270,10 @@ class TemplateSpec(BaseModel):
     supports: list[RunMode] = Field(
         default_factory=lambda: ["from_scratch", "patch"], description="支持的生成模式"
     )
+    #: 受保护路径（v1.3 T1.1）。缺省空 ⇒ 合并行为与 v1.2 完全一致。
+    protected: ProtectedSpec = Field(default_factory=ProtectedSpec)
+    #: 打分口径（v1.3 Q3）。缺省空 ⇒ 走 v1.2 老口径。
+    scoring: ScoringSpec = Field(default_factory=ScoringSpec)
 
     # ------------------------------------------------ 跨层纯数据出口（2 -> 5 / 2 -> 3）
 
@@ -200,12 +292,35 @@ class TemplateSpec(BaseModel):
             snake_case_py=self.layout.snake_case_py,
             max_file_lines=self.layout.max_file_lines,
             allowed_prefixes=list(self.layout.allowed_prefixes),
+            # v1.3 B4：**模板自己声明的根级文件**自动获得允许，不再需要作者把
+            # `README.md` 之类重复登记进 `allowed_prefixes`（也不硬编码任何文件名）。
+            # 两类来源都要算，否则这条规则对**每套模板**都恒判失败：
+            #   ① conventions（模板要求模型产出的根文件，如 README.md / .gitignore）
+            #   ② skeleton（模板**自己**落位的根文件，如 pyproject.toml / ruff.toml）
+            # 二者都是"模板/基线提供的合法路径"，不是模型越界。
+            allowed_files=self._root_level_files(),
             frontend=(
                 self.layout.frontend.model_copy(deep=True)
                 if self.layout.frontend is not None
                 else None
             ),
         )
+
+    def _root_level_files(self) -> list[str]:
+        """模板声明的**根级文件**（无目录分隔符），去重保序。
+
+        来源：``conventions[].path`` + ``skeleton.files[].path``（v1.3 B4）。
+        """
+        paths: list[str] = []
+        for raw in (
+            *[item.path for item in self.conventions],
+            *[item.path for item in self.skeleton.files],
+        ):
+            if "/" in raw:
+                continue
+            if raw not in paths:
+                paths.append(raw)
+        return paths
 
     def skeleton_files(self) -> dict[str, str]:
         """骨架文件集（``path -> content``，纯 dict，供 ``artifacts.merge_trees``）。
@@ -222,6 +337,24 @@ class TemplateSpec(BaseModel):
     def seed_paths(self) -> frozenset[str]:
         """已给最小版本、需要模型输出完整版的路径（仅提示词渲染用）。"""
         return self.skeleton.seed_paths
+
+    def protected_paths(self) -> frozenset[str]:
+        """受保护路径（纯数据，供 ``artifacts.merge_trees`` 与提示词渲染）。
+
+        返回 ``frozenset[str]`` 而不是本模型：``merge_trees`` 在 ``artifacts``(rank 3)，
+        ``artifacts -> templates`` 是逆层（CI 拦，docs/11 §7.5-6），因此只能传纯数据。
+        """
+        return frozenset(self.protected.paths)
+
+    def to_scoring_rules(self) -> ScoringRules:
+        """导出打分口径（``common.contracts.ScoringRules``，供 evaluation 消费）。
+
+        ``templates``(2) -> ``common``(5) 是合法边（与 :meth:`to_layout_rules` 同理）。
+        """
+        return ScoringRules(
+            runnability_points=dict(self.scoring.runnability_points),
+            frontend_scored_in_runnability=self.scoring.frontend_scored_in_runnability,
+        )
 
 
 @dataclass(frozen=True)

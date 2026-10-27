@@ -21,6 +21,14 @@
 判定**只在**本函数内部完成（依据只有 ``base_paths`` 与 ``reserved_paths`` 两个纯参数）：
 不在 ``templates``（模板不该知道基线状态）、不在 ``role_executor``（编排只解数据不做策略）、
 不在 ``store``（store 只负责不可变落盘）。
+
+**v1.3 追加：受保护路径（T1.1）与改动面告警（T1.3）**
+
+- ``protected_paths`` 命中时按 ``on_protected_hit`` 处置：``reject`` 抛
+  :class:`ProtectedPathConflict`（唯一抛异常场景，**应用补丁前整批抛**）；
+  ``ignore`` 丢弃模型内容、保留基线版本并记 ``conflicts`` / ``counts.protected_hits``；
+- ``change_ratio`` / ``warnings`` 只进 manifest，**不改变** ``files``；
+- ``manifest_json()`` 采「非默认值才序列化」，未触发新能力时与 v1.2 **逐字节一致**（A4）。
 """
 
 from __future__ import annotations
@@ -34,8 +42,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ymir.artifacts.versioning import compute_content_hash
-from ymir.common.errors import InvalidParamError
-from ymir.common.paths import normalize_rel_path
+from ymir.common.errors import InvalidParamError, StateConflictError
+from ymir.common.paths import normalize_rel_path, normalize_scope_path
 
 #: 单文件大小上限（超过即记 ``too_large`` 并跳过，不阻断整次合并）。
 DEFAULT_MAX_FILE_BYTES: int = 512 * 1024
@@ -49,6 +57,9 @@ PATCH_MANIFEST_NAME: str = "patch_manifest.json"
 
 #: 冲突原因（``delete_conflict`` 为本实现的补充值：docs/09 §4.2.2 未定义
 #: "同一路径既在 ``deleted`` 又有补丁正文" 的处置，此处定为**删除优先**并显式记账）。
+#:
+#: v1.3（docs/11 §7.2.3）**追加**第 7 个值 ``protected_path``：命中模板声明的
+#: 受保护路径（只增不改，历史 manifest 仍可解析）。
 ConflictReason = Literal[
     "delete_missing",
     "path_type_conflict",
@@ -56,7 +67,29 @@ ConflictReason = Literal[
     "invalid_path",
     "reserved",
     "delete_conflict",
+    "protected_path",
 ]
+
+#: 受保护路径命中策略（v1.3，docs/11 §7.2.3）。
+#:
+#: 与 ``templates.models.ProtectedSpec.on_hit`` **同构**，但两者各写一份字面量而
+#: **不跨层 import**（``artifacts``(3) -> ``templates``(2) 是逆层，CI 拦）——
+#: 与 :data:`MergeMode` / ``RunMode`` 的既有做法一致。
+ProtectedPolicy = Literal["reject", "ignore"]
+
+#: 改动面告警阈值缺省值（v1.3 T1.3，docs/11 §7.2.3）。
+#:
+#: 数值与 ``templates.models.ProtectedSpec.max_change_ratio`` 的默认值**同源**
+#: （两处注释互指），但同样不跨层 import。
+DEFAULT_MAX_CHANGE_RATIO: float = 0.5
+
+#: ``warnings`` 短码前缀（≤3 条、每条 ≤64 字节，docs/11 §7.5-2）。
+CHANGE_RATIO_WARNING_PREFIX: str = "change_ratio_exceeded:"
+PROTECTED_HIT_WARNING_PREFIX: str = "protected_path_ignored:"
+
+#: ``warnings`` 条数与单条字节上限（体积硬约束，docs/11 §7.5-2）。
+WARNINGS_MAX_ITEMS: int = 3
+WARNING_MAX_BYTES: int = 64
 
 #: 合并模式：``from_scratch`` 骨架全量注入 / ``patch`` 仅补缺失 / ``merge`` 纯基线合并。
 MergeMode = Literal["from_scratch", "patch", "merge"]
@@ -68,6 +101,35 @@ class Conflict:
 
     path: str
     reason: ConflictReason
+
+
+class ProtectedPathConflict(StateConflictError):
+    """模型输出命中了模板声明的**受保护路径**（v1.3 T1.1，docs/11 §7.3-1）。
+
+    业务码沿用 ``1003``（HTTP 409），**不新增 1008**：语义上它就是「状态冲突」——
+    基线版本不可被静默覆盖。``details`` 固定为
+    ``{"reason": "protected_path", "paths": [...]}``，供 API 层与审批卡片直接消费。
+
+    ★ 本异常是 :func:`merge_trees` **唯一**抛异常的场景，且命中集合在应用补丁
+    **之前**一次性算出并整批抛出（便于编排层把全部路径一次回喂模型）。
+    """
+
+    def __init__(
+        self,
+        paths: Sequence[str],
+        message: str = "",
+        *,
+        reason: str = "protected_path",
+    ) -> None:
+        unique = tuple(dict.fromkeys(str(path) for path in paths))
+        self.paths = unique
+        self.reason = reason
+        text = message or (
+            "命中受保护路径（由基线提供、不允许修改）："
+            + "、".join(unique)
+            + "；请改为新建文件实现目标"
+        )
+        super().__init__(text, details={"reason": reason, "paths": list(unique)})
 
 
 class ManifestConflict(BaseModel):
@@ -91,6 +153,9 @@ class PatchCounts(BaseModel):
     skeleton_added: int = 0
     reserved_conflicts: int = 0
     skipped_existing: int = 0
+    #: 被拦截的受保护路径条数（v1.3 T1.1）：``ignore`` 策略下记数；
+    #: ``reject`` 策略直接抛 :class:`ProtectedPathConflict`（不产出 manifest），故不记。
+    protected_hits: int = 0
 
 
 class PatchManifest(BaseModel):
@@ -98,6 +163,10 @@ class PatchManifest(BaseModel):
 
     无时间戳字段是**刻意**的：``generated_at`` 会让"同一输入两次合并字节一致"
     不可成立（T2.1 DoD ③），而时间信息由产物落盘的 ``created_at`` 承担。
+
+    v1.3（T1.3）追加两个**带默认值**的字段，并由 :meth:`MergeResult.manifest_json`
+    做「非默认值才序列化」—— 未触发新能力时 ``patch_manifest.json`` 与 v1.2
+    **逐字节一致**（契约 A4，docs/11 §7.2.3）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -111,6 +180,12 @@ class PatchManifest(BaseModel):
     skeleton_added: list[str] = Field(default_factory=list)
     reserved_conflicts: list[str] = Field(default_factory=list)
     skipped_existing: list[str] = Field(default_factory=list)
+    #: 改动面 = ``len(changed_paths) / max(1, 基线文件数)``，保留 2 位小数（T1.3）。
+    #: 无基线（``from_scratch``）恒为 ``0.0``。
+    change_ratio: float = 0.0
+    #: 机器短码告警（≤3 条、每条 ≤64 字节）。已知取值：
+    #: ``change_ratio_exceeded:<ratio>`` / ``protected_path_ignored:<n>``。
+    warnings: list[str] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -138,9 +213,26 @@ class MergeResult:
         )
 
     def manifest_json(self) -> str:
-        """``patch_manifest.json`` 正文（键排序 + 紧凑分隔符 ⇒ 字节稳定）。"""
+        """``patch_manifest.json`` 正文（键排序 + 紧凑分隔符 ⇒ 字节稳定）。
+
+        ★★ **A4 字节级契约**：v1.3 新增字段采用「**非默认值才序列化**」——
+        ``change_ratio == 0.0`` / ``warnings`` 为空 / ``counts.protected_hits == 0``
+        时把对应键 pop 掉，使未触发新能力的输入产出的正文与 v1.2 **逐字节相同**。
+
+        ★ 删除下面任何一个 ``pop`` 判断都等于**破坏 A4 契约**：
+        历史批次报告与前端 diff 会立刻出现"看起来改过、实际没改"的噪音
+        （docs/11 §7.7-R6，回归用例见 ``tests/test_patch.py`` 的逐字节快照）。
+        """
+        payload = self.manifest.model_dump(mode="json")
+        if self.manifest.change_ratio == 0.0:
+            payload.pop("change_ratio", None)
+        if not self.manifest.warnings:
+            payload.pop("warnings", None)
+        counts = payload.get("counts")
+        if isinstance(counts, dict) and not counts.get("protected_hits"):
+            counts.pop("protected_hits", None)
         return json.dumps(
-            self.manifest.model_dump(mode="json"),
+            payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -227,6 +319,97 @@ def _prefix_conflict(tree: AbstractSet[str], path: str) -> str | None:
     return None
 
 
+# ------------------------------------------------------- 受保护路径 / 改动面（v1.3 T1.1/T1.3）
+
+
+def detect_protected_hits(
+    patch_paths: AbstractSet[str],
+    protected_paths: AbstractSet[str],
+) -> tuple[str, ...]:
+    """返回命中的受保护路径（排序、去重）。纯函数，无 IO。
+
+    匹配规则（与 ``layout.allowed_prefixes`` 的尾斜杠约定同源）：
+
+    - ``protected`` 以 ``/`` 结尾 ⇒ **目录前缀**：``p == d`` / ``p.startswith(d)`` /
+      ★ ``p == d.rstrip("/")``；
+    - 否则 ⇒ **精确文件**：``p == protected``。
+
+    ★ 第三条（F6，QA P3-2）解决"**无扩展名文件**无法被保护"的漏洞：
+    ``normalize_scope_path`` 会把 ``Dockerfile``（末段无扩展名）当目录补成
+    ``Dockerfile/``，而 ``Dockerfile == "Dockerfile/"`` 与
+    ``"Dockerfile".startswith("Dockerfile/")`` **都不成立** ⇒ 改写完全不拦且无报错。
+    加上 ``p == d.rstrip("/")`` 后，``Dockerfile`` 这种声明既能保护**该文件本身**，
+    也继续保护以它为名的目录内容（``Dockerfile/extra``）。
+
+    返回的是**补丁侧**的路径（而不是保护声明的字面量），因为回喂模型时必须
+    给出它实际写过的文件名（``tests/conftest.py``），不能只给目录。
+
+    ★ 本函数只做**路径匹配**；「内容是否真的变了」由调用方过滤（QA F2：
+    ``merge_trees`` 只把 ``patch[p] != base[p]`` 的路径传给本函数，原样回显交给
+    noop 语义吃掉）。
+    """
+    hits: set[str] = set()
+    prefixes = tuple(item for item in protected_paths if item.endswith("/"))
+    # 目录项的「本名」形态：`Dockerfile/` → `Dockerfile`（保护无扩展名单文件，F6）
+    prefix_names = frozenset(item.rstrip("/") for item in prefixes)
+    exact = frozenset(item for item in protected_paths if not item.endswith("/"))
+    for path in patch_paths:
+        if path in exact or path in prefix_names:
+            hits.add(path)
+            continue
+        if any(path.startswith(item) for item in prefixes):
+            hits.add(path)
+    return tuple(sorted(hits))
+
+
+def compute_change_ratio(changed_paths: Sequence[str], base_file_count: int) -> float:
+    """改动面 = ``len(changed_paths) / max(1, base_file_count)``，四舍五入 2 位。
+
+    无基线（``base_file_count <= 0``，即 ``from_scratch``）返回 ``0.0`` —— 从零生成
+    没有"改动面"这一概念，报一个非零值只会误导人审。
+    """
+    if base_file_count <= 0:
+        return 0.0
+    unique = len(set(changed_paths))
+    return round(unique / max(1, base_file_count), 2)
+
+
+def _normalize_protected(paths: AbstractSet[str]) -> frozenset[str]:
+    """归一化受保护路径（目录前缀保留 / 自动补尾斜杠）。
+
+    与模板加载期校验 18 **同一实现**（:func:`ymir.common.paths.normalize_scope_path`）：
+    ``tests`` / ``tests/`` 都归一为 ``tests/``，``tests/conftest.py`` 保持精确匹配。
+
+    非法路径**静默丢弃**而不是抛异常：模板加载期校验 18 已保证合法，这里的
+    归一化只是防御（``merge_trees`` 的既有纪律是"模型笔误不毁整次生成"）。
+    """
+    normalized: set[str] = set()
+    for raw in paths:
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            normalized.add(normalize_scope_path(text))
+        except InvalidParamError:
+            continue
+    return frozenset(normalized)
+
+
+def _bounded_warnings(codes: Sequence[str]) -> list[str]:
+    """裁剪告警短码（≤3 条、每条 ≤64 字节，且去重保序）。"""
+    result: list[str] = []
+    for raw in codes:
+        code = str(raw)
+        encoded = code.encode("utf-8")
+        if len(encoded) > WARNING_MAX_BYTES:
+            code = encoded[:WARNING_MAX_BYTES].decode("utf-8", "ignore")
+        if code and code not in result:
+            result.append(code)
+        if len(result) >= WARNINGS_MAX_ITEMS:
+            break
+    return result
+
+
 def merge_trees(
     base: Mapping[str, str],
     patch: Mapping[str, str],
@@ -237,6 +420,9 @@ def merge_trees(
     base_paths: AbstractSet[str] = frozenset(),
     deleted: Sequence[str] = (),
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    protected_paths: AbstractSet[str] = frozenset(),
+    on_protected_hit: ProtectedPolicy = "reject",
+    max_change_ratio: float = DEFAULT_MAX_CHANGE_RATIO,
 ) -> MergeResult:
     """合并基线树与补丁树（纯函数），并按优先级表处理骨架注入。
 
@@ -251,20 +437,44 @@ def merge_trees(
             阶段一只给路径清单而不给正文时显式传入。
         deleted: 要从基线删除的相对路径（仅 ``patch`` / ``merge`` 有意义）。
         max_file_bytes: 单文件字节上限，超限记 ``too_large`` 并跳过。
+        protected_paths: 受保护路径（v1.3 T1.1；纯数据，元素语义同
+            ``layout.allowed_prefixes``：尾斜杠 = 目录前缀，经
+            ``common.paths.normalize_scope_path`` 归一化 —— ``tests`` 与 ``tests/``
+            等价）。**空集合 ⇒ 永不抛出**，v1.0–v1.2 行为逐字节不变。
+            ★ **本函数不看 ``mode``**：``from_scratch`` 是否启用保护由**编排层**决定
+            （``role_executor._apply_patch_contract`` 的 ``and base_files``）——
+            纯函数只回答"给了这组参数怎么合"，不猜调用方意图（QA 澄清项）。
+        on_protected_hit: ``reject``（默认）= 抛 :class:`ProtectedPathConflict`；
+            ``ignore`` = 丢弃模型内容、保留基线版本、记 manifest。
+        max_change_ratio: 改动面告警阈值（v1.3 T1.3，``(0, 1]``）。超阈值只记
+            ``warnings``，**不阻断**合并。
 
     Returns:
         :class:`MergeResult`：``files``（合并后树）+ ``manifest``（可序列化记账）。
 
     Raises:
-        InvalidParamError: ``mode`` 非法 / ``max_file_bytes`` 非正。
+        InvalidParamError: ``mode`` 非法 / ``max_file_bytes`` 非正；
+            v1.3 追加：``max_change_ratio`` 不在 ``(0, 1]`` / ``on_protected_hit`` 非法。
+        ProtectedPathConflict: 命中 ``protected_paths`` 且策略为 ``reject``
+            （1003 / HTTP 409，``details={"reason":"protected_path","paths":[...]}``）。
 
     Note:
         ``base`` / ``patch`` / ``skeleton`` **不会被原地修改**（内部先复制）。
+
+        v1.3 三段式处置（docs/11 §7.3-4）：本函数只负责**第一段**（``reject`` 抛出）；
+        「1 次定向重试」与「兜底 ``ignore``」由编排层
+        （``orchestrator.role_executor._execute_with_patch_contract``）承担。
     """
     if mode not in ("from_scratch", "patch", "merge"):
         raise InvalidParamError(f"非法合并模式: {mode!r}")
     if max_file_bytes <= 0:
         raise InvalidParamError(f"max_file_bytes 必须为正数: {max_file_bytes}")
+    if on_protected_hit not in ("reject", "ignore"):
+        raise InvalidParamError(f"非法受保护路径策略: {on_protected_hit!r}")
+    if not (0 < max_change_ratio <= 1):
+        raise InvalidParamError(
+            f"max_change_ratio 必须在 (0, 1] 区间: {max_change_ratio}"
+        )
 
     base_norm, base_conflicts = _normalize_lenient(base)
     patch_norm, patch_conflicts = _normalize_lenient(patch)
@@ -278,6 +488,30 @@ def merge_trees(
         *deleted_conflicts,
     ]
 
+    # ---- 受保护路径判定（v1.3 T1.1）：应用补丁**之前**一次性算全量并整批处置 ----
+    # ★ F2（QA P2）：**只有内容真的变了才算命中**。
+    # 模型把基线文件原样回显（``patch[p] == base[p]``）属于「未修改」，v1.2 的 noop
+    # 语义本就吃掉它；若在此判成命中，则 reject 会白烧一次全量模型重试、ignore 会产出
+    # ``protected_path_ignored:1`` 的假噪音。**这不是放松约束**：内容一字节没变，
+    # 受保护文件就没有被改动。
+    # ``deleted`` 通道**无条件命中**：删除是不可逆的破坏，不能靠"内容相同"豁免。
+    protected = _normalize_protected(protected_paths)
+    changed_patch_paths = frozenset(
+        path
+        for path, content in patch_norm.items()
+        if path not in base_norm or base_norm[path] != content
+    )
+    protected_hits: frozenset[str] = frozenset(
+        detect_protected_hits(
+            changed_patch_paths | frozenset(deleted_paths), protected
+        )
+    )
+    if protected_hits and on_protected_hit == "reject":
+        # 整批抛出（不是"抛第一个"）：回喂模型时必须给出全部命中路径。
+        raise ProtectedPathConflict(sorted(protected_hits))
+    for path in sorted(protected_hits):
+        conflicts.append(Conflict(path=path, reason="protected_path"))
+
     known_base_paths: frozenset[str] = (
         frozenset(base_paths) if base_paths else frozenset(base_norm)
     )
@@ -286,6 +520,7 @@ def merge_trees(
 
     files: dict[str, str] = dict(base_norm)
     counts = PatchCounts()
+    counts.protected_hits = len(protected_hits)
     added_paths: list[str] = []
     modified_paths: list[str] = []
     applied_deleted: list[str] = []
@@ -295,7 +530,7 @@ def merge_trees(
 
     # ---- 骨架决策（优先级表 1/2/3；mode="merge" 一律不注入）----
     inject: dict[str, str] = {}
-    drop_model: set[str] = set()
+    drop_model: set[str] = set(protected_hits)
     if mode != "merge":
         for path in sorted(skeleton_norm):
             content = skeleton_norm[path]
@@ -315,6 +550,9 @@ def merge_trees(
     # ---- 补丁应用（新增 / 修改 / noop / 冲突）----
     for path in sorted(patch_norm):
         content = patch_norm[path]
+        if path in protected_hits:
+            # ignore 策略：丢弃模型内容、保留基线版本（files 里已有 base_norm 的内容）
+            continue
         if path in deleted_set:
             # 同一路径既声明删除又给了正文：删除优先（显式删除意图最强）
             conflicts.append(Conflict(path=path, reason="delete_conflict"))
@@ -342,6 +580,9 @@ def merge_trees(
 
     # ---- 删除应用（指向不存在路径只记账，不报错）----
     for path in deleted_paths:
+        if path in protected_hits:
+            # 受保护路径不可删除：与"改内容"同口径，保留基线版本
+            continue
         if path not in base_norm and path not in known_base_paths:
             conflicts.append(Conflict(path=path, reason="delete_missing"))
             continue
@@ -378,6 +619,15 @@ def merge_trees(
     counts.reserved_conflicts = len(reserved_conflicts)
     counts.skipped_existing = len(skipped_existing)
 
+    # ---- 改动面与告警（v1.3 T1.3）：只写 manifest，**不改变** files ----
+    change_ratio = compute_change_ratio(changed_paths, len(base_norm))
+    warning_codes: list[str] = []
+    if protected_hits and on_protected_hit == "ignore":
+        warning_codes.append(f"{PROTECTED_HIT_WARNING_PREFIX}{len(protected_hits)}")
+    if len(base_norm) > 0 and change_ratio > max_change_ratio:
+        # 超阈值只提示、不阻断（T1.3 DoD ④：提示而非拒绝）
+        warning_codes.append(f"{CHANGE_RATIO_WARNING_PREFIX}{change_ratio:.2f}")
+
     manifest = PatchManifest(
         mode=mode,
         base_content_hash=compute_content_hash(base_norm) if base_norm else "",
@@ -390,5 +640,7 @@ def merge_trees(
         skeleton_added=sorted(skeleton_added),
         reserved_conflicts=sorted(reserved_conflicts),
         skipped_existing=sorted(skipped_existing),
+        change_ratio=change_ratio,
+        warnings=_bounded_warnings(warning_codes),
     )
     return MergeResult(files=files, manifest=manifest)

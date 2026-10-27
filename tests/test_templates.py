@@ -1,7 +1,8 @@
 """模板模型与加载器测试（v1.2 · T1.1，docs/09 §4.1.1 / §4.1.5）。
 
 覆盖口径：
-- **17 条加载期校验逐条 1 条用例**（``test_checkNN_*``），其中骨架 6 条为重点；
+- **21 条加载期校验逐条 1 条用例**（``test_checkNN_*``）：1–17 见 v1.2，18–21 见 v1.3
+  （受保护路径 / on_hit 枚举 / max_change_ratio 区间 / scoring 配分完整性）；
 - 字段名反断言（``type`` 存在 / ``kind`` 不存在）+ ``kind`` 写进 YAML 必 1001；
 - ``to_layout_rules()`` 与 YAML 一致；``SkeletonSpec`` 两类路径互补；
 - ``list_templates`` 让坏模板以 ``loading_error`` 暴露而不整体失败。
@@ -34,12 +35,12 @@ from ymir.templates import (
     load_template,
     load_template_file,
 )
-from ymir.templates.models import SkeletonSpec
+from ymir.templates.models import SANDBOX_IMAGE_NODE_PACKAGES, SkeletonSpec
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "templates"
 #: **真实**模板目录（T1.4 落的两套垂直模板）
 TEMPLATES_DIR = PROJECT_ROOT / "config" / "templates"
-REAL_TEMPLATE_IDS = ("fastapi-vue3", "python-cli")
+REAL_TEMPLATE_IDS = ("fastapi-vue3", "python-cli", "data-pipeline", "node-express")
 #: 已注册角色（与 config/roles/*.yaml 一致；显式传入以免测试依赖工作目录）
 ROLES = {"pm", "architect", "engineer", "qa"}
 
@@ -95,7 +96,7 @@ def test_load_template_missing_is_1002() -> None:
     assert excinfo.value.biz_code == BizCode.NOT_FOUND
 
 
-# --------------------------------------------------------------------- 17 条校验逐条
+# ------------------------------------------------------- 加载期校验逐条（1–17 / v1.3 18–21）
 
 
 def test_check01_id_must_equal_file_stem(tmp_path: Path) -> None:
@@ -112,19 +113,74 @@ def test_check02_version_not_empty(tmp_path: Path) -> None:
     _expect_1001(tmp_path, data, check_no=2)
 
 
-def test_check03_language_must_be_python(tmp_path: Path) -> None:
-    """校验 3：``stack.language == "python"``（锁定 L2）。"""
-    data = _demo()
-    data["stack"]["language"] = "java"
-    _expect_1001(tmp_path, data, check_no=3)
+def test_check03_language_allowlist(tmp_path: Path) -> None:
+    """校验 3（v1.3 放宽）：``python`` / ``typescript`` 合法，其它一律 1001。
+
+    归一化（大小写）只用于比对，``stack.language`` 原样保留。
+    """
+    for language in ("python", "typescript", "Python", "TYPESCRIPT"):
+        data = _demo()
+        data["stack"]["language"] = language
+        data["stack"]["dependencies"] = []
+        spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+        assert spec.stack.language == language
+
+    for language in ("java", "go", "ruby", ""):
+        data = _demo()
+        data["stack"]["language"] = language
+        _expect_1001(tmp_path, data, check_no=3)
+
+
+def test_check03_language_allowlist_constant() -> None:
+    """校验 3 的取值集合是 ``ALLOWED_LANGUAGES``（新增语言必须同时补镜像与骨架）。"""
+    from ymir.templates.models import ALLOWED_LANGUAGES
+
+    assert set(ALLOWED_LANGUAGES) == {"python", "typescript"}
 
 
 def test_check04_dependencies_must_subset_image(tmp_path: Path) -> None:
-    """校验 4：``stack.dependencies ⊆ 镜像清单``（fail-fast）。"""
+    """校验 4：``stack.dependencies ⊆ 镜像清单``（fail-fast）。
+
+    v1.3：``numpy`` / ``pandas`` 已随镜像扩表（B14 同一 PR），因此这里换成
+    镜像内确实没有的包（``torch``）来验证拒绝逻辑。
+    """
     data = _demo()
-    data["stack"]["dependencies"] = ["fastapi", "numpy"]
+    data["stack"]["dependencies"] = ["fastapi", "torch"]
     message = _expect_1001(tmp_path, data, check_no=4)
-    assert "numpy" in message
+    assert "torch" in message
+
+
+def test_check04_node_table_is_language_selected(tmp_path: Path) -> None:
+    """校验 4（v1.3 语义细化）：按 ``language`` 选表 —— python / node 各一张，互不串味。"""
+    from ymir.templates.loader import image_packages_for
+    from ymir.templates.models import SANDBOX_IMAGE_NODE_PACKAGES
+
+    assert image_packages_for("python") == SANDBOX_IMAGE_PACKAGES
+    assert image_packages_for("typescript") == SANDBOX_IMAGE_NODE_PACKAGES
+    assert image_packages_for("java") == frozenset()
+    # 两张表刻意不重叠：node 模板别指望用 pytest，python 模板别指望用 express
+    assert not (set(SANDBOX_IMAGE_PACKAGES) & set(SANDBOX_IMAGE_NODE_PACKAGES))
+    assert {"express", "typescript", "@types/express", "@types/node"} == set(
+        SANDBOX_IMAGE_NODE_PACKAGES
+    )
+
+    data = _demo()
+    data["stack"]["language"] = "typescript"
+    data["stack"]["dependencies"] = ["express", "typescript>=5", "@types/node"]
+    spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+    assert spec.stack.language == "typescript"
+
+    # node 表里没有的包仍被拒（不在镜像内 ⇒ 不谎报）
+    data = _demo()
+    data["stack"]["language"] = "typescript"
+    data["stack"]["dependencies"] = ["lodash"]
+    message = _expect_1001(tmp_path, data, check_no=4)
+    assert "typescript" in message and "lodash" in message
+
+    # python 模板不能声明 node 依赖（选表是**按语言**，不是并集）
+    data = _demo()
+    data["stack"]["dependencies"] = ["express"]
+    _expect_1001(tmp_path, data, check_no=4)
 
 
 def test_check04_dependency_names_tolerate_version_specifiers() -> None:
@@ -297,7 +353,7 @@ def test_check17_default_role_ids_from_config() -> None:
     assert {"pm", "architect", "engineer", "qa"} <= ids
 
 
-# ---------------------------------------------------------------- 模型层硬约束（非 17 条）
+# ---------------------------------------------------------------- 模型层硬约束（非校验条目）
 
 
 def test_checkspec_has_type_not_kind() -> None:
@@ -400,13 +456,18 @@ def test_list_templates_empty_dir(tmp_path: Path) -> None:
 
 @pytest.fixture(scope="module")
 def real_templates() -> dict[str, TemplateSpec]:
-    """从**真实** ``config/templates/`` 加载两套模板（17 条校验全过才算可用）。"""
+    """从**真实** ``config/templates/`` 加载两套模板（21 条校验全过才算可用）。"""
     return {tid: load_template(tid, known_roles=ROLES) for tid in REAL_TEMPLATE_IDS}
 
 
 def test_real_templates_load_through_all_checks(real_templates: dict[str, TemplateSpec]) -> None:
-    """DoD ①：两模板都通过 17 条加载期校验并列出。"""
-    assert set(real_templates) == {"fastapi-vue3", "python-cli"}
+    """DoD ①：四套模板都通过 21 条加载期校验并列出（v1.3：2 → 4 套）。"""
+    assert set(real_templates) == {
+        "fastapi-vue3",
+        "python-cli",
+        "data-pipeline",
+        "node-express",
+    }
     listed = {entry.id: entry for entry in list_templates(known_roles=ROLES)}
     for template_id in REAL_TEMPLATE_IDS:
         assert listed[template_id].ok, listed[template_id].loading_error
@@ -420,7 +481,16 @@ def test_real_templates_checks_are_executable(
         assert len(spec.checks) >= 3, template_id
         assert all(check.type == "command" for check in spec.checks), template_id
         runs = [check.run for check in spec.checks]
-        executable_tokens = ("pytest", "compileall", "python -m", "python -c")
+        # v1.3：node 模板的执行型入口是 node-build / node --test / npx tsc
+        executable_tokens = (
+            "pytest",
+            "compileall",
+            "python -m",
+            "python -c",
+            "node-build",
+            "node --test",
+            "npx tsc",
+        )
         assert any(token in run for run in runs for token in executable_tokens), (
             f"{template_id} 缺少执行型检查：{runs}"
         )
@@ -489,7 +559,12 @@ def test_ruff_toml_consistency_with_checks_and_layout(
     行长度（每行字符）与 ``layout.max_file_lines``（每文件行数）是两个轴：
     这里断言前者为 100（文档定案值），后者不小于 100（不矛盾）。
     """
-    for template_id, spec in real_templates.items():
+    # v1.3：node 模板没有 ruff（工具链是 tsc / node --test），只对 python 模板断言
+    python_templates = {
+        tid: spec for tid, spec in real_templates.items() if spec.stack.language == "python"
+    }
+    assert set(python_templates) == {"fastapi-vue3", "python-cli", "data-pipeline"}
+    for template_id, spec in python_templates.items():
         assert any("ruff check" in check.run for check in spec.checks), template_id
         content = spec.skeleton_files()["ruff.toml"]
         line_length = _toml_int(content, "line-length")
@@ -497,6 +572,56 @@ def test_ruff_toml_consistency_with_checks_and_layout(
         assert spec.layout.max_file_lines >= line_length, template_id
         # 单一来源：pyproject.toml 里不得再写 [tool.ruff]
         assert "[tool.ruff]" not in spec.skeleton_files()["pyproject.toml"], template_id
+
+
+def test_fastapi_ruff_ignores_b008_only(real_templates: dict[str, TemplateSpec]) -> None:
+    """B008 与 FastAPI 的 ``Depends`` 写法天然冲突：**只有** fastapi-vue3 忽略它。
+
+    T5.1 真跑实测：v1.2 的 fastapi 基线产物因
+    ``def handler(db: Session = Depends(get_session))`` 吃了 4 条 B008，
+    被基线探针判成 ``unhealthy`` ⇒ ``regression`` 归因失效。这不是模型的错，
+    是模板规则与框架惯例冲突（任何合规写法都恒扣分）。
+
+    ★ 同时锁定「只忽略 B008」：``select`` 必须还在，且其余三套模板的 ruff 配置里
+    **不得**出现 B008 —— 防止将来被"统一"顺手带上，那会真的放松检查。
+    """
+    fastapi_ruff = real_templates["fastapi-vue3"].skeleton_files()["ruff.toml"]
+    assert "[lint]" in fastapi_ruff, fastapi_ruff
+    assert "select" in fastapi_ruff, fastapi_ruff  # 规则集没被整个关掉
+    assert "ignore" in fastapi_ruff and "B008" in fastapi_ruff, fastapi_ruff
+
+    # 骨架只覆盖 from_scratch / 基线缺配置两种情形；基线自带 ruff.toml 时骨架不参与
+    # （merge_trees 优先级 1），所以 ruff 检查命令里也要带 `--ignore B008`（基线无关）。
+    ruff_checks = [
+        check.run
+        for check in real_templates["fastapi-vue3"].checks
+        if check.run.startswith("ruff check")
+    ]
+    assert ruff_checks == ["ruff check --ignore B008 ."], ruff_checks
+
+    # 骨架只覆盖 from_scratch / 基线缺配置两种情形；基线自带 ruff.toml 时骨架不参与
+    # （merge_trees 优先级 1），所以 ruff 检查命令里也要带 `--ignore B008`（基线无关）。
+    ruff_checks = [
+        check.run
+        for check in real_templates["fastapi-vue3"].checks
+        if check.run.startswith("ruff check")
+    ]
+    assert ruff_checks == ["ruff check --ignore B008 ."], ruff_checks
+
+    for template_id in ("python-cli", "data-pipeline", "node-express"):
+        content = real_templates[template_id].skeleton_files().get("ruff.toml")
+        if content is None:  # node-express 用 tsc，不跑 ruff
+            continue
+        assert "B008" not in content, template_id
+        assert "ignore" not in content or "B008" not in content, template_id
+        # 命令层也不许带 B008（防止被"统一"顺手加上）
+        assert all("B008" not in check.run for check in real_templates[template_id].checks), (
+            template_id
+        )
+        # 命令层也不许带 B008（防止被"统一"顺手加上）
+        assert all("B008" not in check.run for check in real_templates[template_id].checks), (
+            template_id
+        )
 
 
 def test_real_template_unknown_field_rejected(
@@ -522,3 +647,284 @@ def _toml_int(content: str, key: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+# ===================================================== v1.3 校验 18–21（docs/11 §7.2.7）
+
+
+def test_check18_protected_path_normalized(tmp_path: Path) -> None:
+    """校验 18：``protected.paths`` 过 ``normalize_rel_path``，目录前缀保留尾斜杠。"""
+    data = _demo()
+    data["protected"] = {
+        "paths": ["./tests//conftest.py", "tests/fixtures/"],
+        "on_hit": "ignore",
+    }
+    spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+    assert spec.protected.paths == ["tests/conftest.py", "tests/fixtures/"]
+    assert spec.protected_paths() == frozenset({"tests/conftest.py", "tests/fixtures/"})
+
+
+def test_check18_directory_without_trailing_slash_gets_one(tmp_path: Path) -> None:
+    """F4（QA P3）：作者写 ``tests``（本意是目录）⇒ 加载期自动补成 ``tests/``。
+
+    否则会退化成"精确匹配名为 ``tests`` 的文件"，目录保护**静默失效且无报错**。
+    """
+    data = _demo()
+    data["protected"] = {"paths": ["tests"]}
+    spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+    assert spec.protected.paths == ["tests/"]
+    # 与显式写法完全等价
+    assert spec.protected_paths() == frozenset({"tests/"})
+
+    explicit = _demo()
+    explicit["protected"] = {"paths": ["tests/"]}
+    assert (
+        load_template_file(_write(explicit, tmp_path), known_roles=ROLES).protected.paths
+        == ["tests/"]
+    )
+
+    # 带扩展名 ⇒ 仍是精确文件匹配（不被误补斜杠）
+    file_data = _demo()
+    file_data["protected"] = {"paths": ["tests/conftest.py"]}
+    assert load_template_file(
+        _write(file_data, tmp_path), known_roles=ROLES
+    ).protected.paths == ["tests/conftest.py"]
+
+
+def test_check18_protected_path_invalid(tmp_path: Path) -> None:
+    """校验 18：受保护路径非法（``..`` 逃逸）→ 1001。"""
+    data = _demo()
+    data["protected"] = {"paths": ["../outside.py"]}
+    message = _expect_1001(tmp_path, data, check_no=18)
+    assert "protected.paths" in message
+
+
+def test_check18_protected_path_duplicated(tmp_path: Path) -> None:
+    """校验 18：归一化后重复 → 1001（重复即静默覆盖）。"""
+    data = _demo()
+    data["protected"] = {"paths": ["tests/conftest.py", "./tests/conftest.py"]}
+    _expect_1001(tmp_path, data, check_no=18)
+
+
+def test_check18_protected_must_not_cross_skeleton(tmp_path: Path) -> None:
+    """校验 18：受保护路径不得与骨架交叉（骨架已由 reserved 机制保护）。"""
+    data = _demo()
+    data["protected"] = {"paths": ["app/main.py"]}  # seed 骨架文件
+    message = _expect_1001(tmp_path, data, check_no=18)
+    assert "skeleton" in message
+
+
+def test_check18_protected_must_not_cross_conventions(tmp_path: Path) -> None:
+    """校验 18：受保护路径不得与 conventions 交叉（那是"模型必须产出"的文件）。"""
+    data = _demo()
+    data["protected"] = {"paths": ["README.md"]}
+    message = _expect_1001(tmp_path, data, check_no=18)
+    assert "conventions" in message
+
+
+def test_check18_protected_directory_prefix_cross_conventions(tmp_path: Path) -> None:
+    """校验 18：目录前缀语义同样参与交叉判定。"""
+    data = _demo()
+    data["conventions"].append({"path": "docs/design.md", "required": True})
+    data["protected"] = {"paths": ["docs/"]}
+    _expect_1001(tmp_path, data, check_no=18)
+
+
+def test_check19_on_hit_enum_and_default(tmp_path: Path) -> None:
+    """校验 19：``on_hit`` 只接受 ``reject``/``ignore``；缺省为 ``reject``（Q1 定案 A）。"""
+    default = load_template_file(_write(_demo(), tmp_path), known_roles=ROLES)
+    assert default.protected.on_hit == "reject"
+    assert default.protected.paths == []
+
+    bad = _demo()
+    bad["protected"] = {"paths": [], "on_hit": "block"}
+    # Literal 由 pydantic 在加载期拦下（结构非法 → 1001）
+    _expect_1001(tmp_path, bad)
+
+
+def test_check20_max_change_ratio_range(tmp_path: Path) -> None:
+    """校验 20：``0 < max_change_ratio ≤ 1``；缺省 0.5（与 merge 常量同源）。"""
+    default = load_template_file(_write(_demo(), tmp_path), known_roles=ROLES)
+    assert default.protected.max_change_ratio == pytest.approx(0.5)
+
+    for bad_ratio in (0, 0.0, -0.1, 1.5):
+        data = _demo()
+        data["protected"] = {"paths": [], "max_change_ratio": bad_ratio}
+        _expect_1001(tmp_path, data)
+
+
+def test_check21_scoring_points_must_be_positive(tmp_path: Path) -> None:
+    """校验 21：``runnability_points`` 的值必须 > 0。"""
+    data = _demo()
+    data["scoring"] = {"runnability_points": {"backend": 0}}
+    message = _expect_1001(tmp_path, data, check_no=21)
+    assert "backend" in message
+
+
+def test_check21_scoring_group_name_not_empty(tmp_path: Path) -> None:
+    """校验 21：组名不能为空。"""
+    data = _demo()
+    data["scoring"] = {"runnability_points": {"": 10}}
+    _expect_1001(tmp_path, data, check_no=21)
+
+
+def test_check21_frontend_static_requires_layout_frontend(tmp_path: Path) -> None:
+    """校验 21：声明 ``frontend_static`` 配分必须有 ``layout.frontend``（否则配分无法兑现）。"""
+    data = _demo()
+    data["layout"].pop("frontend")
+    data["scoring"] = {"runnability_points": {"backend": 10, "frontend_static": 10}}
+    message = _expect_1001(tmp_path, data, check_no=21)
+    assert "layout.frontend" in message
+
+
+def test_check21_frontend_flag_requires_layout_frontend(tmp_path: Path) -> None:
+    """校验 21：``frontend_scored_in_runnability=true`` 同样需要 ``layout.frontend``。"""
+    data = _demo()
+    data["layout"].pop("frontend")
+    data["scoring"] = {
+        "runnability_points": {"backend": 10},
+        "frontend_scored_in_runnability": True,
+    }
+    _expect_1001(tmp_path, data, check_no=21)
+
+
+def test_check21_valid_scoring_roundtrip(tmp_path: Path) -> None:
+    """校验 21 通过形态：配分可导出为跨层纯数据 ``ScoringRules``。"""
+    data = _demo()
+    data["scoring"] = {
+        "runnability_points": {"backend": 10, "frontend_static": 10, "frontend_build": 10},
+        "frontend_scored_in_runnability": True,
+    }
+    spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+    rules = spec.to_scoring_rules()
+    assert rules.enabled is True
+    assert rules.runnability_points["frontend_build"] == pytest.approx(10)
+    assert rules.frontend_scored_in_runnability is True
+    # 未声明 scoring 时 enabled=False（老口径，分数零变化）
+    plain = load_template_file(_write(_demo(), tmp_path), known_roles=ROLES)
+    assert plain.to_scoring_rules().enabled is False
+
+
+def test_real_templates_protected_paths_declared(
+    real_templates: dict[str, TemplateSpec],
+) -> None:
+    """真模板（T1.1 / U3）：**每套**都声明受保护夹具，且策略为 ``reject``。
+
+    场景②③的根因都是 ``tests/conftest.py`` 被重写；python 三套必须都保护它，
+    node 侧保护对应的 ``tests/setup.ts``（同一「测试基础设施不可重写」口径）。
+    """
+    expected = {
+        "fastapi-vue3": "tests/conftest.py",
+        "python-cli": "tests/conftest.py",
+        "data-pipeline": "tests/conftest.py",
+        "node-express": "tests/setup.ts",
+    }
+    for template_id, protected_path in expected.items():
+        spec = real_templates[template_id]
+        assert spec.protected.paths == [protected_path], template_id
+        assert spec.protected.on_hit == "reject", template_id
+        assert spec.protected_paths() == frozenset({protected_path}), template_id
+        assert spec.protected.max_change_ratio == pytest.approx(0.5), template_id
+
+
+def test_only_fastapi_vue3_uses_grouped_scoring(
+    real_templates: dict[str, TemplateSpec],
+) -> None:
+    """Q3：**只有** ``fastapi-vue3`` 声明分组配分；其余三套保持 v1.2 老口径。
+
+    这是"分数可比性"的分界线：python-cli / data-pipeline / node-express 的
+    runnability 仍按 ``checks[].weight`` 归一，历史分数不受影响。
+    """
+    grouped = real_templates["fastapi-vue3"]
+    rules = grouped.to_scoring_rules()
+    assert rules.enabled is True
+    assert rules.runnability_points == {
+        "backend": 10,
+        "frontend_static": 10,
+        "frontend_build": 10,
+    }
+    assert rules.frontend_scored_in_runnability is True
+
+    for template_id in ("python-cli", "data-pipeline", "node-express"):
+        spec = real_templates[template_id]
+        assert spec.to_scoring_rules().enabled is False, template_id
+        assert spec.scoring.runnability_points == {}, template_id
+        assert spec.scoring.frontend_scored_in_runnability is False, template_id
+
+
+# ================================================ v1.3 · 新增两套模板（T3.2）
+
+def test_data_pipeline_template_shape(real_templates: dict[str, TemplateSpec]) -> None:
+    """``data-pipeline``：python + pandas/定时任务场景，骨架 4 个、protected 生效。"""
+    spec = real_templates["data-pipeline"]
+    assert spec.stack.language == "python"
+    assert spec.stack.backend == "none" and spec.stack.frontend == "none"
+    # v1.3：pandas / numpy 已随镜像扩表（B14 同一 PR）⇒ 可以且**应该**声明
+    assert {"pandas", "numpy"} <= set(spec.stack.dependencies)
+    assert set(spec.stack.dependencies) <= SANDBOX_IMAGE_PACKAGES
+    assert len(spec.skeleton.files) == 4
+    assert spec.reserved_paths() == {"pyproject.toml", "ruff.toml"}
+    assert spec.seed_paths() == {"pipeline/__init__.py", "requirements.txt"}
+    assert spec.layout.required_dirs == ["pipeline", "tests"]
+    assert spec.layout.allowed_prefixes == ["pipeline/", "tests/"]
+    assert spec.protected_paths() == frozenset({"tests/conftest.py"})
+    assert spec.to_scoring_rules().enabled is False  # 不声明分组配分（老口径）
+    runs = [check.run for check in spec.checks]
+    assert any("compileall" in run for run in runs)
+    assert any("pytest" in run for run in runs)
+    assert any("ruff check" in run for run in runs)
+    # pandas 检查刻意**不**写成"假绿"：镜像已预装 ⇒ 现在真能通过
+    assert 'python -c "import pandas"' in runs
+
+
+def test_node_express_template_shape(real_templates: dict[str, TemplateSpec]) -> None:
+    """``node-express``：typescript + Express，骨架恰 5 个、checks 全部声明 requires。"""
+    spec = real_templates["node-express"]
+    assert spec.stack.language == "typescript"
+    assert spec.stack.backend == "express" and spec.stack.frontend == "none"
+    # v1.3：node 包表与镜像同批落地 ⇒ 依赖可以声明（且必须是镜像内真有的包）
+    assert set(spec.stack.dependencies) == {
+        "express",
+        "typescript",
+        "@types/express",
+        "@types/node",
+    }
+    assert set(spec.stack.dependencies) <= SANDBOX_IMAGE_NODE_PACKAGES
+    assert len(spec.skeleton.files) == spec.skeleton.max_files == 5
+    assert spec.reserved_paths() == {"package.json", "tsconfig.json", ".env.example"}
+    assert spec.seed_paths() == {"src/index.ts", "src/app.ts"}
+    assert spec.layout.required_dirs == ["src", "tests"]
+    assert spec.layout.forbidden_dirs == ["node_modules", "dist"]
+    assert spec.protected_paths() == frozenset({"tests/setup.ts"})
+    # 每条 check 都必须声明 requires（无 node 工具链时 skipped 不扣分，docs/11 §7.5-3）
+    assert all(check.requires for check in spec.checks), [c.run for c in spec.checks]
+    assert {check.requires for check in spec.checks} == {"node-build", "node", "npx"}
+    # 禁止离线必失败的写法（npm ci / npx -y / npm install）
+    for check in spec.checks:
+        lowered = check.run.lower()
+        assert "npm ci" not in lowered and "npx -y" not in lowered
+        assert "npm install" not in lowered
+
+
+def test_new_templates_skeletons_contain_no_test_files(
+    real_templates: dict[str, TemplateSpec],
+) -> None:
+    """新模板同样遵守「骨架不含测试文件」（否则 ``has_tests`` 白送结构分）。"""
+    for template_id in ("data-pipeline", "node-express"):
+        paths = set(real_templates[template_id].skeleton_files())
+        assert not [path for path in paths if "test" in path.lower()], template_id
+
+
+def test_node_skeleton_tsconfig_compiles_to_dist(
+    real_templates: dict[str, TemplateSpec],
+) -> None:
+    """``node-express`` 的 ``tsconfig.outDir`` 必须是 ``dist``（checks 用它跑测试）。"""
+    import json
+
+    files = real_templates["node-express"].skeleton_files()
+    tsconfig = json.loads(files["tsconfig.json"])
+    assert tsconfig["compilerOptions"]["outDir"] == "dist"
+    assert tsconfig["compilerOptions"]["strict"] is True
+    package = json.loads(files["package.json"])
+    assert package["scripts"]["build"].startswith("tsc")
+    assert package["scripts"]["test"] == "node --test dist"

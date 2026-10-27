@@ -910,7 +910,9 @@ class TestHarnessMergesTrees:
         harness = EvaluationHarness(store=store)
         task = EvalTask(id="t-inc", artifact_name="code")
 
-        workdir, artifact_ref, references = await harness._load_task(task, project_id, None)
+        workdir, artifact_ref, references, base_files = await harness._load_task(
+            task, project_id, None
+        )
 
         # DoD ②：合并树文件数 > 补丁文件数
         assert len(workdir) > len(patch)
@@ -943,7 +945,7 @@ class TestHarnessMergesTrees:
         harness = EvaluationHarness(store=store)
         task = EvalTask(id="t-plain", artifact_name="code")
 
-        workdir, _, references = await harness._load_task(task, project_id, None)
+        workdir, _, references, _base = await harness._load_task(task, project_id, None)
         assert workdir == files
         assert task.changed_paths is None
         assert references["code"] == files
@@ -1018,8 +1020,120 @@ async def test_from_scratch_template_artifact_is_not_treated_as_incremental(
     harness = EvaluationHarness(store=store)
     task = EvalTask(id="t-scratch", artifact_name="code")
 
-    workdir, _, _ = await harness._load_task(task, project_id, None)
+    workdir, _, _, _base = await harness._load_task(task, project_id, None)
     assert workdir == files
     assert task.changed_paths is None
 
 
+
+
+# ============================================ v1.3（T1.1 / T1.3）：manifest 序列化契约
+
+#: ``manifest_json()`` 在**未触发新能力**时必须产出的键集合（v1.2 原样 12 键）。
+V12_MANIFEST_KEYS: set[str] = {
+    "mode",
+    "base_content_hash",
+    "counts",
+    "changed_paths",
+    "deleted",
+    "conflicts",
+    "skeleton_added",
+    "reserved_conflicts",
+    "skipped_existing",
+}
+#: 受保护路径用例的基线样本（多加一个 conftest.py，与真实场景一致）
+CONFTEST_BASE: str = "import pytest\n\n\n@pytest.fixture()\ndef client():\n    return None\n"
+
+V12_COUNTS_KEYS: set[str] = {
+    "added",
+    "modified",
+    "noop_dropped",
+    "deleted",
+    "skeleton_added",
+    "reserved_conflicts",
+    "skipped_existing",
+}
+
+
+def test_manifest_json_byte_identical_to_v12_when_new_features_unused() -> None:
+    """**A4 字节级契约**（docs/11 §7.2.3 / R6）：未触发新能力 ⇒ 正文逐字节等于 v1.2。
+
+    做法：把「v1.2 会产出的键」显式写死成字面量，用同一序列化纪律（``sort_keys`` +
+    紧凑分隔符）渲染后逐字节比对。删掉 ``manifest_json`` 里的任何一个 ``pop`` 判断，
+    本条用例立刻失败（docs/11 §7.7-R6）。
+
+    「未触发新能力」的判定 = ``change_ratio == 0``（``from_scratch`` 无基线，或补丁全是
+    noop）+ ``warnings`` 为空 + ``counts.protected_hits == 0``。
+    """
+    fresh = {"app/main.py": "app = None\n", "requirements.txt": "pytest>=8.2\n"}
+    merged = merge_trees({}, fresh, mode="from_scratch")
+    snapshot = merged.manifest_json()
+    payload = json.loads(snapshot)
+
+    # 1) 键集合 == v1.2（没有任何 v1.3 新键）
+    assert set(payload) == V12_MANIFEST_KEYS
+    assert set(payload["counts"]) == V12_COUNTS_KEYS
+
+    # 2) 逐字节快照（字面量重建同一 payload，再用同一序列化纪律渲染）
+    expected = json.dumps(
+        {
+            "base_content_hash": "",
+            "changed_paths": ["app/main.py", "requirements.txt"],
+            "conflicts": [],
+            "counts": {
+                "added": 2,
+                "deleted": 0,
+                "modified": 0,
+                "noop_dropped": 0,
+                "reserved_conflicts": 0,
+                "skeleton_added": 0,
+                "skipped_existing": 0,
+            },
+            "deleted": [],
+            "mode": "from_scratch",
+            "reserved_conflicts": [],
+            "skeleton_added": [],
+            "skipped_existing": [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert snapshot == expected
+
+    # 3) 默认值不进正文
+    assert "change_ratio" not in snapshot
+    assert "warnings" not in snapshot
+    assert "protected_hits" not in snapshot
+
+
+def test_manifest_json_patch_noop_keeps_v12_shape() -> None:
+    """增量模式下"什么都没改"（全 noop）同样不产生新键（change_ratio == 0）。"""
+    merged = merge_trees(BASE, {"app/main.py": BASE["app/main.py"]}, mode="patch")
+    payload = json.loads(merged.manifest_json())
+    assert merged.manifest.change_ratio == 0.0
+    assert set(payload) == V12_MANIFEST_KEYS
+    assert set(payload["counts"]) == V12_COUNTS_KEYS
+
+
+def test_manifest_json_serializes_non_default_values_only() -> None:
+    """非默认值才序列化：受保护命中 / 改动面超阈值时才出现对应键。"""
+    protected_base = {**BASE, "tests/conftest.py": CONFTEST_BASE}
+    merged = merge_trees(
+        protected_base,
+        {"tests/conftest.py": "import pytest\n", "app/b.py": "x = 1\n"},
+        mode="patch",
+        protected_paths=frozenset({"tests/conftest.py"}),
+        on_protected_hit="ignore",
+        max_change_ratio=0.2,
+    )
+    payload = json.loads(merged.manifest_json())
+    assert payload["counts"]["protected_hits"] == 1
+    # 基线 4 个文件，实际生效变更 1 个（conftest 被拦）⇒ 0.25 > 0.2 阈值
+    assert payload["change_ratio"] == pytest.approx(0.25)
+    assert payload["warnings"] == [
+        "protected_path_ignored:1",
+        "change_ratio_exceeded:0.25",
+    ]
+    # 基线版本仍在树里（ignore 语义）
+    assert merged.files["tests/conftest.py"] == CONFTEST_BASE

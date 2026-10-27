@@ -1,0 +1,40 @@
+#!/bin/sh
+# fe-build [dir]（缺省 web）：**离线**前端构建（v1.3 T2.2）。
+#
+# 三条路径（按顺序，全部断网可用）：
+#   1. 项目自带 package-lock.json 且 npm 本地缓存（/opt/npm-cache）命中
+#      ⇒ `npm ci --offline` 精确还原；
+#   2. 否则回退**预置基线** node_modules（/opt/fe-baseline/node_modules，
+#      与 web/package.json 同版本区间；`cp -an` 不覆盖模型已有的文件）；
+#   3. 最后 `npm run build`（构建脚本由项目 package.json 提供，缺失即失败）。
+#
+# 纪律：
+# - **绝不联网**（`--offline` + `--no-audit` + `--no-fund`），沙箱默认 `network=none`；
+# - 失败日志留在 /tmp/npm-ci.log（报告摘要会带它的尾部），便于定位"缺哪个包"；
+# - 本脚本**不写进用户产物树**（不是骨架文件），不占 skeleton.max_files、不进导出 zip。
+set -eu
+
+dir="${1:-web}"
+cd "$dir" 2>/dev/null || {
+    echo "fe-build: 项目目录不存在: $dir" >&2
+    exit 2
+}
+[ -f package.json ] || {
+    echo "fe-build: 缺少 $dir/package.json（前端工程必须有 package.json）" >&2
+    exit 2
+}
+
+export npm_config_cache="${npm_config_cache:-/opt/npm-cache}"
+log=/tmp/npm-ci.log
+
+if [ -f package-lock.json ] && npm ci --offline --no-audit --no-fund >"$log" 2>&1; then
+    echo "fe-build: npm ci --offline 命中本地缓存"
+else
+    echo "fe-build: npm ci --offline 不可用，回退预置基线 node_modules"
+    tail -n 5 "$log" 2>/dev/null || true
+    mkdir -p node_modules
+    # -a 保留符号链接与权限；-n 不覆盖模型已产出的文件
+    cp -an /opt/fe-baseline/node_modules/. ./node_modules/
+fi
+
+npm run build

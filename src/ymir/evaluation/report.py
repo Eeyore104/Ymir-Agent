@@ -56,6 +56,38 @@ class EvidenceOut(BaseModel):
     detail: str = ""
 
 
+class BaselineCheckOut(BaseModel):
+    """基线侧单条检查的执行明细（v1.3 T1.2）。"""
+
+    command: str = ""
+    exit_code: int | None = None
+    timed_out: bool = False
+    skipped: bool = False
+    output: str = ""
+
+
+class BaselineProbeOut(BaseModel):
+    """``baseline_runnability`` 的报告形态（v1.3 T1.2，docs/11 §7.2.4）。
+
+    ``status``：``healthy`` | ``unhealthy`` | ``skipped``（三态唯一口径）。
+    """
+
+    status: Literal["healthy", "unhealthy", "skipped"] = "skipped"
+    score: float = 0.0
+    passed: bool = False
+    checks: list[BaselineCheckOut] = Field(default_factory=list)
+    reason: str = ""
+    duration_ms: int = 0
+    cached: bool = False
+
+
+class SkippedCheckOut(BaseModel):
+    """被跳过的检查（环境缺失，T2.4 可读性；**不扣分**）。"""
+
+    command: str = ""
+    reason: str = ""
+
+
 class DimensionOut(BaseModel):
     """单维评分（0-100，附证据链）。"""
 
@@ -112,6 +144,27 @@ class TaskOut(BaseModel):
     #: 报告级警示（v1.2）：如"基线不可用 → 分数与基线内运行不可比"（R9）。
     #: 缺省空列表 —— 空时 Markdown 渲染与 v1.1 逐字节一致。
     warnings: list[str] = Field(default_factory=list)
+    #: 基线健康度探测结果（v1.3 T1.2）。**默认 None** ⇒ 非增量 / 旧报告 JSON
+    #: 与渲染结果与 v1.2 逐字节一致。
+    baseline_runnability: BaselineProbeOut | None = None
+    #: 「合并树有失败 + 基线健康」= 增量改坏了既有功能（v1.3 T1.2）。
+    regression: bool = False
+    regression_reason: str = ""
+    #: 阻断项失败的命令清单（v1.3 Q4，docs/11 §7.5-5）。
+    #: 非空 ⇒ ``passed`` 必为 ``False``（见 :meth:`model_post_init`）。
+    blocking_failed: list[str] = Field(default_factory=list)
+    #: 环境缺失被跳过的检查（**不扣分、不阻断**）。
+    skipped_checks: list[SkippedCheckOut] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        """Q4 落点（v1.3）：阻断项失败 ⇒ 不可交付 ⇒ ``passed=False``。
+
+        分数照算照披露（报告允许出现「总分 78.00 / 未通过：阻断项失败」）；
+        这里收紧的是**通过判定**，不是分数。构造点唯一（harness），但做成
+        模型不变量可以防止将来有人手工拼一个"阻断失败却 passed=True"的报告。
+        """
+        if self.blocking_failed and self.passed:
+            self.passed = False
 
     def dimension(self, name: str) -> DimensionOut | None:
         for item in self.dimensions:
@@ -315,6 +368,8 @@ class EvaluationReport(BaseModel):
             ]
             # 警示行仅在存在时输出（空时与 v1.1 逐字节一致）
             lines += [f"- ⚠️ {warning}" for warning in task.warnings]
+            # v1.3 新增行**仅在有新数据时**输出（否则与 v1.2 逐字节一致）
+            lines += _incremental_health_lines(task)
             lines += [
                 "",
                 "| 维度 | 分数 | 权重 | 理由 |",
@@ -404,6 +459,41 @@ class EvaluationReport(BaseModel):
 
 def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _incremental_health_lines(task: TaskOut) -> list[str]:
+    """渲染 v1.3 增量健康度行（**无新数据时返回空列表**）。
+
+    空列表 ⇒ markdown 与 v1.2 逐字节一致（兼容性红线，docs/11 §7.5-7）。
+    """
+    lines: list[str] = []
+    probe = task.baseline_runnability
+    if probe is not None:
+        status_labels = {
+            "healthy": "健康（基线自身检查通过）",
+            "unhealthy": "不健康（基线自身检查未通过，分数不可比）",
+            "skipped": f"未执行（{probe.reason or '未探测'}）",
+        }
+        label = status_labels.get(probe.status, probe.status)
+        detail = f"基线检查：{label}"
+        if probe.checks:
+            detail += f"，{len(probe.checks)} 条检查"
+        if probe.cached:
+            detail += "（缓存命中）"
+        if probe.duration_ms:
+            detail += f"，耗时 {probe.duration_ms} ms"
+        lines.append(f"- {detail}")
+    if task.regression:
+        lines.append(f"- 回归：{task.regression_reason or '基线通过但合并树出现失败'}")
+    if task.blocking_failed:
+        lines.append(f"- 阻断项失败：{'、'.join(task.blocking_failed)}（不可交付）")
+    if task.skipped_checks:
+        skipped = "、".join(
+            f"{item.command or '（未声明命令）'}（{item.reason or '环境缺失'}）"
+            for item in task.skipped_checks
+        )
+        lines.append(f"- 已跳过检查（不扣分）：{skipped}")
+    return lines
 
 
 def _delta(current: float, previous: float) -> float:

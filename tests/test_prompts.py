@@ -206,7 +206,7 @@ prompting:
 
 
 def _template_context(tmp_path: Path) -> TemplateContext:
-    """YAML -> loader（17 条校验）-> ``TemplateContext``（含 from_spec 桥接）。"""
+    """YAML -> loader（21 条校验）-> ``TemplateContext``（含 from_spec 桥接）。"""
     path = tmp_path / "fastapi-vue3.yaml"
     path.write_text(_TEMPLATE_YAML, encoding="utf-8", newline="\n")
     spec = load_template_file(path, known_roles=set(ALL_ROLES))

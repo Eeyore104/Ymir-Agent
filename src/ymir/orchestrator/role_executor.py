@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,9 +30,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.artifacts.merge import (
+    DEFAULT_MAX_CHANGE_RATIO,
     DEFAULT_MAX_FILE_BYTES,
     PATCH_MANIFEST_NAME,
     MergeResult,
+    ProtectedPathConflict,
+    _bounded_warnings,
     merge_trees,
 )
 from ymir.artifacts.store import ArtifactStore
@@ -87,6 +90,15 @@ _TEMPLATE_DEGRADED_INVALID = "template_invalid"
 
 #: 降级原因里的异常摘要长度上限（JSON 列不留长栈，tooltip 够读即可）
 _TEMPLATE_DEGRADED_DETAIL_CHARS = 200
+
+#: 受保护路径命中后的**定向重试**上限（v1.3 Q1 第二段：恰好 1 次，不多不少）。
+PROTECTED_RETRY_MAX: int = 1
+
+#: 兜底 ``ignore`` 重合时的告警短码前缀（v1.3 §7.5-1）。
+#:
+#: 与 ``merge.PROTECTED_HIT_WARNING_PREFIX``（模板本就声明 ``ignore``）区分开：
+#: 本前缀表示"**reject 撞了两次墙后被迫降级**"，T5.1 可据此量化重试命中率。
+PROTECTED_FORCED_IGNORE_PREFIX: str = "protected_path_forced_ignore:"
 
 
 @dataclass(frozen=True)
@@ -157,11 +169,13 @@ class RoleStageExecutor:
         # ---- 阶段一（合法化）+ 阶段二（合入）：骨架注入 / patch 契约 ----------
         # 顺序是硬要求（docs/09 §4.1.3 S1）：runtime.execute 之后、smoke 之前、save 之前。
         # 无模板且无基线时整段跳过 ⇒ v1.1 路径逐字节不变。
-        merged = self._apply_patch_contract(
-            output,
+        output, merged, protected_retry = await self._execute_with_patch_contract(
+            run=run,
+            stage=stage,
+            stage_input=stage_input,
+            output=output,
             template_spec=template_spec,
             base_files=base_files,
-            stage_input=stage_input,
         )
         smoke_files = merged.files if merged is not None else output.files
 
@@ -223,7 +237,14 @@ class RoleStageExecutor:
                 "changed_paths": list(merged.manifest.changed_paths),
                 "reserved_conflicts": list(merged.manifest.reserved_conflicts),
                 "conflicts": [item.model_dump() for item in merged.manifest.conflicts],
+                # ---- v1.3 T1.3 / T1.1：纯增量键（旧读取方全部忽略即可）----
+                "change_ratio": merged.manifest.change_ratio,
+                "warnings": list(merged.manifest.warnings),
+                "protected_hits": merged.manifest.counts.protected_hits,
             }
+            if protected_retry is not None:
+                # 仅在发生过"reject -> 重试"时出现（T5.1 据此量化重试命中率）
+                payload["patch"]["protected_retry"] = protected_retry
 
         return StageOutcome(
             output_refs=[saved.ref()],
@@ -236,13 +257,127 @@ class RoleStageExecutor:
 
     # ------------------------------------------------------------------ patch 契约
 
+    async def _execute_with_patch_contract(
+        self,
+        *,
+        run: PipelineRun,
+        stage: StageSpec,
+        stage_input: StageInput,
+        output: StageOutput,
+        template_spec: TemplateSpec | None,
+        base_files: dict[str, str],
+    ) -> tuple[StageOutput, MergeResult | None, dict[str, Any] | None]:
+        """阶段一/二合并 + 受保护路径**三段式**处置（v1.3 Q1，docs/11 §7.3-4）。
+
+        ① **首次**：按模板策略合并（``reject`` 为默认）——命中即抛
+           :class:`ProtectedPathConflict`；
+        ② **定向重试 1 次**：把「受保护路径清单 + 请改用新文件」经
+           ``StageInput.feedback`` 回喂模型（复用既有反馈通道，不新增提示词通道），
+           重新 ``runtime.execute``；两次调用的成本 / tokens **累加**到返回的
+           ``StageOutput``（成本不漏计）；
+        ③ **零成本兜底**：重试仍冲突 ⇒ 对**第二次产出**以 ``ignore`` 再合一次
+           （纯函数、不调模型），manifest 记 ``protected_path_forced_ignore:<n>``，
+           阶段继续 —— **不整轮失败**（T5.1 DoD ②）。
+
+        Returns:
+            ``(stage_output, merge_result, protected_retry)``。
+            ``protected_retry`` 仅在发生过重试时非 ``None``（进 payload，
+            供 T5.1 量化重试命中率）。
+
+        Note:
+            **偏离 §7.3-4 的一处**：该函数的返回多带了第三项 ``protected_retry``
+            （设计原文为 2 元组）。原因：payload 的 ``protected_retry`` 键需要
+            "是否重试过 + 命中路径"，而 :class:`MergeResult` 是 frozen 且不含该信息，
+            用 manifest 短码反推只能得到"被迫降级"，拿不到"重试成功"这一支。
+            这是**私有**方法（无外部调用点），改动面为零。
+        """
+        if template_spec is None and not base_files:
+            return output, None, None
+
+        policy: str = template_spec.protected.on_hit if template_spec is not None else "reject"
+        try:
+            merged = self._apply_patch_contract(
+                output,
+                template_spec=template_spec,
+                base_files=base_files,
+                on_protected_hit=policy,
+            )
+            _ensure_manifest_synced(output, merged)
+            return output, merged, None
+        except ProtectedPathConflict as conflict:
+            first_conflict = conflict
+
+        # ---- 第二段：定向重试 1 次（复用 feedback 通道回喂纠正指令）----
+        logger.warning(
+            "受保护路径冲突，发起 %s 次定向重试：run=%s stage=%s paths=%s",
+            PROTECTED_RETRY_MAX,
+            run.id,
+            stage.id,
+            list(first_conflict.paths),
+        )
+        retry_input = replace(
+            stage_input,
+            feedback=[_protected_feedback(first_conflict), *stage_input.feedback],
+            attempt=stage_input.attempt + 1,
+        )
+        retry_output = await self._runtime.execute(
+            stage.role, retry_input, run_id=run.id, stage_id=stage.id
+        )
+        combined = _accumulate_outputs(output, retry_output)
+        retry_info: dict[str, Any] = {
+            "paths": list(first_conflict.paths),
+            "attempts": PROTECTED_RETRY_MAX,
+        }
+        try:
+            merged = self._apply_patch_contract(
+                combined,
+                template_spec=template_spec,
+                base_files=base_files,
+                on_protected_hit="reject",
+            )
+            _ensure_manifest_synced(combined, merged)
+            return combined, merged, retry_info
+        except ProtectedPathConflict as second_conflict:
+            # ---- 第三段：零成本兜底（ignore 再合一次，纯函数不调模型）----
+            logger.warning(
+                "重试后仍命中受保护路径，按 ignore 兜底合并（保留基线版本，不整轮失败）："
+                "run=%s stage=%s paths=%s",
+                run.id,
+                stage.id,
+                list(second_conflict.paths),
+            )
+            merged = self._apply_patch_contract(
+                combined,
+                template_spec=template_spec,
+                base_files=base_files,
+                on_protected_hit="ignore",
+            )
+            hits = merged.manifest.counts.protected_hits
+            # P3-4（QA）：forced 短码**前置**（它是最重要的降级信号，不能被
+            # 先到的 change_ratio 短码挤掉），并统一走 ``_bounded_warnings`` 裁剪
+            # （≤3 条 / ≤64 字节）—— 手写 ``[:3]`` 在将来加第 3 类短码时会静默截断。
+            merged.manifest.warnings = _bounded_warnings(
+                [
+                    f"{PROTECTED_FORCED_IGNORE_PREFIX}{hits}",
+                    *merged.manifest.warnings,
+                ]
+            )
+            # ★★ F1（QA P2）：`_apply_patch_contract` 返回前已把 manifest 序列化进
+            # `output.files`，上面的 warnings 追加只改了内存对象。必须**重新序列化回写**，
+            # 否则「内存说有 forced_ignore、落盘没有」——产物与报告不一致且无法追溯。
+            _reserialize_manifest(combined, merged)
+            # P3-3（QA）：把"改完记得回写"变成**机制**——返回前强制核对
+            _ensure_manifest_synced(combined, merged)
+            retry_info["forced_ignore"] = list(second_conflict.paths)
+            return combined, merged, retry_info
+
     def _apply_patch_contract(
         self,
         output: StageOutput,
         *,
         template_spec: TemplateSpec | None,
         base_files: dict[str, str],
-        stage_input: StageInput,
+        on_protected_hit: str = "reject",
     ) -> MergeResult | None:
         """阶段一/阶段二合并（`docs/09 §4.1.3 S1 + §4.2.2`）。
 
@@ -253,6 +388,10 @@ class RoleStageExecutor:
           就只留了增量"（``out1.files`` 是整树，直接落盘会把基线全文写进产物）。
 
         无模板且无基线 → 返回 ``None``，``output.files`` 一字不改（v1.1 路径）。
+
+        v1.3（T1.1）：``protected_paths`` **只在 ``patch`` 模式（有基线正文）生效** ——
+        ``from_scratch`` 时模型创建 ``tests/conftest.py`` 是**必需的**，若也拦，
+        产物会缺掉夹具文件（回归防线无从建立）。这是本实现相对设计的一处**必要澄清**。
         """
         if template_spec is None and not base_files:
             return None
@@ -260,6 +399,16 @@ class RoleStageExecutor:
         skeleton = template_spec.skeleton_files() if template_spec is not None else None
         reserved = (
             template_spec.reserved_paths() if template_spec is not None else frozenset()
+        )
+        protected = (
+            template_spec.protected_paths()
+            if template_spec is not None and base_files
+            else frozenset()
+        )
+        max_change_ratio = (
+            template_spec.protected.max_change_ratio
+            if template_spec is not None
+            else DEFAULT_MAX_CHANGE_RATIO
         )
         deleted = _deleted_paths(output.structured)
         out1 = merge_trees(
@@ -271,6 +420,9 @@ class RoleStageExecutor:
             base_paths=frozenset(base_files),
             deleted=deleted,
             max_file_bytes=self._max_patch_file_bytes,
+            protected_paths=protected,
+            on_protected_hit=on_protected_hit,  # type: ignore[arg-type]
+            max_change_ratio=max_change_ratio,
         )
 
         stored = {path: out1.files[path] for path in out1.manifest.changed_paths
@@ -628,6 +780,80 @@ class RoleStageExecutor:
 
 
 # --------------------------------------------------------------------- 消息解包工具
+
+
+def _protected_feedback(conflict: ProtectedPathConflict) -> str:
+    """回喂模型的纠正指令（v1.3 Q1 第二段，docs/11 §7.3-4）。
+
+    复用 :attr:`StageInput.feedback` 通道（``prompts.build_user`` 渲染成「历史反馈」节），
+    **不新增提示词通道、不改 ``RoleRuntime.execute`` 签名**（B4）。
+
+    文案纪律（R1 ②）：不只说"禁止"，必须**给出替代路径**，否则模型只会换个写法继续撞。
+    """
+    paths = "、".join(conflict.paths) or "（受保护路径）"
+    return (
+        f"受保护路径不可修改（{paths}）：这些文件由基线提供且必须保持原样，"
+        "本次产出中对它们的改动已被服务端拒绝。\n"
+        f"请改为新建文件实现你的目标（例如 `tests/test_<新功能>.py` 或新的实现模块），"
+        f"不要重写、不要删除 {paths}；如需新增夹具，请在你新建的文件里定义。"
+    )
+
+
+def _reserialize_manifest(output: StageOutput, merged: MergeResult) -> None:
+    """把内存里的 ``manifest`` **重新序列化**回 ``output.files``（F1，QA P2）。
+
+    只在 ``_apply_patch_contract`` 已经写过簿记文件（``mode == "patch"``）时生效：
+    ``from_scratch`` 产物**不该**带 ``patch_manifest.json``（docs/09 §9-T2.4 DoD ⑨），
+    此处不新造该文件。
+
+    纪律：**任何对 ``merged.manifest`` 的事后修改都必须跟一次本调用**，
+    否则落盘正文落后于内存对象（最典型的坑就是第三段兜底追加短码）。
+    """
+    if PATCH_MANIFEST_NAME not in output.files:
+        return
+    output.files[PATCH_MANIFEST_NAME] = merged.manifest_json()
+
+
+def _ensure_manifest_synced(output: StageOutput, merged: MergeResult) -> None:
+    """返回前强制核对「内存 manifest == 落盘正文」（P3-3，QA）。
+
+    只在簿记文件存在时生效（``from_scratch`` 不写 manifest）。**不匹配即抛**：
+    产物里的 `patch_manifest.json` 一旦落后于内存对象，下游（评测 / 审批卡片 /
+    基线表）看到的告警与冲突就与实际合并结果不一致，且没有任何报错 —— 那是最难查的
+    一类缺陷。把检查放在唯一的出口，比"记得在每次改 manifest 后调 _reserialize"可靠。
+
+    ★ 用显式 ``raise`` 而不是 ``assert``：``python -O`` 会剥离断言（QA-08 既有结论），
+    机制不能在优化模式下失效。
+    """
+    if PATCH_MANIFEST_NAME not in output.files:
+        return
+    expected = merged.manifest_json()
+    actual = output.files[PATCH_MANIFEST_NAME]
+    if actual != expected:
+        raise RuntimeError(
+            "patch_manifest.json 与内存 manifest 不一致（写盘落后于内存）："
+            f"expected={expected[:120]}… actual={actual[:120]}…"
+        )
+
+
+def _accumulate_outputs(base: StageOutput, retry: StageOutput) -> StageOutput:
+    """把「首次产出」与「重试产出」合成一个 ``StageOutput``（成本不漏计）。
+
+    - **文件 / 摘要 / 结构化数据**取重试那次（它才是修正后的结果）；
+    - **成本 / tokens / schema 尝试次数**两次相加（两次都真的花了钱）。
+    """
+    return StageOutput(
+        files=retry.files,
+        summary=retry.summary,
+        structured=retry.structured,
+        provider=retry.provider or base.provider,
+        model=retry.model or base.model,
+        tier=retry.tier or base.tier,
+        prompt_tokens=base.prompt_tokens + retry.prompt_tokens,
+        completion_tokens=base.completion_tokens + retry.completion_tokens,
+        cost_cny=round(base.cost_cny + retry.cost_cny, 6),
+        schema_attempts=base.schema_attempts + retry.schema_attempts,
+    )
 
 
 def _is_auto_repair(message: Message) -> bool:

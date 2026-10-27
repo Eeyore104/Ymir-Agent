@@ -148,9 +148,45 @@ class LayoutRules(BaseModel):
     allowed_prefixes: list[str] = Field(
         default_factory=list, description="产物路径必须命中的前缀（空 = 不限制）"
     )
+    #: 根级文件白名单（v1.3 B4，QA 裁决）：``conventions[].path`` 里**不带目录**的文件
+    #: （``README.md`` / ``.gitignore``）自动进这里 —— 它们不属于任何前缀，若不显式允许，
+    #: 每套模板的「路径落在允许前缀内」规则都会恒判失败一条。
+    #: 刻意**不**把它们塞进 ``allowed_prefixes``：前缀是 ``startswith`` 语义，
+    #: 会把 ``README.md.bak`` 一起放行（见 handbook §7.5-3）。
+    allowed_files: list[str] = Field(
+        default_factory=list, description="根级文件白名单（空 = 不限制）"
+    )
     frontend: FrontendRules | None = Field(
         default=None, description="前端结构规则（None = 不做前端检查）"
     )
+
+
+class ScoringRules(BaseModel):
+    """模板**打分口径**（纯数据；``templates``(2) 产出、``evaluation``(1) 消费）。
+
+    v1.3（docs/11 §7.2.2）新增独立类而**不塞进** :class:`LayoutRules`：
+    后者是"目录与命名规范"，再加打分点会让同一字段承载两种语义
+    （结构规则 vs 配分策略），``convention`` 与 ``runnability`` 的耦合也会变脏。
+
+    ★ 默认值即"未启用"：``runnability_points`` 为空 ⇒ 消费方走 v1.2 的
+    「按 ``checks[].weight`` 归一」老口径，**分数零变化**。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runnability_points: dict[str, float] = Field(
+        default_factory=dict,
+        description="组名 -> 该组在可运行率维度内的点数（空 = 不启用分组配分）",
+    )
+    frontend_scored_in_runnability: bool = Field(
+        default=False,
+        description="True ⇒ 前端结构规则只在 runnability 的 frontend_static 组计分",
+    )
+
+    @property
+    def enabled(self) -> bool:
+        """是否启用分组配分（空字典 = 走 v1.2 的按权重归一）。"""
+        return bool(self.runnability_points)
 
 
 # --------------------------------------------------------------------- 裁决合同（v1.1）
@@ -203,6 +239,14 @@ class EvalVerdict:
     wall_time_ms: int = 0
     degraded: bool = False
     reason: str = ""
+    #: 基线健康度（v1.3 T1.2）：``""``（未探测） | ``healthy`` | ``unhealthy`` | ``skipped``。
+    #: 追加字段**全部带默认值** ⇒ 既有构造点（gate / 测试里的手工 ``EvalVerdict(...)``）
+    #: 零改动；本类不是 JSON 契约（不落盘、不进 API），仅进程内传递。
+    baseline_status: str = ""
+    #: 合并树出现失败但基线健康（v1.3 T1.2）—— 即"增量改坏了既有功能"。
+    regression: bool = False
+    #: 阻断项失败的命令清单（v1.3 Q4）。非空 ⇒ 裁决必为 ``fail``。
+    blocking_failed: tuple[str, ...] = ()
 
     @property
     def is_pass(self) -> bool:

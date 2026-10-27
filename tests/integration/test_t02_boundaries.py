@@ -851,12 +851,37 @@ async def test_non_budget_exception_fails_stage_and_run(
         .all()
     )
     assert execs and execs[0].status == "failed"  # 阶段现场保留为 failed
-    events = (
-        (await session.execute(select(Event).where(Event.run_id == run_id).order_by(Event.seq)))
-        .scalars()
-        .all()
-    )
-    types = [e.type for e in events]
+
+    # ★ 时序纪律（QA 复验发现的偶发红）：``run.status=failed`` 的提交**早于**
+    # ``run.failed`` 事件落库（状态更新与事件写入是两个事务，不是原子的）。
+    # 因此事件必须**轮询等待**，不能"读一次就断言"—— 后者在全量跑时偶发只看到
+    # ['run.started','stage.started','stage.failed']。
+    # 纪律：为确定性等待而改测试，**不**用 sleep 给产品打补丁、不放松断言。
+    def _types_of(rows: list[Event]) -> list[str]:
+        return [row.type for row in rows]
+
+    deadline_events = time.monotonic() + 10
+    events: list[Event] = []
+    while True:
+        async with session_factory() as probe:
+            events = list(
+                (
+                    await probe.execute(
+                        select(Event).where(Event.run_id == run_id).order_by(Event.seq)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if "run.failed" in _types_of(events):
+            break
+        if time.monotonic() > deadline_events:
+            raise AssertionError(
+                f"等待 run.failed 事件超时，已见事件：{_types_of(events)}"
+            )
+        await asyncio.sleep(0.05)
+
+    types = _types_of(events)
     assert "stage.failed" in types and "run.failed" in types
     assert "budget.exceeded" not in types  # 非预算异常不应误报预算
     await engine.shutdown()

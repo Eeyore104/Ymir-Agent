@@ -11,6 +11,9 @@
   # 演练（不调模型）：打印将执行的阶段链与模型档位
   uv run python scripts/run_single_role.py --requirement "x" --role qa --dry-run
 
+  # 跑完顺带出一份四维分数（v1.3 T4.1：与 gate / 批量补评同一装配点）
+  uv run python scripts/run_single_role.py --requirement "..." --role engineer --evaluate
+
 原理：以目标角色阶段为终点对流水线做「截断」（原定义不改），经
 ``definition_loader`` 注入引擎——走标准编排链路（阶段记录 / 消息 / 事件 /
 用量计量全落库），跑到终点 run 置 completed。
@@ -28,6 +31,9 @@ from sqlalchemy import select
 from ymir.bootstrap import build_execution_stack
 from ymir.common.logging import setup_logging
 from ymir.config import PROJECT_ROOT, get_settings, load_env_file
+from ymir.evaluation.harness import build_eval_harness
+from ymir.evaluation.report import TaskOut
+from ymir.evaluation.run_task import evaluate_run
 from ymir.models.entities import Message, ModelCall, StageExecution
 from ymir.models.enums import RunStatus
 from ymir.orchestrator.engine import OrchestrationEngine
@@ -79,6 +85,17 @@ def parse_args() -> argparse.Namespace:
         default="key_node",
         choices=["key_node", "batch", "debug"],
         help="HITL 模式（key_node=三关审批 / batch=全自动 / debug=全步骤人审）",
+    )
+    # v1.3（T4.1）：终态后按 harness 口径补一次四维打分（**附加信息，不参与 verdict**）
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="run 终态后补一次四维打分（与 gate / 批量同源；不影响 verdict）",
+    )
+    parser.add_argument(
+        "--suite",
+        default="default",
+        help="评测套件 id（默认 default；仅 --evaluate 时生效）",
     )
     return parser.parse_args()
 
@@ -236,6 +253,31 @@ async def print_report(session_factory, run_id: str, elapsed: float) -> None:
     print("=" * 72)
 
 
+def print_evaluation(outcome: TaskOut) -> None:
+    """打印四维分数 + 双门槛（**不是裁决**：verdict 仍由 QA 角色判定，L4 口径不变）。"""
+    print("- 四维分数（确定性口径）")
+    for dim in outcome.dimensions:
+        print(f"  {dim.label} {dim.score:.2f} / 100（权重 {dim.weight:.2f}）")
+    thresholds = outcome.thresholds or {}
+    print(
+        f"  加权总分 {outcome.total_score:.2f}"
+        f"（门槛 {thresholds.get('total', 75):g}）"
+        f"  可运行率 {outcome.runnability:.2f}"
+        f"（门槛 {thresholds.get('runnability', 60):g}）"
+    )
+    if outcome.baseline_runnability is not None:
+        probe = outcome.baseline_runnability
+        print(f"  基线检查：{probe.status}（{probe.reason or '通过'}）")
+    if outcome.regression:
+        print(f"  回归：{outcome.regression_reason}")
+    if outcome.blocking_failed:
+        print(f"  阻断项失败：{'、'.join(outcome.blocking_failed)}")
+    if outcome.skipped_checks:
+        print(f"  已跳过检查：{len(outcome.skipped_checks)} 条（环境缺失，不扣分）")
+    print("  ⚠️ 该分数为附加信息，不参与 verdict（verdict 仍由 QA 角色判定）")
+    print("=" * 72)
+
+
 async def run_main(args: argparse.Namespace) -> int:
     load_env_file()  # 注入 .env（DEEPSEEK_API_KEY 等）
     settings = get_settings()
@@ -280,6 +322,26 @@ async def run_main(args: argparse.Namespace) -> int:
         final = await wait_terminal(session_factory, run_id, args.timeout)
         elapsed = time.perf_counter() - started
         await print_report(session_factory, run_id, elapsed)
+        if args.evaluate:
+            # v1.3（T4.1）：与 gate 裁决 / 批量补评**同一装配点**（run_task.evaluate_run），
+            # 不重复实现打分逻辑，也不改写 run 的终态与 verdict。
+            async with session_factory() as session:
+                fresh_run = await RunRepository(session).get(run_id)
+            if fresh_run is None:
+                print("[evaluate] 跳过：run 已不存在")
+            else:
+                harness = build_eval_harness(
+                    settings,
+                    stack.artifact_store,
+                    gateway=stack.gateway,
+                    session_factory=session_factory,
+                    events=stack.event_publisher,
+                )
+                print("- 评测（附加信息，不参与 verdict）")
+                outcome = await evaluate_run(
+                    harness, fresh_run, default_suite=args.suite
+                )
+                print_evaluation(outcome)
         await orchestrator.shutdown()
         return 0 if final.status == RunStatus.COMPLETED.value else 1  # type: ignore[attr-defined]
     finally:

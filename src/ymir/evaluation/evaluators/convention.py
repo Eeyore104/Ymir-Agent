@@ -9,9 +9,7 @@
 from __future__ import annotations
 
 import ast
-import fnmatch
 import re
-from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -22,9 +20,11 @@ from ymir.evaluation.evaluators.base import (
     EvalScore,
     Evaluator,
     Evidence,
+    frontend_structure_rules,
     has_tests,
     python_files,
     ratio_score,
+    workdir_directories,
 )
 
 _SNAKE_RE = re.compile(r"^[a-z_][a-z0-9_]*\.py$")
@@ -196,7 +196,7 @@ class ConventionEvaluator(Evaluator):
         layout = ctx.layout
         assert layout is not None  # noqa: S101 - 调用点已保证非空
         py = python_files(ctx.workdir)
-        dirs = _directories(ctx.workdir)
+        dirs = workdir_directories(ctx.workdir)
         rules: list[tuple[bool, str]] = []
 
         for required in layout.required_dirs:
@@ -286,14 +286,21 @@ class ConventionEvaluator(Evaluator):
             )
 
         if layout.allowed_prefixes:
+            # v1.3（B4）：``conventions`` 里的**根级文件**（README.md / .gitignore）
+            # 由 ``allowed_files`` 显式放行 —— 它们不属于任何目录前缀，若不单独允许，
+            # 每套模板的这条规则都会恒判失败一条（把"模板自己要求的文件"算成越界）。
+            allowed_files = set(layout.allowed_files)
             outside = [
                 path
                 for path in ctx.workdir
                 if path != PATCH_MANIFEST_NAME
+                and path not in allowed_files
                 and not any(path.startswith(prefix) for prefix in layout.allowed_prefixes)
             ]
             ok_prefix = not outside
             prefixes = "、".join(layout.allowed_prefixes)
+            if allowed_files:
+                prefixes += "（含根级文件：" + "、".join(sorted(allowed_files)) + "）"
             rules.append((ok_prefix, f"路径落在模板允许前缀内：{prefixes}"))
             evidence.append(
                 Evidence(
@@ -306,66 +313,17 @@ class ConventionEvaluator(Evaluator):
             )
 
         frontend = layout.frontend
-        if frontend is not None:
-            rules += self._frontend_rules(frontend, ctx.workdir, dirs, evidence)
+        # v1.3（Q3）：模板把前端**结构**分移到 runnability 的 ``frontend_static`` 组时，
+        # 本维度不再重复计一遍（否则同一个规则被扣两次分）。
+        relocated = ctx.scoring is not None and ctx.scoring.frontend_scored_in_runnability
+        if frontend is not None and not relocated:
+            rules += frontend_structure_rules(frontend, ctx.workdir, evidence)
 
         if not rules:
             evidence.append(Evidence("metric", "structure", "模板未声明结构规则，不适用"))
             return 50.0, "模板未声明结构规则（不适用）"
         passed = sum(1 for ok, _ in rules if ok)
         return ratio_score(passed, len(rules)), f"模板结构规范 {passed}/{len(rules)}"
-
-    @staticmethod
-    def _frontend_rules(
-        frontend: Any,
-        workdir: dict[str, str],
-        dirs: list[str],
-        evidence: list[Evidence],
-    ) -> list[tuple[bool, str]]:
-        """前端结构规则（**仅静态检查，不构建**：docs/09 §12-Q2 定案 A）。
-
-        证据必须带「静态检查（未构建）」，否则报告会让人误以为前端真的能构建。
-        """
-        rules: list[tuple[bool, str]] = []
-        for required in frontend.required_dirs:
-            ok = any(item == required or item.startswith(f"{required}/") for item in dirs)
-            rules.append((ok, f"前端目录 {required}"))
-            evidence.append(
-                Evidence(
-                    "metric" if ok else "file",
-                    required,
-                    f"前端目录 {required} {'已存在' if ok else '缺失'}（静态检查（未构建））",
-                )
-            )
-        for pattern in frontend.required_glob:
-            matched = [path for path in workdir if fnmatch.fnmatch(path, pattern)]
-            ok = bool(matched)
-            rules.append((ok, f"前端文件模式 {pattern}"))
-            evidence.append(
-                Evidence(
-                    "metric" if ok else "file",
-                    pattern,
-                    f"命中 {len(matched)} 个文件"
-                    if ok
-                    else f"未命中任何文件（静态检查（未构建））：{pattern}",
-                )
-            )
-        for name in frontend.forbidden_imports:
-            offenders = sorted(
-                path
-                for path, content in workdir.items()
-                if name in content and path.endswith((".vue", ".js", ".ts", ".json"))
-            )
-            ok = not offenders
-            rules.append((ok, f"前端禁止依赖 {name}"))
-            evidence.append(
-                Evidence(
-                    "metric" if ok else "file",
-                    name,
-                    f"未出现 {name}" if ok else f"出现禁止依赖 {name}：{offenders[:3]}",
-                )
-            )
-        return rules
 
     async def _judge_component(
         self, ctx: EvalContext
@@ -389,16 +347,6 @@ class ConventionEvaluator(Evaluator):
             f"{judgement.evidence[0] if judgement.evidence else '未提供'}",
         )
         return score, f"命名/注释抽检 {judgement.score}/5", outcome.cost_cny, outcome.tokens, [ev]
-
-
-def _directories(files: dict[str, str]) -> list[str]:
-    """产物中出现过的目录（含中间层，如 ``web/src/components`` 产出 web、web/src、…）。"""
-    dirs: set[str] = set()
-    for path in files:
-        parts = path.split("/")
-        for index in range(1, len(parts)):
-            dirs.add("/".join(parts[:index]))
-    return sorted(dirs)
 
 
 def _collect_symbols(files: dict[str, str]) -> list[tuple[str, str]]:

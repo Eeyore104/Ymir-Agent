@@ -36,6 +36,15 @@ conventions:
   - { path: README.md, required: true }
   - { path: .gitignore, required: true }
 
+# 受保护路径（v1.3 T1.1 / U3 定案）：场景③（python-cli × patch）的根因就是
+# `tests/conftest.py` 被重写、`run_cli` 夹具被删 ⇒ 6 个模块收集期 ImportError。
+# 刻意**不声明 scoring**（保持 v1.2 老口径，分数零变化）。
+protected:
+  paths:
+    - tests/conftest.py
+  on_hit: reject
+  max_change_ratio: 0.5
+
 skeleton:
   max_files: 5
   max_bytes: 32768

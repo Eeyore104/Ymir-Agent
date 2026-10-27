@@ -6,11 +6,10 @@
 
 一个 ``evaluate`` 调用做五件事：
 
-1. 解析套件 / 任务：``run.context["benchmark"]["eval_suite"/"eval_task"]`` >
-   流水线 ``repair.eval.suite/task`` > ``default_suite``；
-2. 构造 ``EvalTask``（``project_id=run.project_id``、``run_id=run.id``，
-   保证「哪个 run 的哪一版产物」可追溯）；
-3. ``harness.evaluate_task(...)`` 走四维 + 双门槛；
+1. **任务装配交给** :func:`ymir.evaluation.run_task.build_task_for_run`（v1.3 T4.1：
+   唯一装配点 —— 套件解析 / 模板 checks 覆盖 / layout / baseline_ref 都在那里，
+   批量补评与单跑脚本共用同一实现，杜绝"两条路径两套分数"）；
+2. ``harness.evaluate_task(...)`` 走四维 + 双门槛；
 4. 报告落盘为 **``eval_verdict``**（不与 QA 的 ``evaluation_report`` 抢名），
    并写入 ``run_id / artifact_version / repair_round / verdict_source="harness"``；
 5. 归约为 ``EvalVerdict``：``skipped`` / 降级 / 异常一律 ``unknown``
@@ -23,18 +22,16 @@ import logging
 import re
 from typing import Any
 
-from ymir.common.contracts import EvalVerdict, FailedCheck, LayoutRules
-from ymir.common.errors import YmirError
+from ymir.common.contracts import EvalVerdict, FailedCheck
 from ymir.evaluation.aggregator import normalize_weights
-from ymir.evaluation.evaluators.base import RUNNABILITY, EvalCheck, EvalTask
+from ymir.evaluation.baseline_probe import BASELINE_UNHEALTHY
+from ymir.evaluation.evaluators.base import RUNNABILITY
 from ymir.evaluation.harness import EvaluationHarness
 from ymir.evaluation.report import EvaluationReport
+from ymir.evaluation.run_task import build_task_for_run, resolve_suite_id
 from ymir.evaluation.suite import EvalSuite
 from ymir.models.entities import PipelineRun
-from ymir.sop.loader import load_pipeline
-from ymir.sop.models import PipelineDefinition, StageSpec
-from ymir.templates import load_template
-from ymir.templates.models import TemplateSpec
+from ymir.sop.models import StageSpec
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +41,12 @@ VERDICT_ARTIFACT_NAME = "eval_verdict"
 #: 失败检查的证据格式：``exit=1 timed_out=False duration=12ms｜<输出片段>``
 _EVIDENCE_RE = re.compile(r"exit=(-?\d+) timed_out=(True|False)")
 _DETAIL_SEPARATOR = "｜"
+
+#: 失败分类 · 基线不健康（v1.3 T1.2；与 ``benchmark.FAILURE_BASELINE_UNHEALTHY`` 同值）。
+FAILURE_BASELINE_UNHEALTHY: str = "baseline_unhealthy"
+
+#: 阻断项失败时 ``reason`` 的固定前缀（v1.3 Q4，docs/11 §7.5-5）。
+BLOCKING_REASON_PREFIX: str = "阻断项失败"
 
 
 class HarnessEvaluationGate:
@@ -63,7 +66,6 @@ class HarnessEvaluationGate:
         self._default_suite = default_suite
         self._artifact_name = artifact_name
         self._detail_chars = max(0, int(detail_chars))
-        self._definitions: dict[str, PipelineDefinition | None] = {}
 
     # ------------------------------------------------------------------ 入口
 
@@ -71,27 +73,13 @@ class HarnessEvaluationGate:
         self, *, run: PipelineRun, stage: StageSpec, attempt: int
     ) -> EvalVerdict:
         """对本次 run 的最新产物给出确定性裁决（任何异常都归为 ``unknown``）。"""
-        suite_id, task_id = self._select(run)
         repair_round = _repair_round(run.context)
         try:
-            suite = EvalSuite.load(suite_id)
-            base = suite.task(task_id) if task_id else None
-            if base is None and suite.tasks:
-                base = suite.tasks[0]
-            task = EvalTask(
-                id=f"run:{run.id}",
-                requirement=str((run.context or {}).get("requirement", "")),
-                scenario=base.scenario if base is not None else "",
-                project_id=run.project_id,
-                run_id=run.id,
+            # v1.3（T4.1）：装配收敛到 run_task，与批量补评 / 单跑脚本同源
+            task, suite = build_task_for_run(
+                run,
                 artifact_name=self._artifact_name,
-                # v1.2（docs/09 §4.1.2 唯一注入点）：模板 checks 覆盖套件 checks；
-                # 无模板时与套件逐条一致（`list(base.checks)`）。
-                checks=self._resolve_checks(run, base),
-                # 模板结构规则（纯数据）：None = 评估器走 v1.1 原逻辑
-                layout=self._resolve_layout(run),
-                # 基线精确引用（R9）：评测侧据此加载基线，绝不猜"当前基线"
-                baseline_ref=_baseline_ref(run.context),
+                default_suite=self._default_suite,
             )
             outcome = await self._harness.evaluate_task(
                 task, project_id=run.project_id, suite=suite
@@ -100,7 +88,8 @@ class HarnessEvaluationGate:
             logger.exception("确定性裁决失败，降级为 unknown：run=%s", run.id)
             return EvalVerdict(
                 status="unknown",
-                suite_id=suite_id,
+                # 套件 id 仍要可追溯：用同一套解析口径（不抛异常）
+                suite_id=resolve_suite_id(run, default_suite=self._default_suite),
                 suite_version="",
                 artifact_name=self._artifact_name,
                 degraded=True,
@@ -111,73 +100,6 @@ class HarnessEvaluationGate:
         await self._save_report(report, run, stage)
 
         return self._to_verdict(suite, outcome, repair_round)
-
-    # ------------------------------------------------------------------ 解析
-
-    def _resolve_checks(self, run: PipelineRun, base: EvalTask | None) -> list[EvalCheck]:
-        """确定性检查命令：模板 ``checks`` 覆盖套件 ``checks``（v1.2，§4.1.2）。
-
-        无模板（或模板已不可读）时**逐条沿用套件**，与 v1.1 完全一致（§10-9）。
-        字段名是 ``type``（与 ``EvalCheck.type`` 同构）：模板 YAML 里写 ``kind`` 早在
-        加载期就被 ``extra="forbid"`` 拒掉，这里不做二次改名。
-        """
-        spec = self._template_spec(run)
-        if spec is None:
-            return list(base.checks) if base is not None else []
-        return [
-            EvalCheck(type=check.type, run=check.run, weight=check.weight)
-            for check in spec.checks
-        ]
-
-    def _resolve_layout(self, run: PipelineRun) -> LayoutRules | None:
-        """模板结构规则（``LayoutRules`` 纯数据；``None`` = 不做模板结构校验）。"""
-        spec = self._template_spec(run)
-        return spec.to_layout_rules() if spec is not None else None
-
-    def _template_spec(self, run: PipelineRun) -> TemplateSpec | None:
-        """按 ``run.context["template"]["id"]`` 读模板（失败只告警，退回套件口径）。"""
-        context = run.context if isinstance(run.context, dict) else {}
-        ref = context.get("template")
-        template_id = str(ref.get("id") or "").strip() if isinstance(ref, dict) else ""
-        if not template_id:
-            return None
-        try:
-            return load_template(template_id)
-        except YmirError:
-            logger.warning(
-                "裁决：模板不可读，退回套件 checks（run=%s template=%s）",
-                run.id,
-                template_id,
-                exc_info=True,
-            )
-            return None
-
-    def _select(self, run: PipelineRun) -> tuple[str, str | None]:
-        """套件 / 任务解析（run.context 覆盖 > 流水线 repair.eval > 缺省）。"""
-        context = run.context or {}
-        benchmark = context.get("benchmark")
-        benchmark = benchmark if isinstance(benchmark, dict) else {}
-        suite_id = _first_str(benchmark.get("eval_suite"))
-        task_id = _first_str(benchmark.get("eval_task"))
-
-        if suite_id is None or task_id is None:
-            definition = self._definition(run.pipeline_id)
-            spec = definition.repair.eval if definition and definition.repair else None
-            if suite_id is None and spec is not None:
-                suite_id = _first_str(spec.suite)
-            if task_id is None and spec is not None:
-                task_id = _first_str(spec.task)
-        return (suite_id or self._default_suite), task_id
-
-    def _definition(self, pipeline_id: str) -> PipelineDefinition | None:
-        """加载（并缓存）流水线定义（用于读 ``repair.eval`` 缺省值）。"""
-        if pipeline_id not in self._definitions:
-            try:
-                self._definitions[pipeline_id] = load_pipeline(pipeline_id)
-            except Exception:  # noqa: BLE001 - 定义不可读时退回缺省套件
-                logger.warning("裁决解析：流水线定义不可读 %s", pipeline_id, exc_info=True)
-                self._definitions[pipeline_id] = None
-        return self._definitions[pipeline_id]
 
     # ------------------------------------------------------------------ 报告
 
@@ -223,7 +145,23 @@ class HarnessEvaluationGate:
     # ------------------------------------------------------------------ 归约
 
     def _to_verdict(self, suite: EvalSuite, outcome: Any, repair_round: int) -> EvalVerdict:
-        """``TaskOut`` -> ``EvalVerdict``（未执行 / 降级 -> ``unknown``）。"""
+        """``TaskOut`` -> ``EvalVerdict``（未执行 / 降级 -> ``unknown``）。
+
+        分支顺序（v1.3 追加 2 个分支，位置是**刻意**的，docs/11 §7.3-7）：
+
+        1. ``status != "evaluated"`` → ``unknown``
+        2. 无产物 → ``unknown``
+        3. ★ **基线不健康** → ``unknown(baseline_unhealthy)``（"分数不可比"比
+           "某维度降级"更根本，故排在 4 之前）
+        4. 维度降级 → ``unknown(degraded_scoring)``
+        5. ★ **阻断项失败** → ``fail(check_failed)``（Q4：优先级**高于**分数，
+           故排在 6 之前）
+        6. 通过 → ``pass``
+        7. 其它 → ``fail``
+
+        所有分支都把 ``baseline_status`` / ``regression`` / ``blocking_failed``
+        抄进 ``EvalVerdict``（供 ``RepairController`` 写 history、``benchmark`` 读回分类）。
+        """
         artifact_version = outcome.artifact_ref.get("version")
         thresholds = dict(outcome.thresholds or {})
         base = {
@@ -235,6 +173,8 @@ class HarnessEvaluationGate:
             "cost_cny": float(outcome.cost_cny),
             "wall_time_ms": int(outcome.wall_time_ms),
         }
+        # v1.3：三个新字段在所有分支都抄一遍（缺省值形态对旧数据无害）
+        incremental = _incremental_fields(outcome)
 
         if outcome.status != "evaluated":
             return EvalVerdict(
@@ -243,6 +183,7 @@ class HarnessEvaluationGate:
                 degraded=True,
                 reason=f"评测未执行：{outcome.skip_reason or 'unknown'}",
                 **base,
+                **incremental,
             )
 
         if outcome.artifact_ref.get("name") is None:
@@ -254,6 +195,21 @@ class HarnessEvaluationGate:
                 degraded=True,
                 reason=f"未解析到产物 {self._artifact_name}（无可评内容）",
                 **base,
+                **incremental,
+            )
+
+        if incremental["baseline_status"] == BASELINE_UNHEALTHY:
+            # T1.2 三态之二：基线自身就失败 ⇒ 分数不可比，按 unknown 降级**不阻断**
+            return EvalVerdict(
+                status="unknown",
+                passed=False,
+                total_score=float(outcome.total_score),
+                runnability=float(outcome.runnability),
+                failure_class=FAILURE_BASELINE_UNHEALTHY,
+                degraded=True,
+                reason="基线自身检查未通过（基线不健康），本次分数不可比、不据此回边",
+                **base,
+                **incremental,
             )
 
         failed_checks = self._failed_checks(outcome)
@@ -270,6 +226,26 @@ class HarnessEvaluationGate:
                 degraded=True,
                 reason="评测降级（评估器或沙箱不可用），不据此回边",
                 **base,
+                **incremental,
+            )
+
+        if incremental["blocking_failed"]:
+            # Q4：阻断项失败 ⇒ 不可交付。**不新增失败分类**（复用 check_failed），
+            # 分数照算照披露（可能出现「总分 78 但未通过：阻断项失败」）。
+            return EvalVerdict(
+                status="fail",
+                passed=False,
+                total_score=float(outcome.total_score),
+                runnability=float(outcome.runnability),
+                failed_checks=tuple(failed_checks),
+                failure_class="check_failed",
+                reason=(
+                    f"{BLOCKING_REASON_PREFIX}（"
+                    + "、".join(incremental["blocking_failed"])
+                    + f"）；total={outcome.total_score} runnability={outcome.runnability}"
+                ),
+                **base,
+                **incremental,
             )
 
         if outcome.passed:
@@ -284,6 +260,7 @@ class HarnessEvaluationGate:
                     f" runnability={outcome.runnability}）"
                 ),
                 **base,
+                **incremental,
             )
 
         return EvalVerdict(
@@ -299,6 +276,7 @@ class HarnessEvaluationGate:
                 f"(<{thresholds.get('runnability', 60):g})"
             ),
             **base,
+            **incremental,
         )
 
     def _failed_checks(self, outcome: Any) -> list[FailedCheck]:
@@ -322,6 +300,22 @@ class HarnessEvaluationGate:
                 )
             )
         return failed
+
+
+def _incremental_fields(outcome: Any) -> dict[str, Any]:
+    """从 ``TaskOut`` 抄出 v1.3 三个新字段（缺省值形态对旧数据无害）。
+
+    ``TaskOut`` 是 pydantic 模型，新字段有默认值；用 ``getattr`` 兜底是为了让
+    既有测试里的 ``SimpleNamespace`` 伪 outcome 也能喂进 ``_to_verdict``。
+    """
+    probe = getattr(outcome, "baseline_runnability", None)
+    status = getattr(probe, "status", "") if probe is not None else ""
+    blocking = getattr(outcome, "blocking_failed", None) or ()
+    return {
+        "baseline_status": str(status or ""),
+        "regression": bool(getattr(outcome, "regression", False)),
+        "blocking_failed": tuple(str(item) for item in blocking),
+    }
 
 
 def _parse_exit(detail: str) -> tuple[int | None, bool]:
@@ -348,13 +342,6 @@ def _repair_round(context: dict[str, Any] | None) -> int:
         return int(repair.get("round", 0))
     except (TypeError, ValueError):
         return 0
-
-
-def _first_str(value: Any) -> str | None:
-    """把配置值归一为「非空字符串或 None」。"""
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
 
 
 def _baseline_ref(context: dict[str, Any] | None) -> dict[str, Any] | None:

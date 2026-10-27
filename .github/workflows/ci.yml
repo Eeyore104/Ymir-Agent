@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  # v1.3（T4.3）：定时 + 手动触发才跑「沙箱镜像可构建」校验（不推镜像、不阻塞 PR）。
+  # 上游 PyPI / 基础镜像一旦变动，镜像可能静默构建失败，周检是唯一发现渠道。
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -58,3 +63,48 @@ jobs:
       - name: Build (vue-tsc + vite)
         run: npm run build
         working-directory: web
+
+  docker-build:
+    name: Sandbox image build (scheduled only)
+    # v1.3（T4.3）：**只验证能 build**，不推镜像、不签字、不阻塞 PR
+    # （PR 上该 job 直接被 if 跳过，因此不会拖慢合并）。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sandbox image (no push)
+        run: docker build -f docker/sandbox.Dockerfile -t ymir-sandbox:ci .
+
+      - name: Inspect image metadata
+        run: |
+          docker image inspect ymir-sandbox:ci \
+            --format 'image={{.Id}} size={{.Size}} base={{index .Config.Labels "org.opencontainers.image.base.name"}}'
+
+      - name: Smoke / offline toolchain (pytest + ruff + pandas + node)
+        run: |
+          docker run --rm --network none ymir-sandbox:ci sh -s <<'SH'
+          set -eu
+          python -V
+          python -m pytest --version
+          ruff --version
+          python -c "import pandas, numpy"
+          node --version
+          npm --version
+          npx --version
+          SH
+
+      - name: Smoke / offline fe-build produces dist
+        run: |
+          docker run --rm -i --network none ymir-sandbox:ci sh -s <<'SH'
+          set -eu
+          mkdir -p /tmp/fe/src
+          cd /tmp/fe
+          printf '%s' '{"name":"smoke","private":true,"version":"0.0.0","type":"module","scripts":{"build":"vite build"},"devDependencies":{"vite":"^5.4.11"}}' > package.json
+          printf '%s' '<!doctype html><html><body><script type="module" src="/src/main.js"></script></body></html>' > index.html
+          printf '%s' 'console.log(1)' > src/main.js
+          fe-build .
+          test -f dist/index.html
+          echo "fe-build OK (dist/index.html)"
+          SH

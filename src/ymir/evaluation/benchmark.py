@@ -33,8 +33,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ymir.common.errors import InvalidParamError
+from ymir.evaluation.baseline_probe import BASELINE_UNHEALTHY
 from ymir.evaluation.evaluators.base import EvalTask
 from ymir.evaluation.harness import EvaluationHarness
+from ymir.evaluation.run_task import evaluate_run
 from ymir.evaluation.suite import EvalSuite
 from ymir.models.entities import ModelCall, PipelineRun
 from ymir.models.enums import RunMode
@@ -52,18 +54,24 @@ TERMINAL_STATUSES: tuple[str, ...] = ("completed", "failed")
 SKIP_NOT_RUN = "not_run"
 SKIP_BUDGET = "budget"
 
-#: 失败六分类（§4.2.6，first-match 顺序见 :data:`FAILURE_ORDER`）
+#: 失败分类（v1.2 六分类 + v1.3 两类，first-match 顺序见 :data:`FAILURE_ORDER`）
 FAILURE_MISSING_ARTIFACT = "missing_artifact"
 FAILURE_DEPENDENCY_MISSING = "dependency_missing"
 FAILURE_TIMEOUT = "timeout"
 FAILURE_CHECK_FAILED = "check_failed"
 FAILURE_BELOW_THRESHOLD = "below_threshold"
 FAILURE_DEGRADED_SCORING = "degraded_scoring"
+#: v1.3（T1.2）新增：基线自身就失败 ⇒ 分数不可比（"这行不可比"是最重要信息，排最前）。
+FAILURE_BASELINE_UNHEALTHY = "baseline_unhealthy"
+#: v1.3（T1.2）新增：基线健康但合并树出现失败 = 增量改坏了既有功能。
+FAILURE_REGRESSION = "regression"
 
 FAILURE_ORDER: tuple[str, ...] = (
+    FAILURE_BASELINE_UNHEALTHY,
     FAILURE_MISSING_ARTIFACT,
     FAILURE_DEPENDENCY_MISSING,
     FAILURE_TIMEOUT,
+    FAILURE_REGRESSION,
     FAILURE_CHECK_FAILED,
     FAILURE_BELOW_THRESHOLD,
     FAILURE_DEGRADED_SCORING,
@@ -115,38 +123,86 @@ class FailureSignals:
     degraded: bool = False
     sandbox: str = "docker"
     run_timed_out: bool = False
+    #: 基线健康度（v1.3 T1.2）：``""`` | ``healthy`` | ``unhealthy`` | ``skipped``。
+    baseline_status: str = ""
+    #: 「基线健康但合并树有失败」（v1.3 T1.2）。
+    regression: bool = False
+    #: 阻断项失败的命令清单（v1.3 Q4）：非空 ⇒ 分类为 ``check_failed`` 且原因带前缀。
+    blocking_failed: list[str] = field(default_factory=list)
 
 
 def classify_failure(signals: FailureSignals) -> tuple[str | None, str]:
-    """按 §4.2.6 的 first-match 顺序给出 ``(failure_class, failure_reason)``。
+    """按 first-match 顺序给出 ``(failure_class, failure_reason)``（v1.3 八分类）。
 
-    命中条件与顺序严格按设计表：缺文件 → 依赖缺失 → 超时 → 检查失败 →
-    未达双门槛 → 评分降级；都不命中返回 ``(None, "")``（即通过）。
+    顺序（docs/11 §7.3-8）：
+
+    1. ★ 基线不健康 → ``baseline_unhealthy``（"这行不可比"最重要）
+    2. 缺文件 → ``missing_artifact``
+    3. 依赖缺失 → ``dependency_missing``
+    4. 超时 → ``timeout``
+    5. ★ 回归 → ``regression``（比 ``check_failed`` 更精确的诊断优先）
+    6. 检查失败 → ``check_failed``（含 blocking 失败项，原因带「阻断项」前缀）
+    7. 未达双门槛 → ``below_threshold``
+    8. 评分降级 → ``degraded_scoring``
+
+    两个新分类**只可能由 v1.3 新数据触发**（``baseline_status`` / ``regression``
+    在旧状态文件里缺失 ⇒ 取默认值）⇒ 旧状态文件重渲染结果不变。
     """
     reason = _first_line(signals.run_error)
 
-    # 1) 缺文件
+    # 1) 基线不健康（T1.2）：分数不可比，先于一切"质量结论"
+    # ★ 口径区分：``baseline_status`` 是**健康度三态**（healthy/unhealthy/skipped），
+    # ``FAILURE_BASELINE_UNHEALTHY`` 是**失败分类值**（baseline_unhealthy）。
+    # 两者字面量不同，混用会让分支永不命中（v1.3 全局审查发现的坑）。
+    if signals.baseline_status == BASELINE_UNHEALTHY:
+        return (
+            FAILURE_BASELINE_UNHEALTHY,
+            "基线自身检查未通过（基线不健康），本次分数与健康基线不可比",
+        )
+
+    # 2) 缺文件
     if not signals.has_code_artifact or MISSING_UPSTREAM_PATTERN in signals.run_error:
         return FAILURE_MISSING_ARTIFACT, reason or "项目内无 code 产物"
 
-    # 2) 依赖缺失（运行期 ImportError 类信号）
+    # 3) 依赖缺失（运行期 ImportError 类信号）
     for check in signals.checks:
         output = str(check.get("output") or "")
         if any(pattern in output for pattern in DEPENDENCY_ERROR_PATTERNS):
             return FAILURE_DEPENDENCY_MISSING, _first_line(output) or "产物依赖镜像外包"
 
-    # 3) 超时
+    # 4) 超时
     if signals.run_timed_out or any(bool(check.get("timed_out")) for check in signals.checks):
         return FAILURE_TIMEOUT, reason or "检查执行超时"
 
-    # 4) 检查执行失败（含 pytest 退出码 5：no tests collected）
+    # 5) 回归（T1.2）：基线通过、合并树失败 ⇒ 增量改坏了既有功能（R7 固定格式）
+    if signals.regression:
+        first_failed = next(
+            (
+                str(check.get("command") or "")
+                for check in signals.checks
+                if check.get("exit_code") not in (None, 0)
+            ),
+            "",
+        )
+        detail = f"基线通过，合并树在 `{first_failed}` 失败" if first_failed else (
+            "基线通过，合并树出现失败"
+        )
+        return FAILURE_REGRESSION, detail
+
+    # 6) 检查执行失败（含 pytest 退出码 5：no tests collected）
     for check in signals.checks:
         exit_code = check.get("exit_code")
         if exit_code is not None and int(exit_code) != 0:
             output = str(check.get("output") or "")
+            if signals.blocking_failed:
+                return (
+                    FAILURE_CHECK_FAILED,
+                    f"阻断项失败（{'、'.join(signals.blocking_failed)}）；"
+                    f"{_first_line(output) or f'exit={exit_code}'}",
+                )
             return FAILURE_CHECK_FAILED, _first_line(output) or f"exit={exit_code}"
 
-    # 5) 未达双门槛
+    # 7) 未达双门槛
     thresholds = {**DEFAULT_THRESHOLDS, **(signals.thresholds or {})}
     if signals.total is not None and signals.runnability is not None:
         total_limit = float(thresholds["total"])
@@ -158,7 +214,7 @@ def classify_failure(signals: FailureSignals) -> tuple[str | None, str]:
                 f" < {total_limit:.0f}/{runnability_limit:.0f}",
             )
 
-    # 6) 评分降级
+    # 8) 评分降级
     if signals.degraded or signals.sandbox == "local":
         return FAILURE_DEGRADED_SCORING, "评分降级（维度 degraded 或沙箱回退 local）"
 
@@ -417,6 +473,13 @@ class BenchmarkRunner:
     ) -> dict[str, Any]:
         first, final = history[0], history[-1]
         thresholds = dict(DEFAULT_THRESHOLDS)
+        # v1.3（T1.2 / Q4）：三个新键**只增不改** —— 旧 history 条目缺键时取默认值，
+        # 重渲染结果与 v1.2 逐字节一致（docs/11 §7.5-7）。
+        baseline_status = str(final.get("baseline_status") or "")
+        regression = bool(final.get("regression"))
+        blocking_failed = [
+            str(item) for item in (final.get("blocking_failed") or []) if str(item)
+        ]
         signals = FailureSignals(
             has_code_artifact=final.get("artifact_version") is not None,
             run_error=(run.error if run is not None else "") or "",
@@ -427,6 +490,9 @@ class BenchmarkRunner:
             degraded=bool(final.get("degraded")),
             sandbox=self._sandbox,
             run_timed_out=_is_timeout_error(run.error if run is not None else ""),
+            baseline_status=baseline_status,
+            regression=regression,
+            blocking_failed=blocking_failed,
         )
         failure_class, failure_reason = classify_failure(signals)
         passed = bool(final.get("verdict") == "pass")
@@ -441,6 +507,10 @@ class BenchmarkRunner:
             "failure_class": None if passed else failure_class,
             "failure_reason": "" if passed else failure_reason,
             "artifact_version": final.get("artifact_version"),
+            # ---- v1.3 可选键（旧读取方忽略即可）----
+            "baseline_status": baseline_status or None,
+            "regression": regression,
+            "comparable": baseline_status != BASELINE_UNHEALTHY,
         }
 
     async def _row_from_fallback(
@@ -451,18 +521,41 @@ class BenchmarkRunner:
         suite: EvalSuite,
         options: BenchmarkOptions,
     ) -> dict[str, Any]:
-        """``history`` 为空：用同一套件 / 同一 judge 补一次**完整评测**（不得凑分）。"""
-        bound = EvalTask(
-            id=task.id,
-            requirement=task.requirement,
-            scenario=task.scenario,
-            project_id=project_id,
-            run_id=run.id if run is not None else None,
-            artifact_name=task.artifact_name,
-            checks=list(task.checks),
-        )
+        """``history`` 为空：用同一套件 / 同一 judge 补一次**完整评测**（不得凑分）。
+
+        v1.3（T4.1 / T4.2）：装配改走 :func:`ymir.evaluation.run_task.evaluate_run`
+        —— 与 gate 裁决 / 单跑脚本**同一装配点**。v1.2 这里自己拼 ``EvalTask``，
+        只绑套件 ``checks``、**不带**模板 ``layout`` 与 ``baseline_ref``，导致同一产物
+        走批量与走裁决可能得到两套分数（真实口径裂缝）。
+        """
         harness = self._harness.without_judge() if options.no_judge else self._harness
-        outcome = await harness.evaluate_task(bound, project_id=project_id, suite=suite)
+        if run is not None:
+            outcome = await evaluate_run(
+                harness,
+                run,
+                artifact_name=task.artifact_name or "code",
+                default_suite=suite.id,
+            )
+        else:
+            # run 已不存在（极端兜底）：无法装配上下文，退化为最小任务（不伪装成同源）
+            logger.warning(
+                "批量补评：run 缺失，退化为套件最小任务（task=%s suite=%s）",
+                task.id,
+                suite.id,
+            )
+            bound = EvalTask(
+                id=task.id,
+                requirement=task.requirement,
+                scenario=task.scenario,
+                project_id=project_id,
+                artifact_name=task.artifact_name,
+                checks=list(task.checks),
+            )
+            outcome = await harness.evaluate_task(
+                bound, project_id=project_id, suite=suite
+            )
+        probe = outcome.baseline_runnability
+        baseline_status = str(getattr(probe, "status", "") or "") if probe else ""
         signals = FailureSignals(
             has_code_artifact=outcome.artifact_ref.get("name") is not None,
             run_error=(run.error if run is not None else "") or "",
@@ -473,6 +566,9 @@ class BenchmarkRunner:
             degraded=any(dim.degraded for dim in outcome.dimensions),
             sandbox=self._sandbox,
             run_timed_out=_is_timeout_error(run.error if run is not None else ""),
+            baseline_status=baseline_status,
+            regression=bool(outcome.regression),
+            blocking_failed=list(outcome.blocking_failed),
         )
         if outcome.status != "evaluated":
             return {
@@ -496,6 +592,10 @@ class BenchmarkRunner:
             "failure_class": None if passed else failure_class,
             "failure_reason": "" if passed else failure_reason,
             "artifact_version": outcome.artifact_ref.get("version"),
+            # ---- v1.3 可选键 ----
+            "baseline_status": baseline_status or None,
+            "regression": bool(outcome.regression),
+            "comparable": baseline_status != BASELINE_UNHEALTHY,
         }
 
     # ------------------------------------------------------------------ 状态

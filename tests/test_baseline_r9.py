@@ -123,7 +123,7 @@ async def test_unavailable_baseline_workdir_is_patch_only(store_factory) -> None
 
     harness = EvaluationHarness(store=store)
     task = EvalTask(id="t-r9-patch", artifact_name="code")
-    workdir, _ref, _references = await harness._load_task(task, project_id, None)
+    workdir, _ref, _references, _base = await harness._load_task(task, project_id, None)
 
     assert workdir == PATCH
     assert PATCH_MANIFEST_NAME not in workdir
@@ -144,7 +144,7 @@ async def test_exact_ref_wins_over_manifest_hash(store_factory) -> None:
         artifact_name="code",
         baseline_ref={"artifact_id": v1.artifact_id, "version": 1},
     )
-    workdir, _ref, _references = await harness._load_task(task, project_id, None)
+    workdir, _ref, _references, _base = await harness._load_task(task, project_id, None)
 
     assert task.baseline_unavailable is False
     assert workdir["pyproject.toml"] == BASE_V1["pyproject.toml"]  # v1 独有
@@ -160,7 +160,7 @@ async def test_hash_matching_searches_history_not_only_latest(store_factory) -> 
 
     harness = EvaluationHarness(store=store)
     task = EvalTask(id="t-r9-hist", artifact_name="code")  # 无 baseline_ref / 无 run_id
-    workdir, _ref, _references = await harness._load_task(task, project_id, None)
+    workdir, _ref, _references, _base = await harness._load_task(task, project_id, None)
 
     assert task.baseline_unavailable is False
     assert workdir["pyproject.toml"] == BASE_V1["pyproject.toml"]
@@ -199,7 +199,7 @@ async def test_run_context_baseline_ref_is_used_when_task_lacks_it(
 
     harness = EvaluationHarness(store=store, session_factory=session_factory)
     task = EvalTask(id="t-r9-ctx", artifact_name="code", run_id=run_id)
-    workdir, _ref, _references = await harness._load_task(task, project_id, None)
+    workdir, _ref, _references, _base = await harness._load_task(task, project_id, None)
 
     assert task.baseline_unavailable is False
     assert workdir["pyproject.toml"] == BASE_V1["pyproject.toml"]
@@ -214,7 +214,7 @@ async def test_healthy_baseline_still_merges(store_factory) -> None:
 
     harness = EvaluationHarness(store=store)
     task = EvalTask(id="t-r9-ok", artifact_name="code")
-    workdir, _ref, _references = await harness._load_task(task, project_id, None)
+    workdir, _ref, _references, _base = await harness._load_task(task, project_id, None)
 
     assert task.baseline_unavailable is False
     assert set(workdir) == set(BASE_V1) | set(PATCH)

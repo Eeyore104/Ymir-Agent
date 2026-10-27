@@ -1,0 +1,39 @@
+#!/bin/sh
+# node-build [dir]（缺省 .）：**离线** Node/TypeScript 构建（v1.3 T3.2）。
+#
+# 与 fe-build 同构：本地缓存 `npm ci --offline` → 回退 /opt/node-baseline/node_modules
+# → 执行构建。**不联网**，禁止 `npm install` / `npx -y`。
+#
+# 构建命令选择：
+#   - package.json 有 "build" 脚本 ⇒ `npm run build`（node-express 骨架里是 tsc）；
+#   - 没有 ⇒ 直接 `npx --no-install tsc -p tsconfig.json`（`--no-install` 保证不联网）。
+set -eu
+
+dir="${1:-.}"
+cd "$dir" 2>/dev/null || {
+    echo "node-build: 项目目录不存在: $dir" >&2
+    exit 2
+}
+[ -f package.json ] || {
+    echo "node-build: 缺少 $dir/package.json" >&2
+    exit 2
+}
+
+export npm_config_cache="${npm_config_cache:-/opt/npm-cache}"
+log=/tmp/npm-ci.log
+
+if [ -f package-lock.json ] && npm ci --offline --no-audit --no-fund >"$log" 2>&1; then
+    echo "node-build: npm ci --offline 命中本地缓存"
+else
+    echo "node-build: npm ci --offline 不可用，回退预置基线 node_modules"
+    tail -n 5 "$log" 2>/dev/null || true
+    mkdir -p node_modules
+    cp -an /opt/node-baseline/node_modules/. ./node_modules/
+fi
+
+if grep -q '"build"[[:space:]]*:' package.json; then
+    npm run build
+else
+    echo "node-build: package.json 无 build 脚本，直接 tsc -p tsconfig.json"
+    npx --no-install tsc -p tsconfig.json
+fi

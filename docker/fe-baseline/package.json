@@ -1,0 +1,20 @@
+{
+  "name": "ymir-fe-baseline",
+  "private": true,
+  "version": "0.0.0",
+  "description": "沙箱前端依赖池（v1.3 T2.2）：与 web/package.json 同版本区间，构建期 npm ci 生成 node_modules",
+  "type": "module",
+  "dependencies": {
+    "element-plus": "^2.9.1",
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vue-tsc": "^2.1.10"
+  }
+}

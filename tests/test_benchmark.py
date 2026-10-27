@@ -33,6 +33,13 @@ from ymir.evaluation import (
     RUNNABILITY,
     EvaluationHarness,
 )
+from ymir.evaluation.baseline import FAILURE_LABELS
+from ymir.evaluation.baseline_probe import BASELINE_UNHEALTHY
+from ymir.evaluation.benchmark import (
+    FAILURE_BASELINE_UNHEALTHY,
+    FAILURE_ORDER,
+    FAILURE_REGRESSION,
+)
 from ymir.evaluation.suite import BINDING_MODE_PER_TASK, EvalSuite
 
 SUITES_DIR = PROJECT_ROOT / "evals" / "suites"
@@ -656,9 +663,12 @@ async def test_fallback_scoring_when_history_empty(
     )
 
     assert len(harness.calls) == 1
-    task_id, project_id, run_id = harness.calls[0]
+    evaluated_task_id, project_id, run_id = harness.calls[0]
+    # v1.3（T4.1）：兜底补评改走 run_task，任务 id 与 gate 同源（``run:<uuid>``），
+    # 状态行仍按套件任务 id 归档
+    assert evaluated_task_id.startswith("run:")
     assert project_id and run_id  # 兜底评测也归属到该 run（judge 成本可追溯）
-    row = state.tasks[task_id]
+    row = state.tasks["task-rest-crud-01"]
     assert row["score_source"] == "fallback"
     assert row["final_pass"] is True
     assert row["cost_source"] == "measured"
@@ -1219,3 +1229,162 @@ async def test_llm_judge_with_run_binds_cost_to_run() -> None:
     # 副本语义：原 judge 不受影响，未绑定时不透传（v1.0 行为不变）
     await judge.judge(system="s", user="u", schema=_JudgeOut)
     assert gateway.calls[1] == {"tier": "executor", "run_id": None, "stage_id": None}
+
+
+# ======================================= v1.3（T1.2 / Q4）：失败分类扩到八类 + 顺序
+
+
+def test_failure_order_is_eight_categories() -> None:
+    """``FAILURE_ORDER`` 由六类扩到八类，且顺序是**口径**（first-match）。"""
+    assert FAILURE_ORDER == (
+        FAILURE_BASELINE_UNHEALTHY,
+        FAILURE_MISSING_ARTIFACT,
+        FAILURE_DEPENDENCY_MISSING,
+        FAILURE_TIMEOUT,
+        FAILURE_REGRESSION,
+        FAILURE_CHECK_FAILED,
+        FAILURE_BELOW_THRESHOLD,
+        FAILURE_DEGRADED_SCORING,
+    )
+    # 两个新值排位为刻意设计：不可比最前，回归先于 check_failed
+    assert FAILURE_ORDER[0] == "baseline_unhealthy"
+    assert FAILURE_ORDER.index("regression") < FAILURE_ORDER.index("check_failed")
+
+
+def test_classify_baseline_unhealthy_wins_over_everything() -> None:
+    """基线不健康 → ``baseline_unhealthy``（"这行不可比"先于一切质量结论）。
+
+    ★ 口径：``baseline_status`` 是健康度三态字面量 ``"unhealthy"``，
+    不是失败分类值 ``"baseline_unhealthy"``（两个常量字面量不同，混用会永不命中）。
+    """
+    failure_class, reason = classify_failure(
+        FailureSignals(
+            has_code_artifact=False,  # 缺文件也要让位
+            baseline_status=BASELINE_UNHEALTHY,
+        )
+    )
+    assert failure_class == FAILURE_BASELINE_UNHEALTHY
+    assert "不可比" in reason
+    # 传失败分类值（错误用法）不会命中 —— 锁定口径区分，防回归
+    wrong, _ = classify_failure(FailureSignals(baseline_status=FAILURE_BASELINE_UNHEALTHY))
+    assert wrong is None
+
+
+def test_classify_regression_before_check_failed() -> None:
+    """回归优先于 ``check_failed``：原因给"基线通过、合并树在某命令失败"（R7 固定格式）。"""
+    signals = FailureSignals(
+        checks=[
+            {
+                "command": "python -m pytest -q",
+                "exit_code": 1,
+                "timed_out": False,
+                "output": "1 failed",
+            }
+        ],
+        baseline_status="healthy",
+        regression=True,
+        total=70.0,
+        runnability=50.0,
+    )
+    failure_class, reason = classify_failure(signals)
+    assert failure_class == FAILURE_REGRESSION
+    assert "基线通过" in reason
+    assert "python -m pytest -q" in reason
+
+
+def test_classify_check_failed_when_not_regression() -> None:
+    """``regression=False`` ⇒ 仍归 ``check_failed``（互斥，不误用回归分类）。"""
+    signals = FailureSignals(
+        checks=[
+            {
+                "command": "python -m pytest -q",
+                "exit_code": 1,
+                "timed_out": False,
+                "output": "1 failed",
+            }
+        ],
+        baseline_status="skipped",
+        regression=False,
+    )
+    failure_class, _reason = classify_failure(signals)
+    assert failure_class == FAILURE_CHECK_FAILED
+
+
+def test_classify_blocking_failed_prefixes_reason() -> None:
+    """Q4：阻断项失败复用 ``check_failed``，原因带「阻断项」前缀（不新增分类）。"""
+    signals = FailureSignals(
+        checks=[
+            {
+                "command": "fe-build web",
+                "exit_code": 1,
+                "timed_out": False,
+                "output": "vite build failed",
+            }
+        ],
+        blocking_failed=["fe-build web"],
+    )
+    failure_class, reason = classify_failure(signals)
+    assert failure_class == FAILURE_CHECK_FAILED
+    assert reason.startswith("阻断项失败")
+
+
+def test_failure_labels_cover_new_categories() -> None:
+    """``baseline.FAILURE_LABELS`` 与 ``FAILURE_ORDER`` 同源（两类新分类都有中文标签）。"""
+    assert FAILURE_LABELS["regression"] == "回归"
+    assert FAILURE_LABELS["baseline_unhealthy"] == "基线不健康"
+    assert set(FAILURE_ORDER) <= set(FAILURE_LABELS)
+
+
+async def test_history_row_carries_incremental_keys(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """``_row_from_history`` 读回三键：``baseline_status`` / ``regression`` / ``comparable``。"""
+    history = [
+        {
+            "round": 0,
+            "verdict": "fail",
+            "total": 70.0,
+            "runnability": 50.0,
+            "failed_checks": ["python -m pytest -q"],
+            "failed_check_details": [
+                {
+                    "command": "python -m pytest -q",
+                    "exit_code": 1,
+                    "timed_out": False,
+                    "output": "1 failed",
+                }
+            ],
+            "artifact_version": 1,
+            "degraded": False,
+            "baseline_status": "healthy",
+            "regression": True,
+            "blocking_failed": [],
+        }
+    ]
+    row = await _row_of_history(session_factory, tmp_path, history)
+    assert row["baseline_status"] == "healthy"
+    assert row["regression"] is True
+    assert row["comparable"] is True
+    assert row["failure_class"] == FAILURE_REGRESSION
+
+
+async def test_history_row_old_entry_keeps_defaults(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """旧状态文件（无三键）→ 默认值 ``None`` / ``False`` / ``True``（渲染不变）。"""
+    legacy = [
+        {
+            "round": 0,
+            "verdict": "fail",
+            "total": 70.0,
+            "runnability": 80.0,
+            "failed_checks": [],
+            "artifact_version": 1,
+            "degraded": False,
+        }
+    ]
+    row = await _row_of_history(session_factory, tmp_path, legacy)
+    assert row["baseline_status"] is None
+    assert row["regression"] is False
+    assert row["comparable"] is True
+    assert row["failure_class"] == FAILURE_BELOW_THRESHOLD

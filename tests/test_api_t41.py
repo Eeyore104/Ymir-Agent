@@ -132,14 +132,17 @@ async def _code_artifact(
 
 # ------------------------------------------------------------------ /templates
 
-async def test_templates_list_returns_two_real_templates(client: AsyncClient) -> None:
-    """DoD ②：``GET /templates`` 返回 2 个模板且都可用（``loading_error is None``）。"""
+async def test_templates_list_returns_four_real_templates(client: AsyncClient) -> None:
+    """DoD ②：``GET /templates`` 返回 4 套模板且都可用（``loading_error is None``）。
+
+    v1.3（T3.2）：模板库 2 → 4 套（新增 ``data-pipeline`` / ``node-express``）。
+    """
     resp = await client.get("/api/v1/templates")
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["total"] == 2
+    assert data["total"] == 4
     by_id = {item["id"]: item for item in data["items"]}
-    assert set(by_id) == {"fastapi-vue3", "python-cli"}
+    assert set(by_id) == {"fastapi-vue3", "python-cli", "data-pipeline", "node-express"}
     assert all(item["loading_error"] is None for item in by_id.values())
 
 
@@ -183,7 +186,10 @@ async def test_template_detail_excludes_skeleton_body(client: AsyncClient) -> No
     assert data["seed_paths"] == ["app/main.py", "requirements.txt"]
     assert data["stack"]["frontend"] == "vue3"
     assert data["layout"]["required_dirs"] == ["app", "tests", "web/src"]
-    assert len(data["checks"]) == 4 and data["checks"][0]["type"] == "command"
+    # v1.3：4 条后端检查 + 1 条前端构建检查
+    assert len(data["checks"]) == 5 and data["checks"][0]["type"] == "command"
+    assert data["checks"][-1]["run"] == "fe-build web"
+    assert data["checks"][-1]["blocking"] is True
     # 四个角色的追加约束都给了文本（前端"将遵守什么"摘要要用）
     assert set(data["prompting"]) == {"pm", "architect", "engineer", "qa"}
     assert "FastAPI" in data["prompting"]["pm"]

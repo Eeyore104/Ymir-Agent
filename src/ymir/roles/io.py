@@ -76,6 +76,11 @@ class TemplateContext:
     checks: tuple[dict[str, Any], ...] = ()
     #: 给各角色的追加约束（键 = 角色 id）
     prompting: dict[str, str] = field(default_factory=dict)
+    #: 受保护路径（v1.3 T1.1）：非空时 engineer 提示词渲染「## 受保护路径」段；
+    #: 空 ⇒ **不渲染该节** ⇒ 非模板 / 未配置模板的提示词逐字节不变。
+    protected_paths: frozenset[str] = frozenset()
+    #: 改动面告警阈值（v1.3 T1.3）：供「改动面最小化」提示词给出具体数字。
+    change_ratio_threshold: float = 0.5
 
     def prompt_for(self, role_id: str) -> str:
         """取某角色的追加约束（未声明返回空串）。"""
@@ -100,6 +105,9 @@ class TemplateContext:
             seed_paths=frozenset(spec.seed_paths()),
             checks=tuple(check.model_dump(mode="json") for check in spec.checks),
             prompting=dict(spec.prompting),
+            # v1.3：受保护路径与改动面阈值（缺省 Empty / 0.5 ⇒ 提示词不变）
+            protected_paths=frozenset(spec.protected_paths()),
+            change_ratio_threshold=float(spec.protected.max_change_ratio),
         )
 
 

@@ -181,6 +181,11 @@ class RepairController:
                 "wall_time_ms": int(verdict.wall_time_ms),
                 "failure_class": verdict.failure_class,
                 "degraded": verdict.degraded,
+                # v1.3（T1.2 / Q4）：**只增不改** —— 既有键一个都不动，
+                # 旧状态文件重放 / 重渲染结果不受影响（docs/11 §7.5-7）。
+                "baseline_status": verdict.baseline_status,
+                "regression": bool(verdict.regression),
+                "blocking_failed": list(verdict.blocking_failed),
                 "at": utcnow().isoformat(),
             }
             history.append(entry)

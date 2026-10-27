@@ -35,7 +35,7 @@ SKIP_LABELS: dict[str, str] = {
     "missing_artifact": "产物缺失",
 }
 
-#: 失败分类的中文标签（六分类，§4.2.6）
+#: 失败分类的中文标签（v1.2 六分类 + v1.3 两类，§4.2.6 / docs/11 §7.3-8）
 FAILURE_LABELS: dict[str, str] = {
     "missing_artifact": "缺文件",
     "dependency_missing": "依赖缺失",
@@ -43,6 +43,9 @@ FAILURE_LABELS: dict[str, str] = {
     "check_failed": "检查失败",
     "below_threshold": "未达门槛",
     "degraded_scoring": "评分降级",
+    # v1.3（T1.2）：两类新分类只可能由新数据触发 ⇒ 旧状态文件重渲染结果不变
+    "regression": "回归",
+    "baseline_unhealthy": "基线不健康",
 }
 
 #: 表头/表尾固定文案（渲染确定性）
@@ -69,6 +72,14 @@ class BaselineRow:
     skip_reason: str | None = None
     score_source: str = "pipeline"
     sandbox: str = "docker"
+    #: 基线健康度（v1.3 T1.2）：``healthy`` / ``unhealthy`` / ``skipped`` / ``None``。
+    #: ★ **不进 markdown 表列**（B11：表列不变才能保证历史表字节一致与可对比），
+    #: 只进 ``baseline-<batch>.json`` 的可选键。
+    baseline_status: str | None = None
+    #: 「基线通过但合并树失败」= 增量改坏既有功能（v1.3 T1.2）。
+    regression: bool = False
+    #: 该行分数是否与"健康基线"可比（``baseline_status != unhealthy``）。
+    comparable: bool = True
 
     @property
     def executed(self) -> bool:
@@ -91,6 +102,10 @@ class BaselineRow:
             "skip_reason": self.skip_reason,
             "score_source": self.score_source,
             "sandbox": self.sandbox,
+            # v1.3 可选键（表格列不变；旧读取方忽略即可）
+            "baseline_status": self.baseline_status,
+            "regression": self.regression,
+            "comparable": self.comparable,
         }
 
 
@@ -283,6 +298,7 @@ def _row_of(task_id: str, scenario: str, raw: dict[str, Any] | None) -> Baseline
             failure_reason=SKIP_LABELS["not_run"],
         )
     wall_ms = raw.get("wall_time_ms")
+    baseline_status = raw.get("baseline_status")
     return BaselineRow(
         task_id=task_id,
         scenario=scenario,
@@ -299,6 +315,10 @@ def _row_of(task_id: str, scenario: str, raw: dict[str, Any] | None) -> Baseline
         skip_reason=raw.get("skip_reason"),
         score_source=str(raw.get("score_source") or "pipeline"),
         sandbox=str(raw.get("sandbox") or "docker"),
+        # v1.3：三个可选键（旧状态文件缺键时取默认值 ⇒ 渲染字节一致）
+        baseline_status=str(baseline_status) if baseline_status else None,
+        regression=bool(raw.get("regression")),
+        comparable=bool(raw.get("comparable", True)),
     )
 
 
