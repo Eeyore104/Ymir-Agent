@@ -39,11 +39,24 @@ conventions:
 # 受保护路径（v1.3 T1.1 / U3 定案）：场景③（python-cli × patch）的根因就是
 # `tests/conftest.py` 被重写、`run_cli` 夹具被删 ⇒ 6 个模块收集期 ImportError。
 # 刻意**不声明 scoring**（保持 v1.2 老口径，分数零变化）。
+#
+# v1.3.1（T3.1 = Q2 的 A 方案）：追加**入口文件** `ymir_cli/cli.py`。真实事故
+# （docs/12 §7-L1）里模型把 `run` 函数删掉、子命令搬到新文件、入口留空壳 ——
+# `import ymir_cli` 仍成功，但 `tests/` 的 `from ymir_cli.cli import run` 全线
+# ImportError。`ymir_cli/cli.py` 不在骨架里（骨架只有 `ymir_cli/__init__.py`），
+# 也不在 conventions 里，因此与校验 18 的"不得交叉"不冲突。
+#
+# A 方案只对 python-cli 成立（fastapi-vue3 的入口 `app/main.py` 是骨架 seed，
+# 校验 18 禁止 protected ∩ skeleton 交叉 ⇒ 保护不了），所以还需要 T3.2 的通用机制
+# `symbol_deletions`：删掉仍被引用的公共顶层符号 ⇒ 同样拦。
 protected:
   paths:
     - tests/conftest.py
+    - ymir_cli/cli.py
   on_hit: reject
   max_change_ratio: 0.5
+  # W3-B′：引用感知的符号删除检测（默认 off；此处显式收紧为 reject）
+  symbol_deletions: reject
 
 skeleton:
   max_files: 5

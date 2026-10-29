@@ -120,6 +120,11 @@ class BaselineContext:
     一并带上，用于 engineer 的「## 增量模式」段（让模型知道哪些文件已存在）。
 
     ★ 只带路径、不带正文：基线可能几百个文件，正文进提示词会直接顶爆 token。
+
+    v1.3.1（T4.2）：追加三个**事实**字段（``patch_changed_paths`` /
+    ``skeleton_added`` / ``smoke_summary``），只给 **qa** 的「## 基线已知事实」段用。
+    全部带默认值 ⇒ 既有构造点（``_load_baseline`` / 测试里的手工构造）零改动、
+    engineer 的提示词逐字节不变。
     """
 
     artifact_id: str = ""
@@ -128,6 +133,17 @@ class BaselineContext:
     file_count: int = 0
     #: 基线已有的相对路径（已排序；提示词按上限截断后渲染）
     paths: tuple[str, ...] = ()
+    # ---- v1.3.1（T4.2，docs/13 §7.2.5）：给 QA 的**事实**，全部带默认值 ----
+    #: 本次补丁的变更路径（来自**本 stage 上游** ``code`` 产物里的
+    #: ``patch_manifest.json``；无则空 ⇒ 提示词不渲染该块）。
+    patch_changed_paths: tuple[str, ...] = ()
+    #: 合并时**真的补进**的骨架路径（同一份 ``patch_manifest.json`` 的
+    #: ``skeleton_added``）。
+    skeleton_added: tuple[str, ...] = ()
+    #: 冒烟结论的**事实摘要**（命令数 / exit=0 数 / 首个非 0 命令），≤400 字符。
+    #: 刻意只放事实串、不放结构化结论：渲染层不需要理解它，也避免悄悄多出一个
+    #: 判词通道。
+    smoke_summary: str = ""
 
     @property
     def hash_prefix(self) -> str:

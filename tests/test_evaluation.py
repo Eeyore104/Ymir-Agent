@@ -59,7 +59,7 @@ from ymir.evaluation.evaluators.architecture import (
 from ymir.evaluation.evaluators.base import CheckRun, run_checks, score_by_points
 from ymir.evaluation.evaluators.convention import _ConventionJudgement
 from ymir.evaluation.evaluators.requirement import _ItemJudgement, _RequirementJudgement
-from ymir.evaluation.report import BaselineProbeOut
+from ymir.evaluation.report import BaselineCheckOut, BaselineProbeOut, FailureAttributionOut
 from ymir.evaluation.run_task import resolve_checks, template_spec_for_run
 from ymir.evaluation.suite import Thresholds
 from ymir.sandbox.base import ExecResult, NetworkPolicy, SandboxSession
@@ -2034,3 +2034,295 @@ async def test_prefix_rule_passes_for_all_four_templates() -> None:
         prefix = [e for e in score.evidence if e.ref == "allowed_prefixes"]
         assert prefix, template_id
         assert "全部路径均在前缀内" in prefix[0].detail, (template_id, prefix[0].detail)
+
+
+# ==================================================== v1.3.1（T2.2 / M7 ①）：归因与探针口径
+
+
+def _attribution_report(task: TaskOut) -> EvaluationReport:
+    """把单个 ``TaskOut`` 包成报告（归因用例只关心渲染，不关心聚合口径）。"""
+    return EvaluationReport.build(
+        suite_id="default",
+        suite_version="1.0",
+        project_id="p",
+        weights={REQUIREMENT: 0.3, RUNNABILITY: 0.3, CONVENTION: 0.2, ARCHITECTURE: 0.2},
+        thresholds=Thresholds(total=75.0, runnability=60.0),
+        tasks=[task],
+        wall_time_ms=1,
+    )
+
+
+def test_failure_attribution_none_keeps_markdown_byte_identical() -> None:
+    """A9 红线：``failure_attribution`` 为 ``None`` ⇒ markdown **逐字节**不变。"""
+    without = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        regression=False,
+    )
+    explicit_none = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        regression=False,
+        failure_attribution=None,
+    )
+
+    baseline_report = _attribution_report(without)
+    explicit_report = _attribution_report(explicit_none)
+    # 抹掉生成时间（两个报告对象各自取当前时刻，微秒不同会掩盖真正要测的差异）
+    baseline_report.generated_at = explicit_report.generated_at = "2026-01-01T00:00:00+00:00"
+
+    baseline_markdown = baseline_report.to_markdown()
+    assert baseline_markdown == explicit_report.to_markdown()
+    # 只有归因相关字样不得出现（其余行由既有 v1.3 用例覆盖）
+    assert "归因" not in baseline_markdown
+    assert "基线自带失败标记的文件" not in baseline_markdown
+
+
+def test_failure_attribution_renders_lines_when_present() -> None:
+    """T2.2 DoD ②：有值时追加 1–2 行（归因 + ``baseline_only_files`` 条数）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        failure_attribution=FailureAttributionOut(
+            verdict="introduced",
+            basis="marker_delta",
+            baseline_only_files=["app/storage.py"],
+            changed_files=["app/api.py"],
+            sample_markers=["app/api.py:3"],
+        ),
+    )
+    markdown = _attribution_report(task).to_markdown()
+
+    assert "失败归因（提示，不参与判定）：失败标记由本次改动引入" in markdown
+    assert "依据 marker_delta" in markdown
+    assert "基线自带失败标记的文件：1 个" in markdown
+
+
+def test_failure_attribution_does_not_change_verdict_or_score() -> None:
+    """★ 归因**不进判据**：加了归因，总分 / 通过判定 / 通过率一字不变。"""
+    plain = TaskOut(
+        id="t", dimensions=[], total_score=90.0, runnability=90.0, passed=True
+    )
+    attributed = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=90.0,
+        runnability=90.0,
+        passed=True,
+        failure_attribution=FailureAttributionOut(
+            verdict="pre_existing", basis="marker_delta", baseline_only_files=["a.py"]
+        ),
+    )
+
+    left = _attribution_report(plain)
+    right = _attribution_report(attributed)
+    assert (left.passed, left.total_score, left.runnability) == (
+        right.passed,
+        right.total_score,
+        right.runnability,
+    )
+    assert left.final_pass_rate == right.final_pass_rate == 1.0
+
+
+def test_failure_attribution_unknown_does_not_say_pass_or_fail() -> None:
+    """``unknown`` 的文案只说"依据不足"，不得出现"通过 / 不通过"式判词。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        failure_attribution=FailureAttributionOut(verdict="unknown", basis="no_markers"),
+    )
+    line = [row for row in _attribution_report(task).to_markdown().splitlines() if "归因" in row]
+    assert len(line) == 1
+    assert "依据不足" in line[0]
+    assert "不参与判定" in line[0]
+    assert "回归" not in line[0]
+
+
+def test_probe_mode_only_serialized_when_skeleton_filled() -> None:
+    """M7 ①：``probe_mode`` **只在** ``skeleton_filled`` 时出现在 JSON 里。"""
+    raw = BaselineProbeOut(status="healthy", passed=True, probe_mode="raw")
+    empty = BaselineProbeOut(status="healthy", passed=True)
+    filled = BaselineProbeOut(status="healthy", passed=True, probe_mode="skeleton_filled")
+
+    assert "probe_mode" not in raw.model_dump()
+    assert "probe_mode" not in empty.model_dump()
+    assert filled.model_dump()["probe_mode"] == "skeleton_filled"
+    # 内部字段仍然可读（供日志与单测断言），只是不进报告 JSON
+    assert raw.probe_mode == "raw"
+
+
+def test_baseline_check_out_skipped_reason_is_optional() -> None:
+    """``skipped_reason`` 为纯增量字段：旧 JSON（缺该键）仍可解析。"""
+    legacy = TaskOut.model_validate(
+        {
+            "id": "t",
+            "baseline_runnability": {
+                "status": "skipped",
+                "checks": [{"command": "fe-build web", "skipped": True}],
+            },
+        }
+    )
+    assert legacy.baseline_runnability is not None
+    assert legacy.baseline_runnability.checks[0].skipped_reason == ""
+    assert legacy.failure_attribution is None
+
+
+def test_probe_line_counts_executed_and_skipped_separately() -> None:
+    """markdown（v1.3.1 T1.2）：跳过的检查不得算进「跑了 N 条」（1 执行 + 1 跳过）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        baseline_runnability=BaselineProbeOut(
+            status="skipped",
+            reason="baseline_incomplete",
+            checks=[
+                BaselineCheckOut(command="python -m pytest -q", exit_code=0),
+                BaselineCheckOut(
+                    command="fe-build web",
+                    skipped=True,
+                    skipped_reason="requires_file_missing:web/",
+                ),
+            ],
+        ),
+    )
+    markdown = _attribution_report(task).to_markdown()
+
+    assert "，1 条检查，1 条因缺依赖文件跳过" in markdown
+    assert "，2 条检查" not in markdown
+
+
+def test_probe_line_all_skipped_never_says_n_checks() -> None:
+    """基线整份跳过时只报跳过条数（不再出现「N 条检查」的误导）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        baseline_runnability=BaselineProbeOut(
+            status="skipped",
+            reason="baseline_incomplete",
+            checks=[
+                BaselineCheckOut(
+                    command="fe-build web",
+                    skipped=True,
+                    skipped_reason="requires_file_missing:web/",
+                ),
+                BaselineCheckOut(
+                    command="npm run build",
+                    skipped=True,
+                    skipped_reason="requires_file_missing:web/",
+                ),
+            ],
+        ),
+    )
+    markdown = _attribution_report(task).to_markdown()
+
+    assert "，2 条因缺依赖文件跳过" in markdown
+    assert "，2 条检查" not in markdown
+
+
+def _json_keys(node: Any) -> set[str]:
+    """递归收集 JSON 结构里出现过的**全部**键名（用于「键不存在」断言）。"""
+    keys: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(str(key))
+            keys |= _json_keys(value)
+    elif isinstance(node, list):
+        for item in node:
+            keys |= _json_keys(item)
+    return keys
+
+
+#: A9 红线点名的三个「非默认值才序列化」键（v1.3.1 新增）。
+_V131_OPTIONAL_KEYS = ("probe_mode", "skipped_reason", "failure_attribution")
+
+
+def test_report_json_omits_v131_keys_when_unconfigured() -> None:
+    """A9：未配置时 ``evaluation_report.json`` **不含**三个新键（逐字节一致的判据）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=80.0,
+        runnability=80.0,
+        passed=True,
+        baseline_runnability=BaselineProbeOut(
+            status="healthy",
+            score=100.0,
+            passed=True,
+            checks=[
+                BaselineCheckOut(command="python -m pytest -q", exit_code=0, output="ok")
+            ],
+            # 探针树 == 基线原样（raw）：内部有值，但**不进 JSON**
+            probe_mode="raw",
+        ),
+    )
+    payload = json.loads(_attribution_report(task).to_json())
+    keys = _json_keys(payload)
+
+    for key in _V131_OPTIONAL_KEYS:
+        assert key not in keys, key
+    # 原有字段一个不少（不是「整段被删」）
+    probe = payload["tasks"][0]["baseline_runnability"]
+    assert probe["status"] == "healthy"
+    assert probe["checks"][0]["command"] == "python -m pytest -q"
+    assert probe["checks"][0]["exit_code"] == 0
+
+
+def test_report_json_keeps_v131_keys_when_configured() -> None:
+    """有值时三个键都在且取值正确（跳过原因 / 探针口径 / 归因四态）。"""
+    task = TaskOut(
+        id="t",
+        dimensions=[],
+        total_score=70.0,
+        runnability=50.0,
+        passed=False,
+        blocking_failed=["fe-build web"],
+        baseline_runnability=BaselineProbeOut(
+            status="skipped",
+            reason="baseline_incomplete",
+            checks=[
+                BaselineCheckOut(
+                    command="fe-build web",
+                    skipped=True,
+                    skipped_reason="requires_file_missing:web/",
+                )
+            ],
+            probe_mode="skeleton_filled",
+        ),
+        failure_attribution=FailureAttributionOut(
+            verdict="introduced",
+            basis="marker_delta",
+            baseline_only_files=["app/storage.py"],
+            changed_files=["app/api.py"],
+            sample_markers=["app/api.py:3"],
+        ),
+    )
+    payload = json.loads(_attribution_report(task).to_json())
+
+    probe = payload["tasks"][0]["baseline_runnability"]
+    assert probe["probe_mode"] == "skeleton_filled"
+    assert probe["checks"][0]["skipped_reason"] == "requires_file_missing:web/"
+    attribution = payload["tasks"][0]["failure_attribution"]
+    assert attribution["verdict"] == "introduced"
+    assert attribution["basis"] == "marker_delta"
+    assert attribution["baseline_only_files"] == ["app/storage.py"]
+    assert attribution["sample_markers"] == ["app/api.py:3"]
+    # 归因不参与判据：通过判定仍只由阻断项决定
+    assert payload["tasks"][0]["passed"] is False

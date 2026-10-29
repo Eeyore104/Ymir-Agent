@@ -128,7 +128,11 @@ async def _resolve_baseline(
             artifact_id.strip(), version, tenant_id=tenant_id
         )
     except NotFoundError as exc:
-        raise InvalidParamError(f"基线不存在: {artifact_id}") from exc
+        # v1.3.1（T6.3-C / QA-T63-01）：保留底层成因，别把两种 NotFound 压成一句。
+        # ``store.get_version_meta`` 抛的是「产物不存在: {id}」或
+        # 「产物版本不存在: {id} v{n}」——版本号是排查的关键线索，不能丢。
+        # 与 ``scripts/run_single_role.py::resolve_baseline_ref`` 同口径。
+        raise InvalidParamError(f"基线引用无效: {exc}") from exc
     if artifact.project_id != project_id:
         raise InvalidParamError(f"基线 {artifact_id} 不属于本项目")
     if artifact.type != BASELINE_TYPE:

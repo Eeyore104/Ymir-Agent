@@ -37,7 +37,15 @@ from ymir.artifacts.merge import (
 from ymir.artifacts.store import BASELINE_TYPE
 from ymir.config import Settings
 from ymir.evaluation.aggregator import aggregate
+from ymir.evaluation.attribution import (
+    ATTRIBUTION_UNKNOWN,
+    CommandOutput,
+    FailureAttribution,
+    attribute_failure,
+)
 from ymir.evaluation.baseline_probe import (
+    BASELINE_SKIPPED,
+    SKIP_BASELINE_INCOMPLETE,
     BaselineProbe,
     BaselineProbeCache,
     baseline_cache_key,
@@ -62,6 +70,7 @@ from ymir.evaluation.report import (
     BaselineProbeOut,
     DimensionOut,
     EvaluationReport,
+    FailureAttributionOut,
     SkippedCheckOut,
     TaskOut,
 )
@@ -96,6 +105,12 @@ BASELINE_UNAVAILABLE_WARNING: str = (
 #: 基线自身就失败（T1.2 三态之二）：**按 unknown 降级、不阻断**，但必须披露。
 BASELINE_UNHEALTHY_WARNING: str = (
     "基线自身检查未通过（基线不健康）：本次分数与「基于健康基线」的运行不可比"
+)
+
+#: 基线整体未执行（T1.2 的 ``baseline_incomplete``）：基线缺少新检查依赖的文件，
+#: 探针**整份**跳过 ⇒ 这批检查既无基线证据、也谈不上回归（additive，不改判据）。
+BASELINE_INCOMPLETE_WARNING: str = (
+    "基线缺少本次检查依赖的文件（基线不完整），探针未执行：涉及这批检查的分数与回归判断不可比"
 )
 
 #: 前端构建未执行（T2.4 降级路径；本批次无 frontend_build 组，属前向兼容常量）。
@@ -281,12 +296,21 @@ class EvaluationHarness:
         ]
         probe = await self._probe(task, base_files)
         regression, regression_reason = self._regression(probe, runs)
+        # v1.3.1（T2.2）：归因**提示**（不参与 verdict / 分数 / regression）
+        attribution = self._attribution(probe, runs, task)
 
         warnings: list[str] = []
         if task.baseline_unavailable:
             warnings.append(BASELINE_UNAVAILABLE_WARNING)
         if probe is not None and probe.unhealthy:
             warnings.append(BASELINE_UNHEALTHY_WARNING)
+        if (
+            probe is not None
+            and probe.status == BASELINE_SKIPPED
+            and probe.reason == SKIP_BASELINE_INCOMPLETE
+        ):
+            # T1.2：基线缺依赖文件导致**整份**探针跳过 ⇒ 必须披露"这次基线没跑"
+            warnings.append(BASELINE_INCOMPLETE_WARNING)
         if any(
             run.group == _FRONTEND_BUILD_GROUP and run.status == "skipped"
             for run in runs
@@ -321,6 +345,7 @@ class EvaluationHarness:
             regression_reason=regression_reason,
             blocking_failed=blocking_failed,
             skipped_checks=skipped_checks,
+            failure_attribution=attribution,
         )
 
     async def _probe(
@@ -330,34 +355,107 @@ class EvaluationHarness:
 
         关闭条件（docs/11 §7.5-7）：``baseline_ref`` 为空（非增量）或基线正文不可用
         （``base_files == {}``）⇒ 直接返回 ``None`` ⇒ ``TaskOut`` 全字段与 v1.2 一致。
+
+        v1.3.1（T1.1）：模板骨架以 ``EvalTask.baseline_skeleton`` 的**纯数据**传入
+        （``evaluation`` 不得 import ``templates``），探针树因此与合并树同尺；
+        缓存键同步并入骨架指纹与 ``requires_files``（T1.3）。
         """
         if not task.baseline_ref or not base_files:
             return None
         checks = list(task.checks)
+        skeleton = dict(task.baseline_skeleton or {})
         return await probe_baseline(
             files=base_files,
             checks=checks,
             sandbox_provider=self._sandbox_provider,
             exec_timeout=self._exec_timeout,
             cache=self._probe_cache,
-            cache_key=baseline_cache_key(base_files, checks),
+            cache_key=baseline_cache_key(base_files, checks, skeleton=skeleton or None),
+            skeleton=skeleton or None,
         )
 
     @staticmethod
     def _regression(
         probe: BaselineProbe | None, runs: Sequence[Any]
     ) -> tuple[bool, str]:
-        """「基线健康 + 合并树有失败」= 回归（T1.2 三态之三）。
+        """「基线通过 + 合并树在**同一命令**上失败」= 回归（T1.2 三态之三）。
+
+        ★ v1.3.1 收紧（C2 / docs/13 §2-T1.4）：只对「probe 侧**实际执行**且
+        ``exit_code == 0``」的命令计 regression。
+
+        **放宽这条 = 把「基线缺文件」重新记成「模型回归」**（docs/13 §7.7-R7）：
+        探针树（T3）与评测工作区（T2）之间还差一层补丁，若某命令在探针侧因
+        ``requires_files`` 缺失被跳过、却在合并树侧失败，那说明的是"基线不完整"，
+        不是"模型改坏了"，此时只报 ``check_failed``（该判据由 ``gate`` 的
+        ``FAILURE_ORDER`` 承接），不报 regression。
 
         构造上互斥（``probe.healthy`` 才可能命中）⇒ 与 ``check_failed`` 不重叠
         （docs/11 §7.7-R7 ①）。
         """
         if probe is None or not probe.healthy:
             return False, ""
-        failed = [run for run in runs if run.status == "failed"]
+        passed_commands = {
+            item.command
+            for item in probe.checks
+            if not item.skipped and item.exit_code == 0 and not item.timed_out
+        }
+        failed = [
+            run
+            for run in runs
+            if run.status == "failed" and run.command in passed_commands
+        ]
         if not failed:
             return False, ""
         return True, f"基线通过，合并树在 `{failed[0].command}` 失败"
+
+    @staticmethod
+    def _attribution(
+        probe: BaselineProbe | None,
+        runs: Sequence[Any],
+        task: EvalTask,
+    ) -> FailureAttributionOut | None:
+        """装配失败归因（v1.3.1 T2.2）。
+
+        关闭条件（任一满足 ⇒ ``None``，报告与 v1.3 逐字节一致）：
+
+        - 没有基线探测结果（非增量 / 基线正文不可用 / 无 ``baseline_ref``）；
+        - 合并树上没有任何失败检查。
+
+        ★ 只做「同一命令 probe 输出 vs 合并树输出的标记差集」，**不写死任何
+        linter 解析器**；``attribute_failure`` 自身绝不抛异常，这里的 try 只是
+        双保险（归因失败绝不能让评测变成 500）。
+        """
+        if probe is None:
+            return None
+        failed = [run for run in runs if run.status == "failed"]
+        if not failed:
+            return None
+        changed = tuple(sorted(task.changed_paths or ()))
+        probe_ran = probe.status != BASELINE_SKIPPED
+        try:
+            result = attribute_failure(
+                merged_failures=[
+                    CommandOutput(command=run.command, output=run.output)
+                    for run in failed
+                ],
+                probe_outputs=[
+                    CommandOutput(command=item.command, output=item.output)
+                    for item in probe.checks
+                    if probe_ran and not item.skipped
+                ],
+                probe_skipped_commands=(
+                    tuple(item.command for item in probe.checks if item.skipped)
+                    if probe_ran
+                    # 探针整体没跑起来 ⇒ 这些命令在基线侧没有可比对的输出
+                    else tuple(run.command for run in failed)
+                ),
+                changed_paths=changed,
+                probe_healthy=probe.healthy,
+            )
+        except Exception:  # noqa: BLE001 - 归因失败只降级，不影响评测结果
+            logger.warning("失败归因计算异常，降级为 unknown（task=%s）", task.id, exc_info=True)
+            return FailureAttributionOut(verdict=ATTRIBUTION_UNKNOWN, basis="error")
+        return _attribution_out(result)
 
     def _skipped(
         self,
@@ -810,7 +908,12 @@ def _normalized(weights: Mapping[str, float]) -> dict[str, float]:
 
 
 def _probe_out(probe: BaselineProbe | None) -> BaselineProbeOut | None:
-    """``BaselineProbe`` -> 报告形态（``None`` 原样返回，保证旧报告逐字节一致）。"""
+    """``BaselineProbe`` -> 报告形态（``None`` 原样返回，保证旧报告逐字节一致）。
+
+    v1.3.1：额外搬运 ``skipped_reason`` 与 ``probe_mode`` ——
+    ``probe_mode`` 的**序列化开关**在 ``BaselineProbeOut`` 内部（只有
+    ``skeleton_filled`` 才落键，M7 ①），这里只做字段平移。
+    """
     if probe is None:
         return None
     return BaselineProbeOut(
@@ -824,12 +927,26 @@ def _probe_out(probe: BaselineProbe | None) -> BaselineProbeOut | None:
                 timed_out=item.timed_out,
                 skipped=item.skipped,
                 output=item.output,
+                skipped_reason=item.skipped_reason,
             )
             for item in probe.checks
         ],
         reason=probe.reason,
         duration_ms=probe.duration_ms,
         cached=probe.cached,
+        probe_mode=probe.probe_mode,
+    )
+
+
+def _attribution_out(result: FailureAttribution) -> FailureAttributionOut:
+    """``FailureAttribution`` -> 报告形态（纯字段平移，不改语义）。"""
+    return FailureAttributionOut(
+        verdict=result.verdict,
+        basis=result.basis,
+        baseline_only_files=list(result.baseline_only_files),
+        changed_files=list(result.changed_files),
+        shared_files=list(result.shared_files),
+        sample_markers=list(result.sample_markers),
     )
 
 

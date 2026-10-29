@@ -4,7 +4,9 @@
 - ``GET /artifacts/{id}``：产物详情（含版本历史与血缘）；
 - ``GET /artifacts/{id}/versions/{v}/content``：版本文件清单 / 单文件内容；
 - ``GET /artifacts/{id}/diff?v1=&v2=``：版本间 unified diff（按文件分组）；
-- ``POST /projects/{id}/baselines``：**上传现有工程快照**（v1.2，docs/09 §4.2.1）。
+- ``POST /projects/{id}/baselines``：**上传现有工程快照**（v1.2，docs/09 §4.2.1）；
+- ``POST /projects/{id}/baselines/from-merge``：**以合入结果为新基线**
+  （v1.3.1 T5.3，docs/13 §7.3-8；L7 闭环的落点）。
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ymir.api.deps import ArtifactsDep, SessionDep, SettingsDep, TenantDep
 from ymir.api.schemas import (
@@ -22,6 +25,8 @@ from ymir.api.schemas import (
     ArtifactDiffOut,
     ArtifactOut,
     ArtifactVersionOut,
+    BaselineMergeOut,
+    BaselineMergeRequest,
     BaselineUploadOut,
     DiffStatsOut,
     FileDiffOut,
@@ -29,16 +34,33 @@ from ymir.api.schemas import (
 )
 from ymir.artifacts.baseline import read_zip_files
 from ymir.artifacts.diff import diff_file_sets
+from ymir.artifacts.provenance import (
+    BASELINE_ARTIFACT_NAME,
+    promote_merged_to_baseline,
+    template_yaml_hash,
+)
 from ymir.artifacts.store import BASELINE_TYPE
-from ymir.common.errors import InvalidParamError, NotFoundError
+from ymir.common.errors import InvalidParamError, NotFoundError, StateConflictError
 from ymir.common.paths import normalize_rel_path
 from ymir.config import Settings
-from ymir.storage.repositories import ProjectRepository
+from ymir.evaluation.run_task import template_spec_for_run
+from ymir.models.entities import PipelineRun, StageExecution
+from ymir.storage.repositories import (
+    ProjectRepository,
+    RunRepository,
+    StageExecutionRepository,
+)
+from ymir.templates import DEFAULT_TEMPLATES_DIR
 
 router = APIRouter(tags=["artifacts"])
 
-#: 基线产物名（同项目内复用同名 artifact，多次上传即 v1 -> v2 -> …）
-BASELINE_ARTIFACT_NAME = "baseline"
+#: 基线产物名（同项目内复用同名 artifact，多次上传即 v1 -> v2 -> …）。
+#:
+#: v1.3.1：字面量唯一定义点移到 ``artifacts.provenance``（写入方，"以合入结果为
+#: 新基线"也要用它），本模块改为**复用**，避免两处字面量漂移。
+
+#: ``code`` 产物的名字（"另存为新基线"默认解析目标）。
+CODE_ARTIFACT_NAME = "code"
 
 
 @router.get(
@@ -335,3 +357,191 @@ def _files_from_json(body: bytes, *, settings: Settings) -> tuple[dict[str, str]
             f"基线内容 {size_bytes} 字节超过上限 {settings.baseline_max_bytes}"
         )
     return files, size_bytes
+
+
+@router.post(
+    "/projects/{project_id}/baselines/from-merge",
+    response_model=ApiResponse[BaselineMergeOut],
+    status_code=201,
+    summary="以合入结果为新基线（从增量产物确定性重建合并树）",
+)
+async def promote_baseline_from_merge(
+    project_id: str,
+    payload: BaselineMergeRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+    tenant_id: TenantDep,
+    store: ArtifactsDep,
+) -> dict[str, object]:
+    """把「增量 run 的合入结果」落成**新基线版本**（v1.3.1 T5.3，docs/13 §7.3-8）。
+
+    端点名不是新造的：``docs/09`` §4.3 的接口表早已承诺
+    ``POST /projects/{id}/baselines/from-merge``，本版把那句承诺落到代码。
+
+    **薄层纪律**：这里只做「取纯数据 → 调服务 → 组装响应」，重建与六道校验全在
+    :func:`ymir.artifacts.provenance.promote_merged_to_baseline`（纯数据进、纯数据出）。
+
+    八步与失败语义：
+
+    ==========================================  ==============================
+    步骤                                        失败
+    ==========================================  ==============================
+    1 项目存在                                 1002
+    2 ``run_id`` → Run（须属于该项目）          1002
+    3 解析阶段：给 ``stage_id`` 则按其取，否则取
+      「本 run 中产出 ``code`` 的最后一次成功
+      阶段」（不按 ``role_id`` 硬编码）          1002
+    4 从 ``output_refs[0]`` 取产物 id/版本      1002
+    5 ``run.context["baseline"]`` 引用完整      1003（非增量 run）
+    6 模板可读 → 骨架 / 模板 id                 1002
+    7 模板 YAML 指纹现算                        1002（文件已不可读）
+    8 调服务（校验 / 重建 / 落盘）              1001 / 1003
+    ==========================================  ==============================
+
+    Raises:
+        NotFoundError: 项目 / 运行 / 阶段 / 产物引用 / 模板缺失（1002）。
+        StateConflictError: 非增量 run、无溯源、指纹不符（1003）。
+        InvalidParamError: 非增量产物、超基线上限（1001）。
+    """
+    project = await ProjectRepository(session).get(project_id, tenant_id=tenant_id)
+    if project is None:
+        raise NotFoundError("项目不存在")
+
+    run = await RunRepository(session).get(payload.run_id, tenant_id=tenant_id)
+    if run is None or run.project_id != project_id:
+        raise NotFoundError(f"运行不存在: {payload.run_id}")
+
+    stage_row = await _resolve_promote_stage(
+        session, run_id=run.id, stage_id=payload.stage_id, tenant_id=tenant_id
+    )
+    artifact_id, artifact_version = _promote_artifact_ref(stage_row)
+    if payload.artifact_version is not None:
+        # 显式版本优先：供「重跑后取历史版本」的场景（步骤 4 的覆盖语义）
+        artifact_version = payload.artifact_version
+
+    base_ref = _promote_baseline_ref(run)
+    skeleton, template_id, template_hash = _promote_template_ref(run)
+
+    result = await promote_merged_to_baseline(
+        store,
+        project_id=project_id,
+        artifact_id=artifact_id,
+        version=artifact_version,
+        base_ref=base_ref,
+        skeleton=skeleton,
+        template_id=template_id,
+        template_hash=template_hash,
+        run_id=run.id,
+        max_files=settings.baseline_max_files,
+        max_bytes=settings.baseline_max_bytes,
+        tenant_id=tenant_id,
+    )
+    return {
+        "code": 0,
+        "data": BaselineMergeOut(
+            artifact_id=result.artifact_id,
+            version=result.version,
+            file_count=result.file_count,
+            content_hash=result.content_hash,
+            size_bytes=result.size_bytes,
+            reused=result.reused,
+        ),
+    }
+
+
+async def _resolve_promote_stage(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    stage_id: str | None,
+    tenant_id: str,
+) -> StageExecution:
+    """解析"要提升哪一次执行"（步骤 3，两种入口）。
+
+    ★ 未给 ``stage_id`` 时**不按 ``role_id`` 硬编码**（如"取 role=engineer 那条"）：
+    阶段 id / 角色名是流水线配置，自定义流水线上会直接失效；判据只能是"这条阶段的
+    产物就是 ``code``"（且必须是**成功**态，否则产物不完整）。
+
+    Raises:
+        NotFoundError: 该 run 没有匹配的成功阶段（1002）。
+    """
+    repo = StageExecutionRepository(session)
+    if stage_id:
+        row = await repo.latest(run_id, stage_id, tenant_id=tenant_id)
+        if row is None:
+            raise NotFoundError(f"阶段执行记录不存在: {stage_id}")
+        return row
+    found = await repo.latest_success_with_output(run_id, CODE_ARTIFACT_NAME, tenant_id=tenant_id)
+    if found is None:
+        raise NotFoundError("该运行还没有产出 code 的成功阶段")
+    return found
+
+
+def _promote_artifact_ref(stage_row: StageExecution) -> tuple[str, int]:
+    """从阶段记录的 ``output_refs[0]`` 取 ``(artifact_id, version)``（步骤 4）。"""
+    refs = stage_row.output_refs if isinstance(stage_row.output_refs, list) else []
+    head = refs[0] if refs else None
+    if not isinstance(head, dict):
+        raise NotFoundError(f"阶段 {stage_row.stage_id} 没有可用的产物引用")
+    artifact_id = str(head.get("artifact_id") or "").strip()
+    raw_version = head.get("version")
+    version = raw_version if isinstance(raw_version, int) else None
+    if not artifact_id or version is None:
+        raise NotFoundError(f"阶段 {stage_row.stage_id} 的产物引用不完整")
+    return artifact_id, version
+
+
+def _promote_baseline_ref(run: PipelineRun) -> dict[str, object]:
+    """取 ``run.context["baseline"]`` 的纯数据形态（步骤 5）。
+
+    ``content_hash`` 与 ``artifact_id@version`` **缺一不可**：前者是"不许拿最新基线
+    顶上"的三方比对依据，后者是唯一允许的加载入口（docs/09 §4.3 两条铁律）。
+    """
+    context = run.context if isinstance(run.context, dict) else {}
+    ref = context.get("baseline")
+    if not isinstance(ref, dict):
+        raise StateConflictError("无法确定基线引用（该 run 不是增量运行）")
+    artifact_id = str(ref.get("artifact_id") or "").strip()
+    content_hash = str(ref.get("content_hash") or "").strip()
+    if not artifact_id:
+        raise StateConflictError("无法确定基线引用（该 run 不是增量运行）")
+    if not content_hash:
+        # v1.3.1（T6.3-C）：这里与 `artifacts.provenance._load_pinned_baseline` 同步
+        # 区分两种原因。原来一律说「该 run 不是增量运行」，把"字段没写全"误诊成
+        # "没有基线"（T6.2 真跑里 CLI 发起的 R-b 就是这样被误导的）。
+        raise StateConflictError(
+            "无法确定基线引用：run 的基线引用缺少 `content_hash`"
+            "（CLI 发起时可能未写全），无法做三方比对"
+        )
+    raw_version = ref.get("version")
+    return {
+        "artifact_id": artifact_id,
+        "version": raw_version if isinstance(raw_version, int) else None,
+        "content_hash": content_hash,
+    }
+
+
+def _promote_template_ref(run: PipelineRun) -> tuple[dict[str, str], str, str]:
+    """取模板的骨架 / id / YAML 指纹（步骤 6、7）。
+
+    ``template_hash`` 在**这里**现算（API 层 rank 0，可合法 import ``templates``）：
+    ``artifacts``(3) 不能 import ``templates``(2)（逆层），所以哈希函数收目录入参。
+
+    Returns:
+        ``(skeleton, template_id, template_hash)``；无模板 ⇒ ``({}, "", "")``。
+
+    Raises:
+        NotFoundError: 模板声明了 id 但已删除 / 改坏 / 文件不可读（1002）。
+    """
+    context = run.context if isinstance(run.context, dict) else {}
+    ref = context.get("template")
+    template_id = str(ref.get("id") or "").strip() if isinstance(ref, dict) else ""
+    if not template_id:
+        return {}, "", ""
+    spec = template_spec_for_run(run)
+    if spec is None:
+        raise NotFoundError(f"模板不存在或不可读: {template_id}")
+    template_hash = template_yaml_hash(DEFAULT_TEMPLATES_DIR, template_id)
+    if not template_hash:
+        raise NotFoundError(f"模板文件不可读: {template_id}.yaml")
+    return dict(spec.skeleton_files()), template_id, template_hash

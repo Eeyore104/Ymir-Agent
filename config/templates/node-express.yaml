@@ -56,6 +56,11 @@ protected:
     - tests/setup.ts
   on_hit: reject
   max_change_ratio: 0.5
+  # W3-B′（v1.3.1 T3.3）：引用感知的符号删除检测，显式收紧为 reject。
+  # ★ 本模板无 `.py` 文件 ⇒ 该检测**实际是 no-op**（检测只认 Python 顶层符号）。
+  #   保留声明是为了四套模板口径一致，避免"某模板少了条约束"的隐性差异（U2）；
+  #   将来本模板加入 `.py` 脚本时自动生效，不需要再改 YAML。
+  symbol_deletions: reject
 
 skeleton:
   max_files: 5

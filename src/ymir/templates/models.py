@@ -9,6 +9,7 @@
 - ``checks``：确定性检查命令（进 ``EvalTask.checks``）；
 - ``prompting``：给四角色追加的约束文本（键必须是已注册角色 id）；
 - ``protected``（v1.3）：受保护路径与命中策略（增量模式硬约束，T1.1）；
+  v1.3.1 追加 ``symbol_deletions``：引用感知的符号删除检测策略（T3.2）；
 - ``scoring``（v1.3）：分组配分口径（纯数据出口 ``to_scoring_rules()``，Q3）。
 
 **本模块只做数据定义，不做 IO**（读文件与校验在 :mod:`ymir.templates.loader`）。
@@ -27,7 +28,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ymir.common.contracts import FrontendRules, LayoutRules, ScoringRules
+from ymir.common.contracts import FrontendRules, LayoutRules, ScoringRules, SymbolPolicy
 
 # 密钥指纹**实现在** ``common.secrets``（v1.2 r4 架构收口）：推送过滤在
 # ``artifacts``(rank 3)，若沿用 ``templates``(rank 2) 的定义就是逆层。
@@ -114,6 +115,15 @@ class CheckSpec(BaseModel):
     )
     timeout_s: float | None = Field(
         default=None, gt=0, description="单条检查超时（秒）；None = 用执行上下文缺省"
+    )
+    # ---- v1.3.1（docs/13 §7.2.1）新增，带默认值 ⇒ 旧模板行为不变 ----
+    requires_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "该检查依赖的**基线文件**：精确相对路径，或以 / 结尾的目录前缀"
+            "（= 该目录下 ≥1 个文件）。仅探针侧消费：基线里一个都没有 ⇒ 该检查 "
+            "skipped + baseline_incomplete（不是 unhealthy）；合并树侧仍判 failed"
+        ),
     )
 
 
@@ -233,6 +243,14 @@ class ProtectedSpec(BaseModel):
         gt=0,
         le=1,
         description="改动面告警阈值（T1.3；与 artifacts.merge.DEFAULT_MAX_CHANGE_RATIO 同源）",
+    )
+    symbol_deletions: SymbolPolicy = Field(
+        default="off",
+        description=(
+            "引用感知的符号删除检测（v1.3.1 T3.2 / docs/13 §7.2.4）："
+            "off = 完全关闭（默认，行为与 v1.3 逐字节一致）；"
+            "reject = 命中即抛；ignore = 保留基线版本并记短码"
+        ),
     )
 
 

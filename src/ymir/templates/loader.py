@@ -1,8 +1,8 @@
-"""模板加载与加载期校验（v1.3：**21 条**；v1.2 为 17 条，docs/11 §7.2.7）。
+"""模板加载与加载期校验（v1.3.1：**23 条**；v1.2 为 17 条，v1.3 为 21 条）。
 
 目录约定：``config/templates/<id>.yaml``，``id`` 必须等于文件名主干。
 
-**21 条加载期校验**（违反任一条 → :class:`TemplateDefinitionError`，业务码 1001）：
+**23 条加载期校验**（违反任一条 → :class:`TemplateDefinitionError`，业务码 1001）：
 
 ===========  ================================================================
 #            校验
@@ -28,6 +28,11 @@
 19           ``protected.on_hit ∈ {reject, ignore}``（显式复核，防默认值被放宽）
 20           ``0 < protected.max_change_ratio ≤ 1``
 21           ``scoring`` 配分完整性（值 > 0、键非空；声明前端配分必须有 ``layout.frontend``）
+22           ``checks[].requires_files``：逐元素过 ``normalize_scope_path``；非空、去重、
+             不得以 ``/`` 开头、不得含反斜杠；**不得被 skeleton 路径满足**
+             （骨架补缺会让它恒真 ⇒ 配了等于没配，属配置错误）
+23           ``protected.symbol_deletions ∈ {off, reject, ignore}``
+             （与校验 19 同风格：显式复核，防默认值被静默放宽）
 ===========  ================================================================
 
 设计取舍（与 ``sop/loader.py`` 同构）：
@@ -37,7 +42,8 @@
 - **坏模板不拖垮注册表**：:func:`list_templates` 把单模板错误收进
   ``TemplateEntry.loading_error``，只有 :func:`load_template` 才抛异常。
 
-v1.3 追加校验 18–21（T1.1 / Q3），17 条原有语义**全部不变**。
+v1.3 追加校验 18–21（T1.1 / Q3），17 条原有语义**全部不变**；
+v1.3.1 追加校验 22（docs/13 §7.2.7）与 23（``symbol_deletions``），前 21 条语义**全部不变**。
 """
 
 from __future__ import annotations
@@ -78,6 +84,11 @@ _OFFLINE_FORBIDDEN: tuple[str, ...] = ("http://", "https://", "pip install", "np
 
 #: 校验 19：受保护路径策略的合法取值（与 ``artifacts.merge.ProtectedPolicy`` 同构）。
 _PROTECTED_POLICIES: frozenset[str] = frozenset({"reject", "ignore"})
+
+#: 校验 23：符号删除检测策略的合法取值（v1.3.1 T3.3，与
+#: ``common.contracts.SymbolPolicy`` 同构 —— 同样本地复写一份字面量，
+#: 因为校验表的职责是"**独立**复核"，import 同一个对象等于自己校验自己）。
+_SYMBOL_POLICIES: frozenset[str] = frozenset({"off", "reject", "ignore"})
 
 #: 校验 21：内置「静态组」名字（该组无对应 check，由前端结构规则打分）。
 FRONTEND_STATIC_GROUP: str = "frontend_static"
@@ -207,8 +218,89 @@ def _normalize_prefix_paths(
     return normalized
 
 
+def _validate_requires_files(
+    template_id: str,
+    checks: Sequence[CheckSpec],
+    skeleton_paths: Sequence[str],
+) -> list[list[str]]:
+    """校验 22：``checks[].requires_files`` 逐元素合法性（v1.3.1，docs/13 §7.2.7）。
+
+    逐条规则（顺序即报错优先级）：
+
+    1. **非空**（纯空白也算空）；
+    2. **不得含反斜杠**（``normalize_scope_path`` 会把 ``\\`` 静默换成 ``/``，
+       那会把"跨平台同义"变成"静默改义"，必须在归一化**之前**拒掉）；
+    3. **不得以 ``/`` 开头**（绝对路径）；
+    4. 过 :func:`ymir.common.paths.normalize_scope_path`（尾斜杠目录语义保留，
+       末段无扩展名自动补 ``/``）；
+    5. 归一化后**同一条 check 内去重**（重复即静默等价，属配置错误）；
+    6. **目录前缀不得被 skeleton 路径满足**：骨架补缺会把
+       ``web/package.json`` 补进探针树 ⇒ ``web/`` **永远存在** ⇒ 该
+       ``requires_files`` **永远不会 skipped** ⇒ 这条声明是**恒真条件**，
+       "配了等于没配"（M9 的理由）。反过来说：确实需要"基线缺 ``web/`` 就跳过"
+       的模板，**就不要**把 ``web/**`` 放进 skeleton。
+
+    Args:
+        template_id: 报错用的模板 id。
+        checks: 模板声明的检查（顺序与返回值一一对应）。
+        skeleton_paths: 已归一化的骨架路径清单。
+
+    Returns:
+        与 ``checks`` 等长的归一化清单（每个元素是该 check 的 ``requires_files``）。
+    """
+    skeleton = set(skeleton_paths)
+    normalized_checks: list[list[str]] = []
+    for check in checks:
+        normalized: list[str] = []
+        for raw in check.requires_files:
+            item = str(raw).strip()
+            if not item:
+                raise _error(
+                    template_id, 22, f"checks[].requires_files 含空元素（run={check.run!r}）"
+                )
+            if "\\" in item:
+                raise _error(
+                    template_id, 22, f"checks[].requires_files 不得含反斜杠: {item!r}"
+                )
+            if item.startswith("/"):
+                raise _error(
+                    template_id, 22, f"checks[].requires_files 不得以 / 开头: {item!r}"
+                )
+            try:
+                path = normalize_scope_path(item)
+            except InvalidParamError as exc:
+                raise _error(
+                    template_id,
+                    22,
+                    f"checks[].requires_files 路径非法（{item!r}）: {exc}",
+                ) from exc
+            if path in normalized:
+                raise _error(
+                    template_id, 22, f"checks[].requires_files 重复: {path}"
+                )
+            hits = (
+                sorted(
+                    candidate
+                    for candidate in skeleton
+                    if candidate.startswith(path)
+                )
+                if path.endswith("/")
+                else ([path] if path in skeleton else [])
+            )
+            if hits:
+                raise _error(
+                    template_id,
+                    22,
+                    "checks[].requires_files 与 skeleton 交叉"
+                    f"（骨架补缺后该条件恒真，配了等于没配）: {path} -> {hits}",
+                )
+            normalized.append(path)
+        normalized_checks.append(normalized)
+    return normalized_checks
+
+
 def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> TemplateSpec:
-    """执行 21 条校验，返回**路径已归一化**的模板（顺序即 docs/11 §7.2.7 表）。"""
+    """执行 23 条校验，返回**路径已归一化**的模板（顺序即 docs/13 §7.2.7 表）。"""
     template_id = spec.id or stem
 
     # 1 · id 必须等于文件名主干
@@ -386,6 +478,12 @@ def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> Te
         paths=protected_paths,
         on_hit=spec.protected.on_hit,
         max_change_ratio=spec.protected.max_change_ratio,
+        # ★ 必须**显式回填**：``ProtectedSpec(...)`` 是重新构造而不是 ``model_copy``，
+        # 漏掉这一行的后果是「YAML 写 ``reject``、运行时静默变回 ``off``」——
+        # 保护面在最该生效的场景失效，且没有任何报错（校验 23 也拦不住，
+        # 因为它校验的是 ``spec`` 而不是回填结果）。回归用例见
+        # ``tests/test_symbol_guard.py`` 的 ``test_template_yaml_declares_reject``。
+        symbol_deletions=spec.protected.symbol_deletions,
     )
     overlap_skeleton = sorted(
         _protected_overlaps(protected_paths, normalized_skeleton.all_paths)
@@ -433,6 +531,22 @@ def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> Te
             "必须声明 layout.frontend（否则配分无法兑现）",
         )
 
+    # 22 · checks[].requires_files（v1.3.1 T1.2：逐元素合法性 + 不得被骨架满足）
+    requires_files = _validate_requires_files(template_id, spec.checks, skeleton_paths)
+
+    # 23 · protected.symbol_deletions 取值（v1.3.1 T3.3）
+    # 与校验 19 同风格：pydantic 的 ``Literal`` 已经拦过一次，这里**显式复核**是
+    # 为了让"默认值被静默放宽"（例如有人把 Field 的 default 改成 "reject" 却忘了
+    # 同步文档）在加载期就炸出来，而不是等到某个模板上线后行为变了才发现。
+    if normalized_protected.symbol_deletions not in _SYMBOL_POLICIES:
+        raise _error(
+            template_id,
+            23,
+            "protected.symbol_deletions 取值非法: "
+            f"{normalized_protected.symbol_deletions!r}"
+            f"（合法值：{sorted(_SYMBOL_POLICIES)}）",
+        )
+
     return spec.model_copy(
         update={
             "layout": normalized_layout,
@@ -447,8 +561,9 @@ def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> Te
                     blocking=check.blocking,
                     requires=check.requires,
                     timeout_s=check.timeout_s,
+                    requires_files=list(paths),
                 )
-                for check in spec.checks
+                for check, paths in zip(spec.checks, requires_files, strict=True)
             ],
             "protected": normalized_protected,
         }

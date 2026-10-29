@@ -1,7 +1,8 @@
 """模板模型与加载器测试（v1.2 · T1.1，docs/09 §4.1.1 / §4.1.5）。
 
 覆盖口径：
-- **21 条加载期校验逐条 1 条用例**（``test_checkNN_*``）：1–17 见 v1.2，18–21 见 v1.3
+- **23 条加载期校验逐条 1 条用例**（``test_checkNN_*``）：1–17 见 v1.2，18–21 见 v1.3，
+  22（``checks[].requires_files``）/ 23（``protected.symbol_deletions``）见 v1.3.1；
   （受保护路径 / on_hit 枚举 / max_change_ratio 区间 / scoring 配分完整性）；
 - 字段名反断言（``type`` 存在 / ``kind`` 不存在）+ ``kind`` 写进 YAML 必 1001；
 - ``to_layout_rules()`` 与 YAML 一致；``SkeletonSpec`` 两类路径互补；
@@ -456,12 +457,12 @@ def test_list_templates_empty_dir(tmp_path: Path) -> None:
 
 @pytest.fixture(scope="module")
 def real_templates() -> dict[str, TemplateSpec]:
-    """从**真实** ``config/templates/`` 加载两套模板（21 条校验全过才算可用）。"""
+    """从**真实** ``config/templates/`` 加载两套模板（22 条校验全过才算可用）。"""
     return {tid: load_template(tid, known_roles=ROLES) for tid in REAL_TEMPLATE_IDS}
 
 
 def test_real_templates_load_through_all_checks(real_templates: dict[str, TemplateSpec]) -> None:
-    """DoD ①：四套模板都通过 21 条加载期校验并列出（v1.3：2 → 4 套）。"""
+    """DoD ①：四套模板都通过 22 条加载期校验并列出（v1.3：2 → 4 套）。"""
     assert set(real_templates) == {
         "fastapi-vue3",
         "python-cli",
@@ -812,19 +813,28 @@ def test_real_templates_protected_paths_declared(
 
     场景②③的根因都是 ``tests/conftest.py`` 被重写；python 三套必须都保护它，
     node 侧保护对应的 ``tests/setup.ts``（同一「测试基础设施不可重写」口径）。
+
+    v1.3.1（T3.1 / T3.3）**等价更新**：python-cli 追加了入口文件
+    ``ymir_cli/cli.py``（Q2 的 A 方案），四套模板同时显式声明
+    ``symbol_deletions: reject``。原先 `assert paths == [单个路径]` 的写法会让
+    "多保护了一个文件"这种**收紧**被当成回归，因此改为逐元素断言（断言更严：
+    集合相等 + 每一项都在，而不是允许前缀匹配）。
     """
     expected = {
-        "fastapi-vue3": "tests/conftest.py",
-        "python-cli": "tests/conftest.py",
-        "data-pipeline": "tests/conftest.py",
-        "node-express": "tests/setup.ts",
+        "fastapi-vue3": ["tests/conftest.py"],
+        "python-cli": ["tests/conftest.py", "ymir_cli/cli.py"],
+        "data-pipeline": ["tests/conftest.py"],
+        "node-express": ["tests/setup.ts"],
     }
-    for template_id, protected_path in expected.items():
+    for template_id, protected_paths in expected.items():
         spec = real_templates[template_id]
-        assert spec.protected.paths == [protected_path], template_id
+        assert spec.protected.paths == protected_paths, template_id
         assert spec.protected.on_hit == "reject", template_id
-        assert spec.protected_paths() == frozenset({protected_path}), template_id
+        assert spec.protected_paths() == frozenset(protected_paths), template_id
         assert spec.protected.max_change_ratio == pytest.approx(0.5), template_id
+        # v1.3.1 T3.3：四套模板一致把符号删除检测收紧为 reject
+        # （node-express 无 .py ⇒ 实际 no-op，声明只为口径一致，U2 定案）
+        assert spec.protected.symbol_deletions == "reject", template_id
 
 
 def test_only_fastapi_vue3_uses_grouped_scoring(
@@ -928,3 +938,116 @@ def test_node_skeleton_tsconfig_compiles_to_dist(
     package = json.loads(files["package.json"])
     assert package["scripts"]["build"].startswith("tsc")
     assert package["scripts"]["test"] == "node --test dist"
+
+
+# ------------------------------------------- v1.3.1 校验 22：checks[].requires_files
+
+
+def _with_requires_files(data: dict[str, Any], values: list[str]) -> dict[str, Any]:
+    """把 ``requires_files`` 挂到 demo 模板的第一条检查上（其余原样）。"""
+    data["checks"][0]["requires_files"] = values
+    return data
+
+
+def test_check22_valid_requires_files_are_normalized(tmp_path: Path) -> None:
+    """校验 22 通过形态：目录前缀保留尾斜杠，精确文件路径原样，无扩展名补 ``/``。"""
+    data = _with_requires_files(_demo(), ["web/", "app/storage.py", "tests"])
+    spec = load_template_file(_write(data, tmp_path), known_roles=ROLES)
+
+    assert spec.checks[0].requires_files == ["web/", "app/storage.py", "tests/"]
+    # 未声明的检查保持空清单（纯增量字段）
+    assert spec.checks[1].requires_files == []
+
+
+def test_check22_valid_requires_files_from_real_template(
+    real_templates: dict[str, TemplateSpec],
+) -> None:
+    """真模板 ``fastapi-vue3`` 的 ``fe-build web`` 声明了 ``web/``（T1.2 落地）。"""
+    spec = real_templates["fastapi-vue3"]
+    build = [check for check in spec.checks if check.run == "fe-build web"]
+    assert len(build) == 1
+    assert build[0].requires_files == ["web/"]
+    # 其余检查不声明（否则会引入"默认声明"的隐性行为）
+    assert [check.requires_files for check in spec.checks if check.run != "fe-build web"] == [
+        []
+    ] * 4
+
+
+@pytest.mark.parametrize(
+    ("values", "marker"),
+    [
+        (["web/", "   "], "空元素"),
+        (["/etc/passwd"], "不得以 / 开头"),
+        (["web\\package.json"], "反斜杠"),
+        (["web/", "web/"], "重复"),
+    ],
+)
+def test_check22_rejects_illegal_elements(
+    tmp_path: Path, values: list[str], marker: str
+) -> None:
+    """校验 22：空元素 / 绝对路径 / 反斜杠 / 重复一律 1001。"""
+    message = _expect_1001(tmp_path, _with_requires_files(_demo(), values), check_no=22)
+    assert marker in message
+
+
+def test_check22_rejects_skeleton_overlap(tmp_path: Path) -> None:
+    """校验 22：目录前缀不得被骨架路径满足（否则骨架补缺后该条件恒真）。
+
+    demo 骨架里有 ``app/main.py`` ⇒ 声明 ``app/`` 就是**恒真条件**（配了等于没配），
+    必须 fail-fast（M9 的理由）。
+    """
+    message = _expect_1001(
+        tmp_path, _with_requires_files(_demo(), ["app/"]), check_no=22
+    )
+    assert "skeleton" in message
+    # 精确文件路径同样不允许与骨架交叉（骨架文件一定在树里）
+    _expect_1001(tmp_path, _with_requires_files(_demo(), ["app/main.py"]), check_no=22)
+
+
+# ------------------------------------- v1.3.1 校验 23：protected.symbol_deletions
+
+
+def _with_symbol_deletions(data: dict[str, Any], value: Any) -> dict[str, Any]:
+    """给 demo 模板的 ``protected`` 段挂上 ``symbol_deletions``（其余原样）。"""
+    data.setdefault("protected", {})["symbol_deletions"] = value
+    return data
+
+
+def test_check23_symbol_deletions_enum_and_default(tmp_path: Path) -> None:
+    """校验 23：只接受 ``off``/``reject``/``ignore``；缺省 ``off``（红线 A9 的开关）。
+
+    ★ 这条用例真正锁的是**回填**：``loader._validate`` 用
+    ``ProtectedSpec(paths=..., on_hit=..., max_change_ratio=...)`` 重新构造对象，
+    任何一处漏写新字段都会让「YAML 写 ``reject``、运行时变回 ``off``」——保护面
+    在最该生效的场景静默失效，且校验 23 本身拦不住（它校验的是原始 ``spec``）。
+    """
+    default = load_template_file(_write(_demo(), tmp_path), known_roles=ROLES)
+    assert default.protected.symbol_deletions == "off"
+
+    for policy in ("off", "reject", "ignore"):
+        spec = load_template_file(
+            _write(_with_symbol_deletions(_demo(), policy), tmp_path), known_roles=ROLES
+        )
+        # 显式声明必须原样保留（不被重新构造时的默认值覆盖）
+        assert spec.protected.symbol_deletions == policy
+
+    # Literal 由 pydantic 在加载期拦下（结构非法 → 1001）
+    bad = _with_symbol_deletions(_demo(), "block")
+    _expect_1001(tmp_path, bad)
+
+
+def test_check23_policy_set_matches_contract() -> None:
+    """校验 23 的取值集合与 ``common.contracts.SymbolPolicy`` **逐值相同**。
+
+    校验表的职责是"独立复核"（同校验 19 的 ``_PROTECTED_POLICIES``），因此它自己
+    持有一份字面量；这条用例把两份钉在一起，防止将来只改一边（例如契约加了
+    ``warn`` 而加载期仍拒 ⇒ 配置永远写不进去；或契约删了 ``ignore`` 而加载期仍收
+    ⇒ 三段式兜底拿到的策略不存在）。
+    """
+    from typing import get_args
+
+    from ymir.common.contracts import SymbolPolicy
+    from ymir.templates.loader import _SYMBOL_POLICIES
+
+    assert sorted(_SYMBOL_POLICIES) == ["ignore", "off", "reject"]
+    assert set(get_args(SymbolPolicy)) == _SYMBOL_POLICIES

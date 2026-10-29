@@ -130,6 +130,8 @@ def resolve_checks(
     无模板（或模板已不可读）时**逐条沿用套件**，与 v1.1 完全一致（§10-9）。
     v1.3 起把 ``group`` / ``blocking`` / ``requires`` / ``timeout_s`` 一并映射 ——
     ``requires`` 是 node 模板在无工具链镜像里优雅跳过的唯一依据（docs/11 §7.5-3）。
+    v1.3.1 起再映射 ``requires_files``（docs/13 §7.2.2）：探针据此把「基线缺该检查
+    依赖的文件」判成 ``skipped`` 而不是 ``unhealthy``；合并树侧**不消费**它。
     """
     if spec is None:
         return list(base.checks) if base is not None else []
@@ -142,6 +144,7 @@ def resolve_checks(
             blocking=check.blocking,
             requires=check.requires,
             timeout_s=check.timeout_s,
+            requires_files=list(check.requires_files),
         )
         for check in spec.checks
     ]
@@ -166,6 +169,9 @@ def build_task_for_run(
     - ``checks``：模板 ``checks`` 覆盖套件 ``checks``（:func:`resolve_checks`）；
     - ``layout``：``TemplateSpec.to_layout_rules()``（纯数据；``None`` = v1.1 口径）；
     - ``scoring``：``TemplateSpec.to_scoring_rules()``（纯数据；未声明 ⇒ ``None`` ⇒ 老口径）；
+    - ``baseline_skeleton``：``TemplateSpec.skeleton_files()``（纯数据，v1.3.1 T1.1）——
+      **本函数是它唯一的注入点**；探针据此把「骨架补缺后的基线」写进沙箱。
+      ``evaluation``(rank 1) 因此无需 import ``templates``(2)。
     - ``baseline_ref``：``run.context["baseline"]``（R9：评测侧据它精确加载基线）；
     - ``project_id`` / ``run_id`` / ``artifact_name``：追溯字段。
 
@@ -197,6 +203,8 @@ def build_task_for_run(
         checks=resolve_checks(spec, base),
         layout=spec.to_layout_rules() if spec is not None else None,
         scoring=scoring,
+        # v1.3.1（T1.1）：骨架以**纯数据**跨层（evaluation 不得 import templates）
+        baseline_skeleton=spec.skeleton_files() if spec is not None else {},
         baseline_ref=_baseline_ref(run.context),
     )
     return task, suite

@@ -20,13 +20,16 @@
   ``templates``(rank 2) 产出、``evaluation``(rank 1) 消费；放在 common(rank 5)
   是为了让两条跨层边都合法（``2 -> 5``、``1 -> 5``），避免 ``evaluation -> templates``
   的分层逆层（CI 由 ``scripts/check_import_graph.py`` 拦截）。
+- ``SymbolPolicy``（v1.3.1，docs/13 §7.2.4）：**符号删除检测策略**的唯一字面量口径。
+  ``templates``(2) 的 ``ProtectedSpec`` 与 ``artifacts``(3) 的 ``merge_trees`` 都要用，
+  同理由下沉到 common 以免任一侧造出逆层边。
 """
 
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -187,6 +190,30 @@ class ScoringRules(BaseModel):
     def enabled(self) -> bool:
         """是否启用分组配分（空字典 = 走 v1.2 的按权重归一）。"""
         return bool(self.runnability_points)
+
+
+# ------------------------------------------------- 保护面策略（v1.3.1，docs/13 §7.2.4）
+
+
+#: 符号删除检测策略（"引用感知的符号删除检测" 的唯一字面量口径）。
+#:
+#: 下沉到 ``common``(rank 5) 而不是留在 ``artifacts``(rank 3)，是因为这个字面量
+#: 现在被**两个方向**同时需要：
+#:
+#: - ``templates``(rank 2) 的 ``ProtectedSpec.symbol_deletions`` 要声明它；
+#: - ``artifacts``(rank 3) 的 ``merge_trees(symbol_deletions=...)`` 要接收它。
+#:
+#: 两条边都只能向下（``2 -> 5`` / ``3 -> 5``），任一方向直接互相 import 都会造出
+#: 逆层边（CI 由 ``scripts/check_import_graph.py`` 拦截）。这与
+#: :class:`LayoutRules` / :class:`FrontendRules` 的下沉理由完全同源。
+#:
+#: 取值语义：
+#:
+#: - ``off``（默认）：代码路径**完全不进入** ⇒ 未配置时 ``merge_trees`` 行为与
+#:   v1.3 逐字节一致（红线 A9）；
+#: - ``reject``：命中即抛 ``SymbolRegressionConflict``（1003/409），走既有三段式；
+#: - ``ignore``：丢弃模型内容、保留基线版本，记 manifest 冲突 + 短码。
+SymbolPolicy = Literal["off", "reject", "ignore"]
 
 
 # --------------------------------------------------------------------- 裁决合同（v1.1）

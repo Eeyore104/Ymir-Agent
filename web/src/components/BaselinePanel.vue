@@ -53,6 +53,12 @@ function onCompare(version: ArtifactVersion): void {
       <el-tag v-else size="small" type="info" effect="plain">无基线</el-tag>
     </div>
 
+    <!-- 引导文案（v1.3.1 T5.4）：动作入口在下方 code 版本行 —— 本组件拿不到"要提升哪一版"，
+         自己取最新版就是 R9 禁止的「拿最新顶上」，所以这里只给一句话，不放按钮。 -->
+    <div class="panel-tip panel-tip-lead">
+      增量产物可在下方「版本历史」的 code 版本行点「另存为新基线」，把合入结果提升为项目基线。
+    </div>
+
     <div v-if="!versions.length" class="panel-empty">
       该项目还没有基线。可在「项目看板 · 发起运行」上传现有工程 zip 快照后，改为增量生成。
     </div>
@@ -128,5 +134,12 @@ function onCompare(version: ArtifactVersion): void {
   margin-top: 8px;
   font-size: 12px;
   color: #909399;
+}
+
+/* 位于标题下方的引导文案（无上方表格，故上边距清零、改留底距） */
+.panel-tip-lead {
+  margin-top: 0;
+  margin-bottom: 8px;
+  line-height: 1.7;
 }
 </style>

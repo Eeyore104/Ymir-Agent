@@ -19,7 +19,7 @@ from ymir.models.entities import (
     Project,
     StageExecution,
 )
-from ymir.models.enums import ApprovalStatus, RunMode, RunStatus
+from ymir.models.enums import ApprovalStatus, RunMode, RunStatus, StageStatus
 
 
 def _as_value(value: str | Enum) -> str:
@@ -277,6 +277,59 @@ class StageExecutionRepository(BaseRepository[StageExecution]):
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def latest_success_with_output(
+        self,
+        run_id: str,
+        output_name: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> StageExecution | None:
+        """该 run 中「首个产出为 ``output_name``」的**最后一次成功**阶段（v1.3.1 T5.3）。
+
+        为什么**不按 ``role_id`` 硬编码**（如"取 role=engineer 那条"）：阶段 id / 角色名
+        是流水线配置（可被 ``sop`` 改写、可有多条产出 ``code`` 的阶段），硬编码会在
+        自定义流水线上直接失效；判据只能是"这条阶段的产物就是那个东西"。
+
+        为什么按 ``attempt desc, started_at desc`` 排：重跑/回修会让同一 stage 有多条
+        记录，用户点"另存为新基线"指的是**屏幕上那一版**，即最近一次成功的产出；
+        ``started_at`` 兜底 ``attempt`` 相同的情况（不同 stage 之间没有 attempt 可比性）。
+
+        Args:
+            run_id: 运行 id。
+            output_name: 产物名（``"code"``）。
+            tenant_id: 租户。
+
+        Returns:
+            命中的阶段执行记录；没有成功产出该产物的阶段 ⇒ ``None``。
+        """
+        stmt = (
+            select(StageExecution)
+            .where(
+                StageExecution.run_id == run_id,
+                StageExecution.tenant_id == tenant_id,
+                StageExecution.status == StageStatus.COMPLETED.value,
+            )
+            .order_by(StageExecution.attempt.desc(), StageExecution.started_at.desc())
+        )
+        result = await self.session.execute(stmt)
+        for row in result.scalars().all():
+            if _first_output_name(row.output_refs) == output_name:
+                return row
+        return None
+
+
+def _first_output_name(refs: list[Any] | None) -> str:
+    """取 ``output_refs[0].name``（脏数据返回空串，绝不抛）。
+
+    与 ``role_executor`` 里写 ``output_refs=[saved.ref()]`` 的形状一一对应；
+    历史数据可能是空列表 / 非 dict ⇒ 视为"没有产出"，让调用方走 1002 分支。
+    """
+    if not isinstance(refs, list) or not refs:
+        return ""
+    head = refs[0]
+    if not isinstance(head, dict):
+        return ""
+    return str(head.get("name") or "")
 
 
 class ExportRepository(BaseRepository[Export]):

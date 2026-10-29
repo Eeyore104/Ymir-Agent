@@ -365,6 +365,31 @@ export interface BaselineUploadResult {
   size_bytes: number
 }
 
+/**
+ * 以合入结果为新基线（v1.3.1 T5.4，docs/13 §7.3-8）：
+ * ``POST /projects/{id}/baselines/from-merge``，201。
+ *
+ * 字段与 :interface:`BaselineUploadResult` 同构 + ``reused``：后者是**幂等标记**
+ * （``true`` = 基线最新版已是该内容，未新建版本），前端据此切换提示文案。
+ */
+export interface BaselineMergeResult extends BaselineUploadResult {
+  /** ``true`` = 复用已有版本（未新建）；``false`` = 本次新建。 */
+  reused: boolean
+}
+
+/**
+ * 「另存为新基线」请求体（v1.3.1 T5.4）。
+ *
+ * ``run_id`` 必填（服务端 ``min_length=1``）：溯源信息挂在 run 上，没有 run 就无从
+ * 重建。``stage_id`` 省略时服务端取「本 run 中产出 ``code`` 的最后一次成功阶段」；
+ * ``artifact_version`` 省略时取该阶段 ``output_refs[0]`` 的版本。
+ */
+export interface BaselineMergePayload {
+  run_id: string
+  stage_id?: string | null
+  artifact_version?: number | null
+}
+
 /** 推送目标（对应后端 ``ExportTarget``，``extra="forbid"``：多一个键即 1001）。 */
 export interface ExportTargetPayload {
   kind?: 'github'

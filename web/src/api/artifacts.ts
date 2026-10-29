@@ -1,6 +1,7 @@
 /**
  * 产物库 API（§6.1、§3.6：项目产物列表 / 详情 / 版本内容 / 版本 diff）；
- * v1.2 增补：跨产物对比（基线 vs 合并结果）与基线上传（docs/09 §4.2）。
+ * v1.2 增补：跨产物对比（基线 vs 合并结果）与基线上传（docs/09 §4.2）；
+ * v1.3.1 增补：以合入结果为新基线（docs/13 §7.3-8）。
  */
 
 import client, { request, type PageData } from './client'
@@ -9,6 +10,8 @@ import type {
   ArtifactContent,
   ArtifactDetail,
   ArtifactDiff,
+  BaselineMergePayload,
+  BaselineMergeResult,
   BaselineUploadResult,
 } from './types'
 
@@ -77,6 +80,32 @@ export function uploadBaseline(projectId: string, file: File | Blob): Promise<Ba
     url: `/projects/${projectId}/baselines`,
     data: file,
     headers: { 'Content-Type': 'application/zip' },
+  })
+}
+
+/**
+ * 以合入结果为新基线（v1.3.1 T5.4，docs/13 §7.3-8）。
+ *
+ * 服务端按该版本的**合入溯源**确定性重建合并树，六道校验（基线引用 / 补丁指纹 /
+ * 模板指纹 / 合并树指纹 / 未落半成品 / 幂等）全在服务端完成 —— 前端不做任何重算。
+ *
+ * 失败语义（``BizError``，``message`` 由调用方**原样上屏**）：
+ * - ``1001``：非增量产物、合并结果超出基线上限；
+ * - ``1002``：项目 / 运行 / 阶段 / 产物引用 / 模板不存在；
+ * - ``1003``：非增量 run、缺溯源、补丁指纹不符、模板已变更、合并树指纹不符。
+ *
+ * @param projectId 项目 id
+ * @param payload ``run_id`` 必填，``stage_id`` / ``artifact_version`` 可省
+ * @returns 回执（含 ``reused``：``true`` = 未新建版本，基线已是该内容）
+ */
+export function promoteMergedToBaseline(
+  projectId: string,
+  payload: BaselineMergePayload,
+): Promise<BaselineMergeResult> {
+  return request<BaselineMergeResult>({
+    method: 'post',
+    url: `/projects/${projectId}/baselines/from-merge`,
+    data: payload,
   })
 }
 

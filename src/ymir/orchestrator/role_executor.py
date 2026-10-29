@@ -33,12 +33,16 @@ from ymir.artifacts.merge import (
     DEFAULT_MAX_CHANGE_RATIO,
     DEFAULT_MAX_FILE_BYTES,
     PATCH_MANIFEST_NAME,
+    MergeProvenance,
     MergeResult,
     ProtectedPathConflict,
     _bounded_warnings,
     merge_trees,
+    parse_patch_manifest,
 )
+from ymir.artifacts.provenance import strip_bookkeeping, template_yaml_hash
 from ymir.artifacts.store import ArtifactStore
+from ymir.artifacts.versioning import compute_content_hash
 from ymir.common.errors import InvalidParamError, NotFoundError, SandboxError, YmirError
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
@@ -58,7 +62,7 @@ from ymir.sandbox.base import NetworkPolicy
 from ymir.sandbox.session import SandboxService
 from ymir.sop.models import ENTRY_INPUT, StageSpec
 from ymir.storage.repositories import ProjectRepository
-from ymir.templates import load_template
+from ymir.templates import DEFAULT_TEMPLATES_DIR, load_template
 from ymir.templates.models import TemplateSpec
 from ymir.tools.read_artifact import read_artifacts
 
@@ -77,6 +81,41 @@ _SMOKE_STREAM_LIMIT = 4000
 
 #: 单阶段冒烟命令数上限（防滥用）
 _SMOKE_MAX_COMMANDS = 5
+
+#: 从**模板**补进冒烟的命令数上限（v1.3.1 T4.1，docs/13 §7.3-6）。
+#:
+#: ★ 与 :data:`_SMOKE_MAX_COMMANDS` **独立**，不许合并：后者是"模型自报命令"的
+#: 防滥用上限（5，语义 = 模型可能胡报一堆），本常量限制的是"我们从模板补进来的
+#: 确定性命令"（2，语义 = 只补构建/编译这类必须验的）。两者的取值理由完全不同。
+_SMOKE_MAX_TEMPLATE_COMMANDS = 2
+
+#: 从模板补进冒烟时只取的检查组（``group``）。
+#:
+#: 为什么只取 ``frontend_build`` 而不把整个 ``checks`` 都补进来：
+#: 其它组（backend / frontend_static …）要么与评测的确定性检查重复（重复执行
+#: 只是白等），要么代价高、副作用不明；``frontend_build`` 恰恰是**评测侧看不到**
+#: 的那一块 —— QA 证据链里缺"前端到底能不能构建"，W4 就是这么误判的。
+_SMOKE_TEMPLATE_GROUP = "frontend_build"
+
+#: ``requires`` 探测命令的超时（秒）：``command -v`` 是纯内存操作，给 10s 足够。
+_SMOKE_REQUIRES_PROBE_TIMEOUT = 10.0
+
+#: 冒烟报告文件名（与 ``evaluation``/``roles`` 侧读取的字面量同源）。
+_SMOKE_REPORT_NAME = "smoke_report.json"
+
+#: 「基线已知事实」段服务的角色（v1.3.1 T4.2）。
+#:
+#: 与 ``roles.prompts._BASELINE_FACT_ROLES`` **同值但不同职责**：这一份决定
+#: "编排层要不要去取事实"，那一份决定"渲染层要不要输出该段"。刻意不跨模块
+#: 复用同一个常量 —— 取数与渲染是两个独立开关，绑在一起会让"只改渲染范围"
+#: 变成"顺手改了取数范围"。
+_BASELINE_FACT_ROLE = "qa"
+
+#: 事实的数据来源产物名（本 stage 的上游 ``code``）。
+_BASELINE_FACT_SOURCE_ARTIFACT = "code"
+
+#: 冒烟事实摘要的字符上限（与 ``roles.prompts._MAX_SMOKE_SUMMARY_CHARS`` 同源）。
+_BASELINE_FACT_SMOKE_CHARS = 400
 
 #: 自动修复消息的来源标识（与 ``RepairController`` 发出的 ``payload.source`` 一致）
 _AUTO_REPAIR_SOURCE = "auto_repair"
@@ -162,6 +201,13 @@ class RoleStageExecutor:
         stage_input = await self._collect_input(
             run, stage, attempt, template_spec=template_spec, baseline_ref=baseline_ref
         )
+        # v1.3.1（T4.2）：**仅 qa** 补「基线已知事实」（取数在编排层、渲染在 prompts）。
+        # 放在 runtime.execute 之前（QA 要拿它组提示词），失败只告警不阻断。
+        if stage.role == _BASELINE_FACT_ROLE:
+            stage_input = replace(
+                stage_input,
+                baseline=await self._baseline_facts(run, stage_input.baseline, stage_input),
+            )
         output = await self._runtime.execute(
             stage.role, stage_input, run_id=run.id, stage_id=stage.id
         )
@@ -181,8 +227,10 @@ class RoleStageExecutor:
 
         smoke: dict[str, Any] | None = None
         if stage.use_sandbox and self._sandbox_service is not None:
-            smoke = await self._run_sandbox_smoke(run, output, files=smoke_files)
-            output.files["smoke_report.json"] = (
+            smoke = await self._run_sandbox_smoke(
+                run, output, files=smoke_files, template_spec=template_spec
+            )
+            output.files[_SMOKE_REPORT_NAME] = (
                 json.dumps(smoke, ensure_ascii=False, indent=2) + "\n"
             )
 
@@ -245,6 +293,13 @@ class RoleStageExecutor:
             if protected_retry is not None:
                 # 仅在发生过"reject -> 重试"时出现（T5.1 据此量化重试命中率）
                 payload["patch"]["protected_retry"] = protected_retry
+            if merged.symbol_removals:
+                # v1.3.1 T3.2：符号删除被拦下的明细（≤10 条），审批卡片据此告诉
+                # 人工"到底哪几个公共符号没了"，而不是只给一个数字。
+                payload["patch"]["symbol_removals"] = [
+                    {"path": item.path, "symbols": list(item.symbols)}
+                    for item in merged.symbol_removals[:10]
+                ]
 
         return StageOutcome(
             output_refs=[saved.ref()],
@@ -279,6 +334,14 @@ class RoleStageExecutor:
            （纯函数、不调模型），manifest 记 ``protected_path_forced_ignore:<n>``，
            阶段继续 —— **不整轮失败**（T5.1 DoD ②）。
 
+        ★ v1.3.1（T3.2 / M3）：「符号删除」冲突走**同一套**三段式（
+        :class:`SymbolRegressionConflict` 继承 :class:`ProtectedPathConflict`，
+        上面那个 ``except`` 零改动复用），但第三段必须**同时**把
+        ``symbol_deletions`` 从 ``reject`` 降为 ``ignore`` —— 否则第二次
+        ``_apply_patch_contract` 会再次抛出且无人捕获。回喂文案按 ``reason``
+        分支（:func:`_protected_feedback`，M2）：删了符号却被告知"请新建文件"
+        会把模型推向"新建空壳 + 入口留空"，比不拦更糟。
+
         Returns:
             ``(stage_output, merge_result, protected_retry)``。
             ``protected_retry`` 仅在发生过重试时非 ``None``（进 payload，
@@ -295,14 +358,28 @@ class RoleStageExecutor:
             return output, None, None
 
         policy: str = template_spec.protected.on_hit if template_spec is not None else "reject"
+        #: 符号删除策略（v1.3.1 T3.2）。缺省 ``off`` ⇒ 与 v1.3 行为完全一致。
+        symbol_policy: str = (
+            template_spec.protected.symbol_deletions if template_spec is not None else "off"
+        )
         try:
             merged = self._apply_patch_contract(
                 output,
                 template_spec=template_spec,
                 base_files=base_files,
                 on_protected_hit=policy,
+                symbol_deletions=symbol_policy,
             )
             _ensure_manifest_synced(output, merged)
+            self._attach_provenance(
+                run=run,
+                output=output,
+                merged=merged,
+                base_files=base_files,
+                template_spec=template_spec,
+                protected_policy=policy,
+                symbol_policy=symbol_policy,
+            )
             return output, merged, None
         except ProtectedPathConflict as conflict:
             first_conflict = conflict
@@ -334,8 +411,21 @@ class RoleStageExecutor:
                 template_spec=template_spec,
                 base_files=base_files,
                 on_protected_hit="reject",
+                symbol_deletions=symbol_policy,
             )
             _ensure_manifest_synced(combined, merged)
+            # ★ 第二段的生效策略是「模板声明值 + on_protected_hit 被写死成 reject」，
+            #   与第一段可能不同（第一段若模板声明 ignore 就不会进到这里）——
+            #   因此这里显式传 "reject"，不复制第一段的变量。
+            self._attach_provenance(
+                run=run,
+                output=combined,
+                merged=merged,
+                base_files=base_files,
+                template_spec=template_spec,
+                protected_policy="reject",
+                symbol_policy=symbol_policy,
+            )
             return combined, merged, retry_info
         except ProtectedPathConflict as second_conflict:
             # ---- 第三段：零成本兜底（ignore 再合一次，纯函数不调模型）----
@@ -346,13 +436,30 @@ class RoleStageExecutor:
                 stage.id,
                 list(second_conflict.paths),
             )
+            # ★ M3（v1.3.1）：第三段必须**同时降级两个策略** —— 只把
+            # ``on_protected_hit`` 降成 ``ignore`` 而 ``symbol_deletions`` 仍是
+            # ``reject``，第二次 ``_apply_patch_contract`` 会**再次**抛
+            # ``SymbolRegressionConflict`` 且此处无人捕获 ⇒ 阶段异常。
+            # 只有声明 ``reject`` 才降级：声明 ``off`` 时**不得**擅自开启检测
+            # （否则"未配置 ⇒ 行为与 v1.3 一致"立刻破功）。
+            fallback_symbols = "ignore" if symbol_policy == "reject" else symbol_policy
             merged = self._apply_patch_contract(
                 combined,
                 template_spec=template_spec,
                 base_files=base_files,
                 on_protected_hit="ignore",
+                symbol_deletions=fallback_symbols,
             )
-            hits = merged.manifest.counts.protected_hits
+            # ★ P3（v1.3.1 QA）：forced 短码里的条数必须把**两类降级都算上**。
+            # 只取 ``protected_hits`` 时，若第三段是因**符号删除**兜底的，会写出
+            # ``protected_path_forced_ignore:0`` —— 读起来像"根本没降级"，还白占
+            # ``_bounded_warnings`` 三个名额之一（实测过
+            # ``['protected_path_forced_ignore:0', 'symbol_regression_ignored:1']``）。
+            # 用**相加**而不是 ``or``：两者可能同时非零（protected 命中的路径被 S4
+            # 短路，但符号命中可能落在**别的**路径上），``or`` 会漏计。
+            # v1.3 里 ``symbol_removals`` 恒为 0 ⇒ 退化成 ``protected_hits``
+            # ⇒ 既有 manifest **逐字节不变**（短码文案/标签不动，前端按原样字符串消费）。
+            hits = merged.manifest.counts.protected_hits + merged.manifest.counts.symbol_removals
             # P3-4（QA）：forced 短码**前置**（它是最重要的降级信号，不能被
             # 先到的 change_ratio 短码挤掉），并统一走 ``_bounded_warnings`` 裁剪
             # （≤3 条 / ≤64 字节）—— 手写 ``[:3]`` 在将来加第 3 类短码时会静默截断。
@@ -368,6 +475,18 @@ class RoleStageExecutor:
             _reserialize_manifest(combined, merged)
             # P3-3（QA）：把"改完记得回写"变成**机制**——返回前强制核对
             _ensure_manifest_synced(combined, merged)
+            # ★ 第三段的生效策略是**运行时降级后**的值（ignore），不是模板声明值 ——
+            #   W6 重建若用声明值，要么重新抛冲突、要么把当时被丢弃的模型内容纳入
+            #   ⇒ ``merged_files_hash`` 必然不符（M3）。
+            self._attach_provenance(
+                run=run,
+                output=combined,
+                merged=merged,
+                base_files=base_files,
+                template_spec=template_spec,
+                protected_policy="ignore",
+                symbol_policy=fallback_symbols,
+            )
             retry_info["forced_ignore"] = list(second_conflict.paths)
             return combined, merged, retry_info
 
@@ -378,6 +497,7 @@ class RoleStageExecutor:
         template_spec: TemplateSpec | None,
         base_files: dict[str, str],
         on_protected_hit: str = "reject",
+        symbol_deletions: str = "off",
     ) -> MergeResult | None:
         """阶段一/阶段二合并（`docs/09 §4.1.3 S1 + §4.2.2`）。
 
@@ -392,6 +512,10 @@ class RoleStageExecutor:
         v1.3（T1.1）：``protected_paths`` **只在 ``patch`` 模式（有基线正文）生效** ——
         ``from_scratch`` 时模型创建 ``tests/conftest.py`` 是**必需的**，若也拦，
         产物会缺掉夹具文件（回归防线无从建立）。这是本实现相对设计的一处**必要澄清**。
+
+        v1.3.1（T3.2）：``symbol_deletions`` 与 ``protected_paths`` **同一条边界** ——
+        ``from_scratch``（无基线）时**不进入**检测（``merge_trees`` 侧的条件是
+        ``base_norm`` 非空，这里再传 ``off`` 是为了让调用点不依赖那个隐式条件）。
         """
         if template_spec is None and not base_files:
             return None
@@ -423,6 +547,7 @@ class RoleStageExecutor:
             protected_paths=protected,
             on_protected_hit=on_protected_hit,  # type: ignore[arg-type]
             max_change_ratio=max_change_ratio,
+            symbol_deletions=symbol_deletions if base_files else "off",  # type: ignore[arg-type]
         )
 
         stored = {path: out1.files[path] for path in out1.manifest.changed_paths
@@ -437,6 +562,55 @@ class RoleStageExecutor:
             stored[PATCH_MANIFEST_NAME] = out1.manifest_json()
         output.files = stored
         return out1
+
+    def _attach_provenance(
+        self,
+        *,
+        run: PipelineRun,
+        output: StageOutput,
+        merged: MergeResult,
+        base_files: dict[str, str],
+        template_spec: TemplateSpec | None,
+        protected_policy: str,
+        symbol_policy: str,
+    ) -> MergeProvenance | None:
+        """把合入溯源写进 ``manifest`` 并**回写落盘正文**（v1.3.1 T5.1）。
+
+        写入时机（容易错的那一条）：本方法在 ``_execute_with_patch_contract``
+        **返回之前**调用，即**冒烟之前** —— 那时 ``smoke_report.json`` 还不存在，
+        与 :func:`ymir.artifacts.provenance.strip_bookkeeping` 的剔除口径严格同源
+        （docs/13 §7.3-7 6c）。若改到冒烟之后写，``patch_files_hash`` 会多算一个
+        文件，W6 重建时 ``merged_files_hash`` 必不符。
+
+        ★ 写完必须 :func:`_reserialize_manifest` + :func:`_ensure_manifest_synced`：
+        ``_apply_patch_contract`` 返回前已把 manifest 序列化进 ``output.files``，
+        只改内存对象就会「内存有、落盘没有」（v1.3 的 F1 教训）。
+
+        Args:
+            protected_policy: 本次**实际传给** ``_apply_patch_contract`` 的值
+                （①模板声明值 / ②``"reject"`` / ③``"ignore"``），不是模板声明值。
+            symbol_policy: 同上（①模板声明值 / ②模板声明值 / ③兜底值）。
+
+        Returns:
+            写入的 :class:`MergeProvenance`；``from_scratch``（无基线 / 非 patch）
+            返回 ``None``（产物里**不写**该键 ⇒ 与 v1.3 逐字节一致）。
+        """
+        prov = _build_provenance(
+            run=run,
+            output=output,
+            merged=merged,
+            base_files=base_files,
+            template_spec=template_spec,
+            protected_policy=protected_policy,
+            symbol_policy=symbol_policy,
+            max_file_bytes=self._max_patch_file_bytes,
+        )
+        if prov is None:
+            return None
+        merged.manifest.provenance = prov
+        _reserialize_manifest(output, merged)
+        _ensure_manifest_synced(output, merged)
+        return prov
 
     async def _load_baseline(
         self, run: PipelineRun
@@ -478,6 +652,62 @@ class RoleStageExecutor:
         )
 
     # ------------------------------------------------------------------ 输入收集
+
+    async def _baseline_facts(
+        self,
+        run: PipelineRun,
+        baseline: BaselineContext | None,
+        stage_input: StageInput | None = None,
+    ) -> BaselineContext | None:
+        """给 QA 的基线上下文补三块**事实**（v1.3.1 T4.2，docs/13 §7.3-5）。
+
+        失败只 ``logger.warning`` 并返回**原 baseline**，**绝不阻断阶段**
+        （取证材料缺失不该让整轮 run 失败）。
+
+        Args:
+            run: 当前 run（仅用于日志）。
+            baseline: 已加载的基线视图；``None``（无基线引用）⇒ 原样返回 ``None``
+                —— 事实挂在 :class:`BaselineContext` 上，没有载体就不造一个。
+            stage_input: 本 stage 的输入；**事实的来源**。``upstream`` 里那条
+                ``code`` 就是 ``read_artifacts`` 为**本次**这一 stage 解析出的那一版。
+
+        数据来源（都已在手，不新增读取通道）：
+            - ``patch_changed_paths`` / ``skeleton_added`` ← 上述 ``code`` 产物的
+              ``patch_manifest.json``（``parse_patch_manifest``；缺失 / 坏 JSON ⇒ 空）；
+            - ``smoke_summary`` ← **同一版本**产物里的 ``smoke_report.json``（缺失 ⇒ 空串）。
+
+        ★★ **禁止取「该项目最新 ``code`` 产物」**：项目里可能已存在更晚的版本
+        （重跑 / 并行 run / 人工补跑），取最新会把「别人那一版」的补丁清单与冒烟
+        结果塞进本次 QA 的上下文 —— 事实与结论来自不同产物，正是 v1.3 F7/F8 的
+        同一类错误。实现上这一点是**结构性保证**：本方法**根本不碰 ``self._store``**，
+        事实只能来自 ``stage_input.upstream``；即使有人想"顺手查一下最新"也无从下手。
+        """
+        if baseline is None:
+            return None
+        try:
+            artifact = _upstream_by_name(stage_input, _BASELINE_FACT_SOURCE_ARTIFACT)
+            if artifact is None:
+                # 没有上游 code 产物：三块事实都无从取，原样返回（渲染层据此不输出该段）
+                return baseline
+            files = dict(artifact.files)
+            manifest = parse_patch_manifest(files.get(PATCH_MANIFEST_NAME))
+            changed = tuple(manifest.changed_paths) if manifest is not None else ()
+            skeleton = tuple(manifest.skeleton_added) if manifest is not None else ()
+            summary = _summarize_smoke(files.get(_SMOKE_REPORT_NAME, ""))
+            return replace(
+                baseline,
+                patch_changed_paths=changed,
+                skeleton_added=skeleton,
+                smoke_summary=summary,
+            )
+        except Exception:  # noqa: BLE001 - 取证材料缺失只降级，绝不阻断阶段
+            logger.warning(
+                "QA 基线事实填充失败，按无事实处理（run=%s stage_input=%s）",
+                run.id,
+                stage_input is not None,
+                exc_info=True,
+            )
+            return baseline
 
     async def _collect_input(
         self,
@@ -707,13 +937,33 @@ class RoleStageExecutor:
     # ------------------------------------------------------------------ 沙箱冒烟
 
     async def _run_sandbox_smoke(
-        self, run: PipelineRun, output: StageOutput, *, files: dict[str, str] | None = None
+        self,
+        run: PipelineRun,
+        output: StageOutput,
+        *,
+        files: dict[str, str] | None = None,
+        template_spec: TemplateSpec | None = None,
     ) -> dict[str, Any]:
         """在沙箱内执行代码产物的自测命令（尽力而为：失败仅记录，不阻断阶段）。
 
         ``files`` 缺省为 ``output.files``；**增量/模板模式下必须传合并后的整树**
         （docs/09 §4.2.2 / §4.1.3）：只写补丁会让 ``import`` 链缺基线文件，
         冒烟必然 ``ModuleNotFoundError``，那是假失败。
+
+        v1.3.1（T4.1，docs/13 §7.3-6）：``template_spec`` 非空时**追加模板的
+        ``frontend_build`` 组命令**（≤2 条，与模型自报命令按字符串去重）。原因见
+        :data:`_SMOKE_TEMPLATE_GROUP`：那块结果评测侧看不到，QA 证据链会缺
+        "前端到底能不能构建"。
+
+        ★ 三条硬纪律：
+
+        1. **只有模板命令带 ``"source": "template"``**，模型命令的条目结构**一字不动**
+           ⇒ 无模板时 ``smoke_report.json`` 与 v1.3 **逐字节一致**（红线 A9）；
+        2. ``requires`` 缺失 ⇒ 记 ``skipped`` + ``reason="requires_missing:<bin>"``，
+           **不执行、零等待**（不烧 300s 的构建超时）；
+        3. ``all_ok`` **三态**（M6）：``executed`` 为空时必须是 ``None`` 而不是
+           ``True`` —— ``all(空集)`` 恒为 ``True``，报告会显示"冒烟全过"而实际
+           一条没跑（无 node 镜像 + 只有 ``frontend_build`` 组时必然踩到）。
         """
         tree = output.files if files is None else files
         commands = [
@@ -721,6 +971,7 @@ class RoleStageExecutor:
             for cmd in output.structured.get("run_commands", [])
             if str(cmd).strip()
         ][:_SMOKE_MAX_COMMANDS]
+        template_checks = _smoke_template_checks(template_spec)
         report: dict[str, Any] = {
             "backend": getattr(self._sandbox_service.sandbox, "backend", "unknown"),  # type: ignore[union-attr]
             "network": str(self._sandbox_network),
@@ -729,7 +980,7 @@ class RoleStageExecutor:
             "all_ok": None,
             "error": None,
         }
-        if not commands:
+        if not commands and not template_checks:
             report["error"] = "skipped: 无自测命令"
             return report
 
@@ -767,10 +1018,24 @@ class RoleStageExecutor:
                         "timed_out": result.timed_out,
                     }
                 )
-            report["all_ok"] = all(
-                item.get("exit_code") == 0 and not item.get("timed_out")
-                for item in report["commands"]
-            )
+            # ---- v1.3.1：模板命令（去重后追加；条目多一个 source 字段）----
+            for check in template_checks:
+                command = str(check.run or "").strip()
+                if command in commands:
+                    continue  # 模型已经自报过同一条：不重复执行（省时且避免噪音）
+                report["commands"].append(
+                    await self._run_smoke_template_check(session, check)
+                )
+            executed = [item for item in report["commands"] if not item.get("skipped")]
+            if executed:
+                report["all_ok"] = all(
+                    item.get("exit_code") == 0 and not item.get("timed_out")
+                    for item in executed
+                )
+            else:
+                # ★ M6：**绝不**让 ``all(空集) == True`` 冒充"全部通过"
+                report["all_ok"] = None
+                report["error"] = "skipped: 全部命令因环境缺失跳过"
         finally:
             try:
                 await self._sandbox_service.destroy(managed)
@@ -778,24 +1043,242 @@ class RoleStageExecutor:
                 logger.exception("沙箱会话销毁失败（run %s）", run.id)
         return report
 
+    async def _run_smoke_template_check(
+        self, session: Any, check: Any
+    ) -> dict[str, Any]:
+        """执行一条模板命令，返回冒烟报告条目（**唯一**带 ``source`` 的形态）。
+
+        ``requires`` 非空 ⇒ 先 ``command -v <bin>`` 探测：非 0 即记 ``skipped``，
+        **不执行主命令**（否则要白等满 ``timeout_s``，构建类检查是 300s）。
+        """
+        command = str(check.run or "").strip()
+        timeout = (
+            float(check.timeout_s) if check.timeout_s else float(self._exec_timeout)
+        )
+        requires = str(check.requires or "").strip()
+        if requires:
+            available = False
+            try:
+                probe = await session.exec(
+                    f"command -v {requires}", timeout=_SMOKE_REQUIRES_PROBE_TIMEOUT
+                )
+                available = probe.exit_code == 0 and not probe.timed_out
+            except Exception:  # noqa: BLE001 - 探测失败按"环境缺失"处置（不执行）
+                logger.warning("冒烟 requires 探测失败，按缺失跳过（%s）", requires)
+            if not available:
+                return {
+                    "command": command,
+                    "source": "template",
+                    "skipped": True,
+                    "reason": f"requires_missing:{requires}",
+                }
+        try:
+            result = await session.exec(command, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - 单命令异常同样记录，不阻断
+            return {
+                "command": command,
+                "source": "template",
+                "error": str(exc),
+                "exit_code": None,
+            }
+        return {
+            "command": command,
+            "source": "template",
+            "stdout": result.stdout[:_SMOKE_STREAM_LIMIT],
+            "stderr": result.stderr[:_SMOKE_STREAM_LIMIT],
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "timed_out": result.timed_out,
+        }
+
 
 # --------------------------------------------------------------------- 消息解包工具
 
 
+def _upstream_by_name(
+    stage_input: StageInput | None, name: str
+) -> UpstreamArtifact | None:
+    """取本 stage 输入里名为 ``name`` 的**已完成解析**的上游产物（无则 ``None``）。
+
+    ★ 这是「事实只取本 stage 那一版」的唯一入口：``stage_input.upstream`` 由
+    ``_collect_input`` 的 ``read_artifacts`` 一次性解析，之后不再变动。
+    **绝不去 store 查"最新"** —— 那会把别人那一版的事实掺进本次 QA。
+    """
+    if stage_input is None:
+        return None
+    for artifact in stage_input.upstream:
+        if artifact.name == name:
+            return artifact
+    return None
+
+
+def _summarize_smoke(raw: str) -> str:
+    """把 ``smoke_report.json`` 压成一行**事实摘要**（只给数字与首个失败命令）。
+
+    形如 ``命令 2 条 / exit=0 1 条 / 首个非 0 命令：`fe-build web```
+    （有跳过时追加 `` / 其中 1 条因环境缺失跳过``）。
+
+    ★ 只给事实、不给判词：不写「通过 / 不通过」，判定由 QA 自己下。
+    ★ 缺失 / 坏 JSON / 无命令 ⇒ 返回空串（渲染层显示「（无冒烟记录）」），绝不抛。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    commands = payload.get("commands")
+    if not isinstance(commands, list) or not commands:
+        return ""
+    items = [item for item in commands if isinstance(item, dict)]
+    skipped = sum(1 for item in items if item.get("skipped"))
+    executed = [item for item in items if not item.get("skipped")]
+    passed = sum(
+        1 for item in executed if item.get("exit_code") == 0 and not item.get("timed_out")
+    )
+    first_bad = ""
+    for item in executed:
+        if item.get("exit_code") != 0 or item.get("timed_out"):
+            first_bad = str(item.get("command") or "").strip()
+            break
+    if first_bad:
+        bad_text = f"`{first_bad}`"
+    elif not executed:
+        bad_text = "无（全部跳过）"
+    else:
+        bad_text = "无"
+    parts = [f"命令 {len(items)} 条", f"exit=0 {passed} 条", f"首个非 0 命令：{bad_text}"]
+    if skipped:
+        parts.append(f"其中 {skipped} 条因环境缺失跳过")
+    summary = " / ".join(parts)
+    if len(summary) > _BASELINE_FACT_SMOKE_CHARS:
+        summary = summary[:_BASELINE_FACT_SMOKE_CHARS] + "…（已截断）"
+    return summary
+
+
+def _smoke_template_checks(template_spec: TemplateSpec | None) -> list[Any]:
+    """挑出要从模板补进冒烟的检查（``frontend_build`` 组，≤2 条，自身去重）。
+
+    Args:
+        template_spec: 模板定义；``None``（无模板 / 通用模式）⇒ 返回空清单 ——
+            这是「无模板时 ``smoke_report.json`` 与 v1.3 逐字节一致」的入口条件。
+
+    Returns:
+        ``CheckSpec`` 列表（保序）：只取 ``group == _SMOKE_TEMPLATE_GROUP`` 且
+        ``run`` 非空的条目，按命令字符串去重，最多 :data:`_SMOKE_MAX_TEMPLATE_COMMANDS` 条。
+
+    Note:
+        与模型自报命令的去重在调用方做（那里才有模型命令清单）；本函数只负责
+        "模板内部不重复"，两个层次分开，避免把两处状态揉成一个参数。
+    """
+    if template_spec is None:
+        return []
+    picked: list[Any] = []
+    seen: set[str] = set()
+    for check in template_spec.checks:
+        if str(getattr(check, "group", "") or "").strip() != _SMOKE_TEMPLATE_GROUP:
+            continue
+        command = str(getattr(check, "run", "") or "").strip()
+        if not command or command in seen:
+            continue
+        seen.add(command)
+        picked.append(check)
+        if len(picked) >= _SMOKE_MAX_TEMPLATE_COMMANDS:
+            break
+    return picked
+
+
+#: 回喂模型：命中受保护路径的纠正指令（v1.3 Q1 第二段）。
+#:
+#: ★ **逐字节冻结**：v1.3 的 38 条文案断言都钉在这段字面量上。v1.3.1 只允许
+#: 在它**旁边**加新模板（``_SYMBOL_REGRESSION_FEEDBACK``），不得改这里的任何一个字。
+_LEGACY_PROTECTED_FEEDBACK: str = (
+    "受保护路径不可修改（{paths}）：这些文件由基线提供且必须保持原样，"
+    "本次产出中对它们的改动已被服务端拒绝。\n"
+    "请改为新建文件实现你的目标（例如 `tests/test_<新功能>.py` 或新的实现模块），"
+    "不要重写、不要删除 {paths}；如需新增夹具，请在你新建的文件里定义。"
+)
+
+#: 回喂模型：删掉仍被引用的公共符号的纠正指令（v1.3.1 T3.2 / M2）。
+#:
+#: ★ 与上面那段**必须不同**：删了 ``run`` 却被告知"请改为新建文件"，模型会照做 ——
+#: 把子命令搬到新文件、入口留空壳（真实事故就是这么发生的），比不拦更糟。
+#: 因此本段必须给出**真正可行的两条路**：恢复符号，或同步改完所有引用。
+#: 且**不得出现「受保护路径」字样**（用例断言）：那会让模型以为整个文件不能碰。
+_SYMBOL_REGRESSION_FEEDBACK: str = (
+    "删除的公共符号仍被其它文件引用（{paths}）：这些文件里的公共函数/类被"
+    "未改动的文件 import 或调用，本次产出中对它们的删除已被服务端拒绝。\n"
+    "请二选一：① **恢复这些符号**（保留原有函数/类及其签名），"
+    "或 ② 同步更新所有引用它们的文件后再删除。\n"
+    "不要靠新建空壳文件、改名或把实现搬到别处绕过 —— 引用方仍会 ImportError。"
+)
+
+
 def _protected_feedback(conflict: ProtectedPathConflict) -> str:
-    """回喂模型的纠正指令（v1.3 Q1 第二段，docs/11 §7.3-4）。
+    """回喂模型的纠正指令（v1.3 Q1 第二段，docs/11 §7.3-4；v1.3.1 T3.2 按 reason 分支）。
 
     复用 :attr:`StageInput.feedback` 通道（``prompts.build_user`` 渲染成「历史反馈」节），
     **不新增提示词通道、不改 ``RoleRuntime.execute`` 签名**（B4）。
 
     文案纪律（R1 ②）：不只说"禁止"，必须**给出替代路径**，否则模型只会换个写法继续撞。
+
+    ★ M2（v1.3.1）：**必须按 ``conflict.reason`` 分支**。v1.3 的实现只拼
+    ``conflict.paths``，固定输出「受保护路径不可修改…请改为新建文件」，
+    **完全不读** ``message`` —— 对"符号回归"用同一段文案是错误的引导（见
+    :data:`_SYMBOL_REGRESSION_FEEDBACK` 的说明）。
+    ``protected_path`` 分支仍走 :data:`_LEGACY_PROTECTED_FEEDBACK`，**逐字节不变**。
     """
     paths = "、".join(conflict.paths) or "（受保护路径）"
-    return (
-        f"受保护路径不可修改（{paths}）：这些文件由基线提供且必须保持原样，"
-        "本次产出中对它们的改动已被服务端拒绝。\n"
-        f"请改为新建文件实现你的目标（例如 `tests/test_<新功能>.py` 或新的实现模块），"
-        f"不要重写、不要删除 {paths}；如需新增夹具，请在你新建的文件里定义。"
+    if conflict.reason == "symbol_regression":
+        return _SYMBOL_REGRESSION_FEEDBACK.format(paths=paths)
+    return _LEGACY_PROTECTED_FEEDBACK.format(paths=paths)
+
+
+def _build_provenance(
+    *,
+    run: PipelineRun,
+    output: StageOutput,
+    merged: MergeResult,
+    base_files: dict[str, str],
+    template_spec: TemplateSpec | None,
+    protected_policy: str,
+    symbol_policy: str,
+    max_file_bytes: int,
+) -> MergeProvenance | None:
+    """算出本次合入的溯源（v1.3.1 T5.1，docs/13 §7.3-7）。纯函数（除模板哈希读盘）。
+
+    ``from_scratch`` / 无基线 ⇒ ``None``：产物里不写 ``provenance`` 键
+    （``manifest_json`` 会 pop），与 v1.3 逐字节一致（A9）。判据用
+    ``mode == "patch"``：它是 ``merge_trees`` 对所有"有基线"场景的唯一取值，
+    比"``base_files`` 非空"更贴近落盘事实。
+
+    ★ 两个内容哈希都过 :func:`strip_bookkeeping`（剔除 ``patch_manifest.json`` /
+    ``smoke_report.json``）：前者是产物自身的簿记、后者此刻尚未生成，二者都不是补丁
+    内容；把 ``patch_manifest.json`` 算进去还会造成"哈希依赖自身"的不动点问题。
+    """
+    if merged.manifest.mode != "patch" or not base_files:
+        return None
+    context = run.context if isinstance(run.context, dict) else {}
+    ref = context.get("baseline")
+    ref_dict = ref if isinstance(ref, dict) else {}
+    raw_version = ref_dict.get("version")
+    template_id = (
+        str(getattr(template_spec, "id", "") or "") if template_spec is not None else ""
+    )
+    return MergeProvenance(
+        base_artifact_id=str(ref_dict.get("artifact_id") or "").strip(),
+        base_version=raw_version if isinstance(raw_version, int) else None,
+        base_content_hash=merged.manifest.base_content_hash,
+        patch_files_hash=compute_content_hash(strip_bookkeeping(output.files)),
+        template_id=template_id,
+        template_hash=template_yaml_hash(DEFAULT_TEMPLATES_DIR, template_id),
+        merged_files_hash=compute_content_hash(strip_bookkeeping(merged.files)),
+        protected_policy=protected_policy,
+        symbol_policy=symbol_policy,
+        max_file_bytes=max_file_bytes,
     )
 
 

@@ -169,6 +169,9 @@ class EvalCheck(BaseModel):
 
     v1.3（docs/11 §7.2.4）追加四字段，与 ``templates.models.CheckSpec`` 同构且
     全部带默认值 ⇒ 旧套件 YAML / 旧调用方零改动。
+
+    v1.3.1（docs/13 §7.2.2）追加 ``requires_files``：**仅探针侧消费**（合并树侧
+    行为一行不改，Q1 的不对称）。
     """
 
     type: str = "command"
@@ -182,6 +185,10 @@ class EvalCheck(BaseModel):
     requires: str = ""
     #: 单条超时（秒）；None = 用执行上下文缺省（``EvalContext.exec_timeout``）
     timeout_s: float | None = Field(default=None, gt=0)
+    #: ★v1.3.1：该检查依赖的**基线文件**（元素语义：精确文件路径，或以 ``/``
+    #: 结尾的目录前缀 = 该目录下 ≥1 个文件）。**只在探针侧**生效：基线里一个都
+    #: 没有 ⇒ 该检查 ``skipped`` + ``baseline_incomplete``，而不是判 unhealthy。
+    requires_files: list[str] = Field(default_factory=list)
 
 
 class EvalTask(BaseModel):
@@ -224,6 +231,12 @@ class EvalTask(BaseModel):
     #: （按 ``checks[].weight`` 归一）。由 ``evaluation/run_task`` 从
     #: ``TemplateSpec.to_scoring_rules()`` 注入（纯数据跨层）。
     scoring: ScoringRules | None = None
+    #: ★模板骨架正文（v1.3.1 T1.1，docs/13 §7.2.2）：``path -> content`` 纯数据，
+    #: 由 ``evaluation/run_task`` 从 ``TemplateSpec.skeleton_files()`` 注入。
+    #: 探针据此把「骨架补缺后的基线」写进沙箱（与合并树同一把尺子）。
+    #: ``{}`` ⇒ 探针树 = 基线原样 ⇒ ``probe_mode`` 不进报告 ⇒ 与 v1.3 逐字节一致。
+    #: ★ **刻意不设** ``baseline_reserved``（S3：``patch={}`` 下 reserved 分支不可达）。
+    baseline_skeleton: dict[str, str] = Field(default_factory=dict)
 
 
 @dataclass

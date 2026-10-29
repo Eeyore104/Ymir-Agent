@@ -1137,3 +1137,35 @@ def test_manifest_json_serializes_non_default_values_only() -> None:
     ]
     # 基线版本仍在树里（ignore 语义）
     assert merged.files["tests/conftest.py"] == CONFTEST_BASE
+
+
+def test_python_cli_entry_file_is_protected_by_real_template() -> None:
+    """T3.1（Q2 的 A 方案）：真实模板 ``python-cli`` 保护入口文件 ``ymir_cli/cli.py``。
+
+    真实事故（docs/12 §7-L1）就是模型改写这个文件：``run`` 被删、子命令搬到别处、
+    入口留空壳。A 方案用 ``protected.paths`` 显式保护它 ⇒ 命中即 1003/409，
+    编排层随后做「1 次定向重试 + 兜底 ignore」，整轮不报废。
+    """
+    from ymir.templates.loader import load_template
+
+    spec = load_template("python-cli")
+    protected = spec.protected_paths()
+    assert "ymir_cli/cli.py" in protected
+    # 与 skeleton / conventions 不交叉（校验 18 已保证，此处再钉一遍：交叉会让加载期就失败）
+    assert "ymir_cli/cli.py" not in spec.skeleton_files()
+    assert "ymir_cli/cli.py" not in {item.path for item in spec.conventions}
+
+    base = {
+        "ymir_cli/cli.py": "def run() -> int:\n    return 0\n",
+        "tests/conftest.py": "import pytest\n",
+    }
+    with pytest.raises(merge_module.ProtectedPathConflict) as excinfo:
+        merge_trees(
+            base,
+            {"ymir_cli/cli.py": "def main() -> None:\n    return None\n"},
+            mode="patch",
+            protected_paths=protected,
+        )
+    assert excinfo.value.biz_code == 1003
+    assert excinfo.value.http_status == 409
+    assert excinfo.value.paths == ("ymir_cli/cli.py",)

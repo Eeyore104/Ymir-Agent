@@ -52,6 +52,10 @@ protected:
     - tests/conftest.py
   on_hit: reject
   max_change_ratio: 0.5
+  # W3-B′（v1.3.1 T3.3）：引用感知的符号删除检测，显式收紧为 reject。
+  # 本模板的入口 `app/main.py` 是骨架 seed ⇒ 校验 18 禁止它进 protected.paths
+  # （Q2 的 A 方案在此失效），符号检测是这一场景唯一的通用保护。
+  symbol_deletions: reject
 
 skeleton:
   max_files: 5
@@ -128,6 +132,15 @@ checks:
     group: frontend_build
     blocking: true
     requires: node
+    # ★ v1.3.1（T1.2，docs/13 §7.2.6）`requires_files`：探针（基线独立执行）的
+    #   **前置文件**判定 —— 基线里连 `web/` 目录都没有（v1.2 时代的补丁产物就是
+    #   这种形态）⇒ 该检查在**探针侧** `skipped`，报告写
+    #   `baseline_incomplete`，而不是把"基线不完整"误判成"基线不健康"。
+    #   ★ 合并树侧语义**不变**：交付树缺 `web/` 仍然 `failed`（阻断项）——
+    #   这正是"基线不完整 ≠ 交付树可缺目录"的不对称（docs/13 §3-Q1）。
+    #   ★ 加载期校验 22 禁止本字段与 skeleton 交叉：骨架里**没有** `web/**`，
+    #   否则骨架补缺会让 `web/` 永远存在、这条声明恒真（配了等于没配）。
+    requires_files: ["web/"]
     timeout_s: 300
 
 # 分组配分（Q3）：runnability 维度内按组计点，合计 30 点 = 该维度满分。

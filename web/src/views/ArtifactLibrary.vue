@@ -4,6 +4,11 @@
 
   v1.2 T4.3 增补：基线面板（vN / 文件数 / hash 前 8 位 / 上传时间）、
   跨产物对比（基线 vs 基线⊕补丁，复用 DiffView）、推送三步对话框。
+
+  v1.3.1 T5.4：「另存为新基线」的**唯一动作入口**落在本视图的 ``code`` 版本行
+  （该行已带 ``run_id`` / ``stage_id`` / ``version``，零额外查询就知道"要提升哪一版"）。
+  ``BaselinePanel.vue`` 只加一句引导文案 —— 它拿不到"要提升哪一版 code"，
+  自己取最新版正是 R9 明令禁止的「拿最新顶上」。
 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
@@ -13,10 +18,26 @@ import BaselinePanel from '@/components/BaselinePanel.vue'
 import DiffView from '@/components/DiffView.vue'
 import MarkdownView from '@/components/MarkdownView.vue'
 import PushExportDialog from '@/components/PushExportDialog.vue'
-import { exportProjectZip, fetchArtifact, fetchProjectArtifacts } from '@/api/artifacts'
+import {
+  exportProjectZip,
+  fetchArtifact,
+  fetchProjectArtifacts,
+  promoteMergedToBaseline,
+} from '@/api/artifacts'
 import { useArtifactsStore } from '@/stores/artifacts'
 import { messageOf, useProjectsStore } from '@/stores/projects'
 import { buildDiffRef } from '@/utils/baseline'
+import {
+  CODE_ARTIFACT_NAME,
+  PATCH_MANIFEST_NAME,
+  PROMOTE_ACTION_LABEL,
+  PROMOTE_DISABLED_HINT,
+  canPromote,
+  parsePromoteManifest,
+  promoteConfirmLines,
+  promoteErrorText,
+  promoteResultText,
+} from '@/utils/promoteBaseline'
 import type { Artifact, ArtifactDetail, ArtifactVersion } from '@/api/types'
 
 const route = useRoute()
@@ -37,6 +58,46 @@ const baselineLoading = ref(false)
 
 /** 推送对话框可见性（T4.3 第三步流程的入口）。 */
 const pushDialogVisible = ref(false)
+
+// --- 「另存为新基线」（v1.3.1 T5.4）-------------------------------------------
+/** 二次确认框可见性。 */
+const promoteDialogVisible = ref(false)
+/** 待提升的 code 版本行（``null`` = 未选中）。 */
+const promoteTarget = ref<ArtifactVersion | null>(null)
+/** 请求进行中（防重复点击）。 */
+const promoting = ref(false)
+/**
+ * 已打开过的 ``patch_manifest.json`` 正文缓存（键 ``artifact_id@version``）。
+ *
+ * ★ 为什么需要它、以及它**不会**变成"点一次拉一次"：
+ * 版本行本身不带文件正文，为了预检而额外发一次 content 请求就等于给"打开页面
+ * 零额外查询"加了一条按需查询。这里**只缓存用户已经在「内容」页主动打开过的正文**
+ * （见 ``onSelectFile``），一次不多拉；拿不到正文时按钮改用 ``run_id`` 门控，
+ * 结论交给服务端 1001 / 1003 的原文兜住。
+ */
+const manifestCache = ref<Record<string, string>>({})
+
+/** 仅 ``code`` 产物允许「另存为新基线」（其它产物没有可重建的合并树）。 */
+const isCodeArtifact = computed<boolean>(() => currentArtifact.value?.name === CODE_ARTIFACT_NAME)
+
+/** 预计基线版本号（当前最新基线 + 1；尚无基线 ⇒ v1；幂等命中时服务端不新建）。 */
+const nextBaselineVersion = computed<number>(() => latestBaselineVersion.value + 1)
+
+/** 确认框三要素（``run_id`` 前 8 位 / ``base v?`` / **预计**基线版本号）。 */
+const promoteLines = computed<string[]>(() => {
+  const row = promoteTarget.value
+  if (row === null) {
+    return []
+  }
+  const raw = manifestCache.value[manifestKey(row)] ?? null
+  const facts = raw === null ? null : parsePromoteManifest(raw)
+  return promoteConfirmLines({
+    runId: row.run_id,
+    baseVersion: facts?.baseVersion ?? null,
+    targetVersion: nextBaselineVersion.value,
+  })
+})
+// ---------------------------------------------------------------------------
 
 const artifacts = computed<Artifact[]>(() => artifactsStore.items)
 const currentArtifact = computed(() => artifactsStore.current)
@@ -140,10 +201,87 @@ async function onViewVersion(version: ArtifactVersion): Promise<void> {
   await artifactsStore.loadVersionContent(version.artifact_id, version.version)
 }
 
-/** 选择文件查看内容。 */
+/** 选择文件查看内容（顺带缓存 ``patch_manifest.json`` 正文，供「另存为新基线」预检）。 */
 async function onSelectFile(path: string): Promise<void> {
   selectedPath.value = path
   await artifactsStore.loadVersionContent(selectedArtifactId.value, contentVersion.value, path)
+  if (path !== PATCH_MANIFEST_NAME || selectedArtifactId.value === '' || contentVersion.value <= 0) {
+    return
+  }
+  const loaded = artifactsStore.content
+  if (loaded?.path !== PATCH_MANIFEST_NAME || typeof loaded.content !== 'string') {
+    return
+  }
+  if (loaded.content.trim() === '') {
+    return
+  }
+  manifestCache.value[`${selectedArtifactId.value}@${contentVersion.value}`] = loaded.content
+}
+
+/** 版本行在 manifest 缓存里的键（``artifact_id@version``，与展示无关、稳定可复现）。 */
+function manifestKey(row: ArtifactVersion): string {
+  return `${row.artifact_id}@${row.version}`
+}
+
+/**
+ * 打开「另存为新基线」二次确认框（唯一动作入口，T5.4）。
+ *
+ * 门控分两层：
+ * 1. ``run_id`` 为空 ⇒ 服务端无从取溯源，直接拒绝（按钮本身也禁用）；
+ * 2. 正文**已缓存**时再跑一遍 ``canPromote`` 预检 —— 只挡"必然失败"（非增量产物 /
+ *    正文损坏）；正文未缓存则跳过预检（**不为此新增查询**），交给服务端 1001 / 1003。
+ */
+function openPromoteDialog(row: ArtifactVersion): void {
+  if (!row.run_id) {
+    ElMessage.warning(PROMOTE_DISABLED_HINT)
+    return
+  }
+  const raw = manifestCache.value[manifestKey(row)] ?? null
+  if (raw !== null) {
+    const gate = canPromote(raw)
+    if (!gate.ok) {
+      ElMessage.warning(gate.reason)
+      return
+    }
+  }
+  promoteTarget.value = row
+  promoteDialogVisible.value = true
+}
+
+/** 关闭确认框并清空选中行。 */
+function closePromoteDialog(): void {
+  promoteDialogVisible.value = false
+  promoteTarget.value = null
+}
+
+/**
+ * 确认「另存为新基线」：``POST /projects/{id}/baselines/from-merge``。
+ *
+ * ★ 失败文案一律**原样上屏**（1001 超上限 / 非增量产物，1003 指纹不符 / 缺溯源 /
+ * 模板已变更）—— 这些 message 本身就是修复指引，改写成「操作失败」等于把用户堵死。
+ * ★ ``reused=true`` 只提示「基线已是该内容」且**不显示新版本号**（见 ``promoteResultText``）。
+ */
+async function onPromote(): Promise<void> {
+  const row = promoteTarget.value
+  if (row === null || !row.run_id || !projectId.value) {
+    return
+  }
+  promoting.value = true
+  try {
+    const result = await promoteMergedToBaseline(projectId.value, {
+      run_id: row.run_id,
+      stage_id: row.stage_id ?? undefined,
+      artifact_version: row.version,
+    })
+    const feedback = promoteResultText(result)
+    ElMessage({ type: feedback.type, message: feedback.text })
+    closePromoteDialog()
+    await loadBaselineDetail(projectId.value)
+  } catch (e) {
+    ElMessage.error(promoteErrorText(e))
+  } finally {
+    promoting.value = false
+  }
 }
 
 /** 执行版本对比。 */
@@ -276,7 +414,7 @@ function downloadBlob(blob: Blob, filename: string): void {
                     {{ formatTime(row.created_at) }}
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" width="220" fixed="right">
+                <el-table-column label="操作" :width="isCodeArtifact ? 330 : 220" fixed="right">
                   <template #default="{ row }">
                     <el-button link type="primary" size="small" @click="onViewVersion(row)">
                       查看内容
@@ -293,6 +431,28 @@ function downloadBlob(blob: Blob, filename: string): void {
                     >
                       与最新版对比
                     </el-button>
+                    <!--
+                      「另存为新基线」唯一动作入口（v1.3.1 T5.4）：只在 code 版本行出现。
+                      run_id 为空 ⇒ 禁用；disabled 按钮不派发鼠标事件，故 tooltip 需包一层 span。
+                    -->
+                    <el-tooltip
+                      v-if="isCodeArtifact"
+                      :content="row.run_id ? '' : PROMOTE_DISABLED_HINT"
+                      placement="top"
+                      :disabled="Boolean(row.run_id)"
+                    >
+                      <span class="promote-wrap">
+                        <el-button
+                          link
+                          type="primary"
+                          size="small"
+                          :disabled="!row.run_id"
+                          @click="openPromoteDialog(row)"
+                        >
+                          {{ PROMOTE_ACTION_LABEL }}
+                        </el-button>
+                      </span>
+                    </el-tooltip>
                   </template>
                 </el-table-column>
               </el-table>
@@ -382,6 +542,40 @@ function downloadBlob(blob: Blob, filename: string): void {
       :project-id="projectId"
       :artifact="currentArtifact"
     />
+
+    <!--
+      「另存为新基线」二次确认框（v1.3.1 T5.4）：展示 run_id 前 8 位 / base v?（取不到则省略）
+      / **预计**基线版本号。确认后调用 POST /projects/{id}/baselines/from-merge。
+    -->
+    <el-dialog
+      v-model="promoteDialogVisible"
+      :title="PROMOTE_ACTION_LABEL"
+      width="520px"
+      :close-on-click-modal="false"
+      @closed="promoteTarget = null"
+    >
+      <div class="promote-facts">
+        <el-tag v-for="line in promoteLines" :key="line" size="small" type="info" effect="plain">
+          {{ line }}
+        </el-tag>
+      </div>
+      <div class="promote-hint">
+        将按该版本的合入溯源（基线引用 + 补丁指纹 + 模板指纹 + 合并树指纹）确定性重建合并树，
+        并落成新的基线版本；若重建结果与当前最新基线内容一致，则复用、不新增版本。
+      </div>
+      <div class="promote-hint">
+        「预计基线版本」= 当前最新基线 + 1，最终版本号以服务端回执为准（幂等命中时不变）。
+      </div>
+      <div class="promote-hint">
+        模板文件有改动（含注释）、指纹不符、或合并结果超出基线上限时，服务端会拒绝并给出原因。
+      </div>
+      <template #footer>
+        <el-button @click="closePromoteDialog">取消</el-button>
+        <el-button type="primary" :loading="promoting" @click="onPromote">
+          确认另存为新基线
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -510,5 +704,24 @@ function downloadBlob(blob: Blob, filename: string): void {
 .diff-hint-block {
   margin-bottom: 10px;
   line-height: 1.7;
+}
+
+/* 「另存为新基线」确认框 */
+.promote-wrap {
+  display: inline-block;
+}
+
+.promote-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.promote-hint {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.7;
+  margin-bottom: 6px;
 }
 </style>

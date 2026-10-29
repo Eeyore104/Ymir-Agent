@@ -40,7 +40,7 @@ from ymir.common.errors import NotFoundError
 from ymir.config import PROJECT_ROOT
 from ymir.orchestrator.role_executor import RoleStageExecutor
 from ymir.roles import PromptRenderer, RoleRegistry, StageInput, UpstreamArtifact
-from ymir.roles.io import RepairContext, TemplateContext
+from ymir.roles.io import BaselineContext, RepairContext, TemplateContext
 from ymir.templates import load_template_file
 
 ROLES_DIR = PROJECT_ROOT / "config" / "roles"
@@ -206,7 +206,7 @@ prompting:
 
 
 def _template_context(tmp_path: Path) -> TemplateContext:
-    """YAML -> loader（21 条校验）-> ``TemplateContext``（含 from_spec 桥接）。"""
+    """YAML -> loader（23 条校验）-> ``TemplateContext``（含 from_spec 桥接）。"""
     path = tmp_path / "fastapi-vue3.yaml"
     path.write_text(_TEMPLATE_YAML, encoding="utf-8", newline="\n")
     spec = load_template_file(path, known_roles=set(ALL_ROLES))
@@ -387,3 +387,116 @@ def test_collect_template_degrades_when_template_load_fails(
     monkeypatch.setattr(role_executor_module, "load_template", _boom)
     executor = RoleStageExecutor.__new__(RoleStageExecutor)
     assert executor._collect_template(_FakeRun({"template": {"id": "gone"}})) is None
+
+
+# ---------------------------------------- v1.3.1 T4.2：QA「基线已知事实」段（§7.3-5）
+
+#: 事实段里**绝不许**出现的判词（QA 要独立取证，不能被喂结论）
+_JUDGEMENT_WORDS = ("判定", "不通过", "regression")
+
+
+def _facts_baseline(**overrides: object) -> BaselineContext:
+    """构造一份带三块事实的基线视图（默认值覆盖"四块都非空"的形态）。"""
+    fields: dict[str, object] = {
+        "artifact_id": "a-1",
+        "version": 2,
+        "content_hash": "0123456789abcdef",
+        "file_count": 3,
+        "paths": ("app/main.py", "tests/conftest.py", "ymir_cli/cli.py"),
+        "patch_changed_paths": ("app/api.py", "ymir_cli/cli.py"),
+        "skeleton_added": ("pyproject.toml",),
+        "smoke_summary": "命令 2 条 / exit=0 1 条 / 首个非 0 命令：`fe-build web`",
+    }
+    fields.update(overrides)
+    return BaselineContext(**fields)  # type: ignore[arg-type]
+
+
+def _render_for(role_id: str, baseline: BaselineContext | None) -> str:
+    role = RoleRegistry(ROLES_DIR).get(role_id)
+    return _renderer().build_user(
+        role, StageInput(requirement="给待办 API 加一个导出接口", baseline=baseline)
+    )
+
+
+def test_baseline_facts_section_renders_four_blocks_for_qa() -> None:
+    """qa：四块事实齐全（基线文件 / 骨架补缺 / 补丁改动 / 冒烟）+ 段末固定行。"""
+    text = _render_for("qa", _facts_baseline())
+
+    assert "## 基线已知事实" in text
+    # ① 基线文件：**必须写明共几个、列前几个**（读者要能判断是不是节选）
+    assert "### 基线文件（共 3 个，列前 3 个）" in text
+    assert "- app/main.py" in text
+    # ② 骨架补缺
+    assert "### 骨架补缺（本次合并补进的模板文件，共 1 个）" in text
+    assert "- pyproject.toml" in text
+    # ③ 本次补丁改动
+    assert "### 本次补丁改动（共 2 个文件）" in text
+    assert "- app/api.py" in text
+    # ④ 模型自测冒烟（只给事实串）
+    assert "### 模型自测冒烟" in text
+    assert "命令 2 条 / exit=0 1 条" in text
+    # 段末固定一行
+    assert "以上为事实清单，不构成结论；请自行取证并给出证据链。" in text
+
+
+def test_baseline_facts_section_has_no_judgement_words() -> None:
+    """事实段**不得**出现判词关键词（``判定`` / ``不通过`` / ``regression``）。"""
+    text = _render_for("qa", _facts_baseline())
+    start = text.index("## 基线已知事实")
+    # 段落到「段末固定行」为止（后面还有上游产物等小节，不能一起断言）
+    end = text.index("以上为事实清单，不构成结论；请自行取证并给出证据链。") + len(
+        "以上为事实清单，不构成结论；请自行取证并给出证据链。"
+    )
+    section = text[start:end]
+    for word in _JUDGEMENT_WORDS:
+        assert word not in section, f"事实段出现了判词「{word}」"
+
+
+def test_baseline_facts_section_absent_for_engineer() -> None:
+    """engineer：**没有**该段（它走「## 增量模式」的另一段，逐字节不变）。"""
+    text = _render_for("engineer", _facts_baseline())
+    assert "## 增量模式" in text
+    assert "## 基线已知事实" not in text
+
+
+def test_baseline_facts_section_skipped_when_no_facts() -> None:
+    """既无基线文件、也无本次改动 ⇒ 返回 ``[]``（不产生空标题）。"""
+    for role_id in ALL_ROLES:
+        text = _render_for(role_id, BaselineContext())
+        assert "## 基线已知事实" not in text, role_id
+
+
+def test_baseline_facts_truncates_with_explicit_counts() -> None:
+    """超限时**明确写出省略了多少**（80 / 40 / 20 三个上限）。"""
+    baseline = _facts_baseline(
+        paths=tuple(f"app/m{i}.py" for i in range(100)),
+        patch_changed_paths=tuple(f"app/c{i}.py" for i in range(50)),
+        skeleton_added=tuple(f"app/s{i}.py" for i in range(25)),
+    )
+    text = _render_for("qa", baseline)
+
+    assert "### 基线文件（共 100 个，列前 80 个）" in text
+    assert "- ……省略 20 个" in text
+    assert "### 骨架补缺（本次合并补进的模板文件，共 25 个）" in text
+    assert "- ……省略 5 个" in text
+    assert "### 本次补丁改动（共 50 个文件）" in text
+    assert "- ……省略 10 个" in text
+    # 第 81 条不许出现（列前 80）
+    assert "- app/m80.py" not in text
+
+
+def test_baseline_facts_smoke_summary_is_capped() -> None:
+    """冒烟摘要整段截断到 400 字符（防长输出灌爆提示词）。"""
+    from ymir.roles.prompts import _MAX_SMOKE_SUMMARY_CHARS  # noqa: PLC0415
+
+    baseline = _facts_baseline(smoke_summary="命" * 1000)
+    text = _render_for("qa", baseline)
+    assert "命" * (_MAX_SMOKE_SUMMARY_CHARS + 1) not in text
+    assert "…（已截断）" in text
+
+
+def test_baseline_facts_empty_smoke_shows_placeholder() -> None:
+    """无冒烟记录时给占位而不是省略该块（四块结构稳定）。"""
+    text = _render_for("qa", _facts_baseline(smoke_summary=""))
+    assert "### 模型自测冒烟" in text
+    assert "- （无冒烟记录）" in text

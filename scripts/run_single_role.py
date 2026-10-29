@@ -28,13 +28,16 @@ import time
 
 from sqlalchemy import select
 
+from ymir.artifacts.store import BASELINE_TYPE, ArtifactStore
 from ymir.bootstrap import build_execution_stack
+from ymir.common.errors import NotFoundError
 from ymir.common.logging import setup_logging
 from ymir.config import PROJECT_ROOT, get_settings, load_env_file
 from ymir.evaluation.harness import build_eval_harness
 from ymir.evaluation.report import TaskOut
 from ymir.evaluation.run_task import evaluate_run
-from ymir.models.entities import Message, ModelCall, StageExecution
+from ymir.gateway.usage import UsageRecorder
+from ymir.models.entities import DEFAULT_TENANT_ID, Message, ModelCall, StageExecution
 from ymir.models.enums import RunStatus
 from ymir.orchestrator.engine import OrchestrationEngine
 from ymir.roles.registry import RoleRegistry
@@ -100,11 +103,92 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_run_context(args: argparse.Namespace) -> dict[str, object]:
+async def resolve_baseline_ref(
+    store: ArtifactStore,
+    *,
+    project_id: str | None,
+    artifact_id: str,
+    version: int | None,
+) -> dict[str, object]:
+    """校验基线引用并返回**四字段**快照（与 ``POST /runs`` 的 ``_resolve_baseline`` 同形）。
+
+    ★ v1.3.1（T6.3-C）修复的裂缝：旧实现只写 ``{"artifact_id", "version"}``，而
+    「另存为新基线」端点要做**三方指纹比对**，缺 ``content_hash`` 直接 1003
+    ⇒ 头号能力在 CLI 入口上跑不通（只有走 API 才行）。``file_count`` 一并写入：
+    它是 ``BaselineContext`` 的既有字段，缺了提示词里「基线文件（共 N 个）」还得再查一次库。
+
+    只接受 ``type=baseline`` 产物；给了 ``project_id`` 时再校验**属于本项目**
+    （跨项目引用会让 ``store.load`` 与项目隔离自相矛盾，docs/09 §9-T2.2 ④）。
+    不给 ``project_id``（调试 / 外部校验脚本）时跳过跨项目那条，只打印一句提示 ——
+    不为对齐 API 在这里引入 repository 依赖。
+
+    Args:
+        store: 产物库（脚本里由 ``stack.artifact_store`` 提供）。
+        project_id: 本次 run 所属项目；``None`` = 调用方拿不到，跳过跨项目校验。
+        artifact_id: 基线产物 id。
+        version: 基线版本；``None`` = 取该产物最新版（与 ``POST /runs`` 同义）。
+
+    Returns:
+        ``{"artifact_id", "version", "content_hash", "file_count"}``。
+
+    Raises:
+        SystemExit: 产物不存在 / 不是基线 / 不属于本项目 —— 都是**用法错误**，
+            脚本以非零退出更直接（不引入 HTTP 业务码）。
+    """
+    try:
+        artifact, row = await store.get_version_meta(
+            artifact_id.strip(), version, tenant_id=DEFAULT_TENANT_ID
+        )
+    except NotFoundError as exc:
+        # v1.3.1（T6.3-C / QA-T63-01）：**不**在这里自己拼「基线不存在」——
+        # ``store.get_version_meta`` 已区分「产物不存在」与「产物版本不存在」
+        # 两种成因，压成一句会把版本号丢掉，逼人只去查 artifact_id。
+        # 与 ``api/routers/runs.py::_resolve_baseline`` 同口径（两入口答案必须一致）。
+        raise SystemExit(f"基线引用无效: {exc}") from exc
+    if artifact.type != BASELINE_TYPE:
+        raise SystemExit(
+            f"产物 {artifact_id} 不是基线（type={artifact.type}，应为 {BASELINE_TYPE}）"
+        )
+    if project_id is None:
+        print(f"[baseline] 跳过「属于本项目」校验（未提供 project_id）：{artifact_id}")
+    elif artifact.project_id != project_id:
+        raise SystemExit(f"基线 {artifact_id} 不属于本项目 {project_id}")
+    return {
+        "artifact_id": artifact.id,
+        "version": row.version,
+        "content_hash": row.content_hash,
+        "file_count": row.file_count,
+    }
+
+
+async def build_run_context(
+    args: argparse.Namespace,
+    store: ArtifactStore | None = None,
+    *,
+    project_id: str | None = None,
+) -> dict[str, object]:
     """构造 ``run.context``：模板与基线只放**引用快照**。
 
     与 ``src/ymir/api/routers/runs.py`` 的 ``POST /runs`` 保持同一形状：
     ``{"context_refs": [...], "template": {"id","version"}, "baseline": {...}}``。
+
+    ★ v1.3.1（T6.3-C）：``baseline`` 是**四字段**
+    （``artifact_id`` / ``version`` / ``content_hash`` / ``file_count``），由
+    :func:`resolve_baseline_ref` 从产物库取。旧实现只写前两个、却在这段 docstring 里
+    声称"与 POST /runs 同一形状" —— 那句话当时**不成立**，代价是提升端点拿不到
+    ``content_hash``、CLI 发起的增量 run 无法「另存为新基线」。
+
+    Args:
+        args: 命令行参数（用到 ``template_id`` / ``baseline_artifact_id`` /
+            ``baseline_version``）。
+        store: 产物库；**可以不给**（``None``）—— 不指定基线时根本不需要它。
+            指定了基线却拿不到 store ⇒ ``SystemExit``：宁可早失败，也不写半份
+            引用（少了 ``content_hash`` 的 baseline 会让产物永远提升不了）。
+        project_id: 本次 run 的项目；``None`` = 跳过跨项目校验（见
+            :func:`resolve_baseline_ref`）。
+
+    Raises:
+        SystemExit: 指定了基线但没有 store（缺 ``content_hash`` 就无从三方向比对）。
     """
     context: dict[str, object] = {"context_refs": []}
     if args.template_id:
@@ -112,12 +196,23 @@ def build_run_context(args: argparse.Namespace) -> dict[str, object]:
         context["template"] = {"id": spec.id, "version": spec.version}
         print(f"[template] 已加载 {spec.id} v{spec.version}")
     if args.baseline_artifact_id:
-        baseline: dict[str, object] = {"artifact_id": args.baseline_artifact_id}
-        if args.baseline_version is not None:
-            baseline["version"] = args.baseline_version
+        if store is None:
+            # 不静默少写两个字段：半份引用比报错更难查（提升时只会看到 1003）。
+            raise SystemExit(
+                "缺少产物库（store）：基线引用必须从版本行取 content_hash / file_count，"
+                "不能只手写 artifact_id + version（dry-run 请走 --dry-run，不走本函数）"
+            )
+        baseline = await resolve_baseline_ref(
+            store,
+            project_id=project_id,
+            artifact_id=args.baseline_artifact_id,
+            version=args.baseline_version,
+        )
         context["baseline"] = baseline
-        label = f"v{args.baseline_version}" if args.baseline_version else "latest"
-        print(f"[baseline] {args.baseline_artifact_id} {label}（增量模式）")
+        print(
+            f"[baseline] {baseline['artifact_id']} v{baseline['version']}"
+            f"（{baseline['file_count']} 文件，增量模式）"
+        )
     return context
 
 
@@ -253,8 +348,14 @@ async def print_report(session_factory, run_id: str, elapsed: float) -> None:
     print("=" * 72)
 
 
-def print_evaluation(outcome: TaskOut) -> None:
-    """打印四维分数 + 双门槛（**不是裁决**：verdict 仍由 QA 角色判定，L4 口径不变）。"""
+def print_evaluation(outcome: TaskOut, *, usage_line: str = "") -> None:
+    """打印四维分数 + 双门槛（**不是裁决**：verdict 仍由 QA 角色判定，L4 口径不变）。
+
+    Args:
+        outcome: 评测产出。
+        usage_line: 「合计（含 --evaluate）」那一行（v1.3.1 T4.3）；空 ⇒ 不打印
+            —— **未传 ``--evaluate`` 时输出与 v1.3 逐字节一致**。
+    """
     print("- 四维分数（确定性口径）")
     for dim in outcome.dimensions:
         print(f"  {dim.label} {dim.score:.2f} / 100（权重 {dim.weight:.2f}）")
@@ -275,6 +376,10 @@ def print_evaluation(outcome: TaskOut) -> None:
     if outcome.skipped_checks:
         print(f"  已跳过检查：{len(outcome.skipped_checks)} 条（环境缺失，不扣分）")
     print("  ⚠️ 该分数为附加信息，不参与 verdict（verdict 仍由 QA 角色判定）")
+    if usage_line:
+        # v1.3.1（T4.3）：`--evaluate` 自己也会调模型（judge / 语料分级），
+        # 上面「合计」是**执行阶段**口径，两者不能混叠 ⇒ 另起一行给含评测的口径。
+        print(usage_line)
     print("=" * 72)
 
 
@@ -291,6 +396,10 @@ async def run_main(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             print_dry_run(truncated)
+            if args.baseline_artifact_id:
+                # dry-run 不建 run、也不建 stack ⇒ 拿不到 store，取不出 content_hash。
+                # 这里只声明"没校验"，不当错误（演练本来就不该碰库）。
+                print("[baseline] 基线引用校验跳过（dry-run）")
             return 0
 
         stack = build_execution_stack(settings, session_factory)
@@ -303,7 +412,9 @@ async def run_main(args: argparse.Namespace) -> int:
         )
 
         project_id = await resolve_project(session_factory, args)
-        context = build_run_context(args)
+        # v1.3.1（T6.3-C）：传 store + project_id —— 基线引用要写成**四字段**
+        # （与 POST /runs 同形），否则提升端点缺 content_hash 无法三方比对。
+        context = await build_run_context(args, stack.artifact_store, project_id=project_id)
         async with session_factory() as session:
             run = await RunRepository(session).create(
                 project_id=project_id,
@@ -341,7 +452,17 @@ async def run_main(args: argparse.Namespace) -> int:
                 outcome = await evaluate_run(
                     harness, fresh_run, default_suite=args.suite
                 )
-                print_evaluation(outcome)
+                # v1.3.1（T4.3）：既有「合计：N 次调用 / tokens / ¥」是**执行阶段**
+                # 口径，刻意不动；这里补一行「含 --evaluate」的口径，
+                # 让"单跑 + 评测"的真实花费可核（两行并存，不混叠）。
+                totals = await UsageRecorder(session_factory).totals(run_id=run_id)
+                print_evaluation(
+                    outcome,
+                    usage_line=(
+                        f"  合计（含 --evaluate）：{totals.calls} 次调用 / "
+                        f"{totals.total_tokens} tokens / ¥{totals.cost_cny:.6f}"
+                    ),
+                )
         await orchestrator.shutdown()
         return 0 if final.status == RunStatus.COMPLETED.value else 1  # type: ignore[attr-defined]
     finally:

@@ -103,6 +103,40 @@ class BaselineUploadOut(BaseModel):
     size_bytes: int
 
 
+class BaselineMergeRequest(BaseModel):
+    """「以合入结果为新基线」请求（v1.3.1 T5.3，docs/13 §7.3-8）。
+
+    刻意**只收引用**（run / stage / 版本号），不接受任何文件正文：合入树由服务端按
+    产物内自描述的溯源**确定性重建**，客户端无法参与构造（否则等于绕过校验上传）。
+
+    ``stage_id`` / ``artifact_version`` 都可缺省：前者缺省 = "该 run 里产出了 ``code``
+    的最后一次成功阶段"（不按角色名硬编码）；后者缺省 = 该阶段记录里的那一版。
+    两者一起给，就是"重跑之后取历史版本"的场景。
+    """
+
+    run_id: str = Field(..., min_length=1, description="产生该增量产物的运行 id")
+    stage_id: str | None = Field(
+        default=None, description="阶段 id；缺省 = 该 run 中产出 code 的最后一次成功阶段"
+    )
+    artifact_version: int | None = Field(
+        default=None, ge=1, description="产物版本号；缺省 = 该阶段记录里的版本"
+    )
+
+
+class BaselineMergeOut(BaselineUploadOut):
+    """「以合入结果为新基线」响应（v1.3.1 §7.3-8）。
+
+    ★ **刻意继承** :class:`BaselineUploadOut` 而不是给基类加字段：
+    给基类加 ``reused`` 会让 ``POST /baselines`` 的响应 JSON 多出 ``"reused": false``
+    —— 那就是「未配置也变了字节」（A9）。
+
+    ``reused=True``：重建结果与当前基线最新版**内容相同**，未新建版本（幂等）。
+    HTTP 状态仍是 201（与既有基线端点一致），语义只靠该字段区分。
+    """
+
+    reused: bool = False
+
+
 class RunOut(BaseModel):
     """运行详情响应。"""
 

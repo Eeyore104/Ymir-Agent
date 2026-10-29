@@ -13,6 +13,13 @@ v1.1 增量（全部带缺省值，旧报告 JSON 缺字段仍可解析）：
   ``verdict_source``：报告追溯字段（R6 追溯纪律）；
 - ``executed`` / ``skipped`` 口径 + ``executed_count`` / ``skipped_count`` /
   ``first_pass_rate`` / ``final_pass_rate``（分母 0 时为 ``None``，不返回 0）。
+
+v1.3.1 增量（docs/13 §7.2.3，**全部纯增量、默认值即关闭**）：
+
+- ``BaselineCheckOut.skipped_reason`` / ``BaselineProbeOut.probe_mode``
+  （后者只在 ``skeleton_filled`` 时序列化，M7 ①）；
+- ``FailureAttributionOut`` + ``TaskOut.failure_attribution``（归因**提示**，
+  不参与 verdict / 分数 / ``regression``；``None`` ⇒ markdown 逐字节不变）。
 """
 
 from __future__ import annotations
@@ -22,8 +29,9 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
+from ymir.evaluation.baseline_probe import PROBE_MODE_SKELETON_FILLED
 from ymir.evaluation.evaluators.base import DIMENSION_LABELS, DIMENSION_ORDER, EvalScore
 from ymir.evaluation.suite import Thresholds
 
@@ -57,19 +65,41 @@ class EvidenceOut(BaseModel):
 
 
 class BaselineCheckOut(BaseModel):
-    """基线侧单条检查的执行明细（v1.3 T1.2）。"""
+    """基线侧单条检查的执行明细（v1.3 T1.2）。
+
+    ★ v1.3.1（T1.2）：只增 ``skipped_reason``，且按 ``patch_manifest`` 的同一纪律
+    「**非默认值才序列化**」—— 未跳过（``""``）时把键 pop 掉，使 v1.3 的
+    ``baseline_runnability.checks[]`` 正文**逐字节不变**（A9 红线）；
+    跳过的条目仍保留完整原因（``requires_file_missing:<path>``），信息不丢。
+    """
 
     command: str = ""
     exit_code: int | None = None
     timed_out: bool = False
     skipped: bool = False
     output: str = ""
+    #: 跳过原因（v1.3.1 T1.2）：唯一取值 ``requires_file_missing:<path>``；
+    #: 未跳过时为空串 ⇒ **该键不进 JSON**（旧正文逐字节一致）。
+    skipped_reason: str = ""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        """``skipped_reason == ""`` 时把键从 JSON 里摘掉（非默认值才序列化）。"""
+        data = handler(self)
+        if not data.get("skipped_reason"):
+            data.pop("skipped_reason", None)
+        return data
 
 
 class BaselineProbeOut(BaseModel):
     """``baseline_runnability`` 的报告形态（v1.3 T1.2，docs/11 §7.2.4）。
 
     ``status``：``healthy`` | ``unhealthy`` | ``skipped``（三态唯一口径）。
+
+    ★ v1.3.1（M7 ①）：``probe_mode`` **只在 ``skeleton_filled`` 时序列化** ——
+    其余取值（``""`` / ``"raw"``）下用 :func:`model_serializer` 把键 pop 掉。
+    这是**无损**表达：``probe_mode`` 不出现 = 「探针树 == 基线原样」，``raw`` 与
+    「v1.3 旧数据」在读者眼里是同一件事。由此守住 A9「未配置时报告 JSON 逐字节一致」。
     """
 
     status: Literal["healthy", "unhealthy", "skipped"] = "skipped"
@@ -79,6 +109,31 @@ class BaselineProbeOut(BaseModel):
     reason: str = ""
     duration_ms: int = 0
     cached: bool = False
+    #: 探针树口径（v1.3.1）：``""``（旧数据 / 基线原样）/ ``"skeleton_filled"``。
+    #: ``"raw"`` 内部存在但**不进报告**（与 ``""`` 等价）。
+    probe_mode: str = ""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        """非 ``skeleton_filled`` 时把 ``probe_mode`` 从 JSON 里摘掉（M7 ①）。"""
+        data = handler(self)
+        if data.get("probe_mode") != PROBE_MODE_SKELETON_FILLED:
+            data.pop("probe_mode", None)
+        return data
+
+
+class FailureAttributionOut(BaseModel):
+    """失败归因（v1.3.1 T2.2，docs/13 §7.2.3）。
+
+    ★ **这是归因提示，不是判据**：不参与 verdict、不参与分数、不参与 ``regression``。
+    """
+
+    verdict: Literal["pre_existing", "introduced", "mixed", "unknown"] = "unknown"
+    basis: str = ""
+    baseline_only_files: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+    shared_files: list[str] = Field(default_factory=list)
+    sample_markers: list[str] = Field(default_factory=list)
 
 
 class SkippedCheckOut(BaseModel):
@@ -155,6 +210,26 @@ class TaskOut(BaseModel):
     blocking_failed: list[str] = Field(default_factory=list)
     #: 环境缺失被跳过的检查（**不扣分、不阻断**）。
     skipped_checks: list[SkippedCheckOut] = Field(default_factory=list)
+    #: 失败归因（v1.3.1 T2.2）。**默认 ``None``** ⇒ 非增量 / 无失败 / 探针不可用
+    #: ⇒ markdown 与 v1.3 逐字节一致（不渲染任何归因行）。
+    #: ★ 归因是**提示**，不参与 verdict / 分数 / ``regression``。
+    failure_attribution: FailureAttributionOut | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        """``failure_attribution is None`` 时把键从 JSON 里摘掉（A9 红线）。
+
+        ★ 为什么是**模型级**序列化而不是单独的 ``to_json``：报告 JSON 的产出路径是
+        ``EvaluationReport.to_json() -> self.model_dump(mode="json")``，``TaskOut`` 是
+        **嵌套模型** —— 只有模型级 serializer 才能被这条路径走到（给 ``TaskOut`` 加一个
+        独立 ``to_json`` 方法则无人调用，等于没修）。
+        纪律与 ``patch_manifest`` 的「非默认值才序列化」同源：未配置时键**不存在**，
+        v1.3 的报告正文因此**逐字节不变**；有归因时键与值照常落盘。
+        """
+        data = handler(self)
+        if data.get("failure_attribution") is None:
+            data.pop("failure_attribution", None)
+        return data
 
     def model_post_init(self, __context: Any) -> None:
         """Q4 落点（v1.3）：阻断项失败 ⇒ 不可交付 ⇒ ``passed=False``。
@@ -477,7 +552,15 @@ def _incremental_health_lines(task: TaskOut) -> list[str]:
         label = status_labels.get(probe.status, probe.status)
         detail = f"基线检查：{label}"
         if probe.checks:
-            detail += f"，{len(probe.checks)} 条检查"
+            # v1.3.1（T1.2）：**跳过**的检查不能算进"跑了 N 条" —— 否则基线整份
+            # 因缺依赖文件跳过时会渲染成「未执行（baseline_incomplete），3 条检查」，
+            # 读起来像真的跑了 3 条。无 skipped 时输出与 v1.3 逐字节一致（A9）。
+            executed = sum(1 for item in probe.checks if not item.skipped)
+            skipped_count = len(probe.checks) - executed
+            if executed:
+                detail += f"，{executed} 条检查"
+            if skipped_count:
+                detail += f"，{skipped_count} 条因缺依赖文件跳过"
         if probe.cached:
             detail += "（缓存命中）"
         if probe.duration_ms:
@@ -493,6 +576,34 @@ def _incremental_health_lines(task: TaskOut) -> list[str]:
             for item in task.skipped_checks
         )
         lines.append(f"- 已跳过检查（不扣分）：{skipped}")
+    lines += _attribution_lines(task.failure_attribution)
+    return lines
+
+
+#: 归因四态的人读文案（**对齐口径唯一来源**：``evaluation.attribution``）。
+_ATTRIBUTION_LABELS: dict[str, str] = {
+    "pre_existing": "失败标记在基线里已存在（既有问题，非本次改动引入）",
+    "introduced": "失败标记由本次改动引入",
+    "mixed": "部分失败标记所在的文件既在基线有标记、又被本次改动（无法完全区分）",
+    "unknown": "依据不足，无法归因（不做猜测）",
+}
+
+
+def _attribution_lines(attribution: FailureAttributionOut | None) -> list[str]:
+    """失败归因行（v1.3.1 T2.2）：**空 ⇒ 返回空列表**（markdown 与 v1.3 逐字节一致）。
+
+    只输出 1–2 行：归因结论 + 基线自带失败的文件条数。刻意在文案里写死
+    「提示，不参与判定」，避免读者把归因当成 verdict 的依据。
+    """
+    if attribution is None:
+        return []
+    label = _ATTRIBUTION_LABELS.get(attribution.verdict, attribution.verdict)
+    basis = attribution.basis or "unknown"
+    lines = [f"- 失败归因（提示，不参与判定）：{label}（依据 {basis}）"]
+    if attribution.baseline_only_files:
+        lines.append(
+            f"- 基线自带失败标记的文件：{len(attribution.baseline_only_files)} 个"
+        )
     return lines
 
 

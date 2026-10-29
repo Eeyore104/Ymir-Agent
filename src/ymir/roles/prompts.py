@@ -51,6 +51,27 @@ _PATCH_ROLES = frozenset({"engineer"})
 #: 「增量模式」段里最多列出的基线路径条数（防提示词被大基线灌爆；超出只给条数）
 _MAX_BASELINE_PATHS_IN_PROMPT = 200
 
+# ---- v1.3.1（T4.2，docs/13 §7.3-5）：QA「基线已知事实」段的上限 ----
+
+#: 渲染「基线已知事实」段的角色（**仅 qa**；engineer 走 :data:`_PATCH_ROLES` 的另一段）。
+#:
+#: ★ 为什么只给 qa：engineer 是"动手改"的角色，它的上下文里已经有「增量模式」段
+#: （基线路径 + 改动面阈值）；再塞一份事实清单只会重复占预算。qa 才是"独立取证"的
+#: 角色，它需要的是**本项目这一版产物的事实**，而不是判词。
+_BASELINE_FACT_ROLES = frozenset({"qa"})
+
+#: 事实段里最多列出的基线文件条数（超出只给计数，不逐个列）
+_MAX_BASELINE_PATHS_IN_QA_PROMPT = 80
+
+#: 事实段里最多列出的「本次补丁改动」条数
+_MAX_CHANGED_PATHS_IN_QA_PROMPT = 40
+
+#: 事实段里最多列出的「骨架补缺」条数
+_MAX_SKELETON_PATHS_IN_QA_PROMPT = 20
+
+#: 冒烟事实摘要的字符上限（整段截断，防长输出灌爆提示词）
+_MAX_SMOKE_SUMMARY_CHARS = 400
+
 #: 列表/枚举值的连接符（中文顿号，避免与路径里的逗号混淆）
 _LIST_SEP = "、"
 
@@ -93,6 +114,11 @@ class PromptRenderer:
                 else 0.5
             )
             lines += _patch_lines(stage_input.baseline, threshold=threshold)
+
+        # v1.3.1（T4.2）：QA 的「## 基线已知事实」段 —— 紧跟 `_patch_lines` 之后
+        # （同一"基线相关"分组），条件不全满足时返回 [] ⇒ 不产生空标题。
+        if stage_input.baseline is not None and role.id in _BASELINE_FACT_ROLES:
+            lines += _baseline_fact_lines(stage_input.baseline)
 
         # 上游产物：先把「与上一版同名」的项过滤掉，**剩余非空才输出标题**
         # （否则修复轮会留下一个空的「## 上游产物」小节，往模型上下文里塞噪音）
@@ -410,6 +436,96 @@ def _patch_lines(baseline: BaselineContext, *, threshold: float = 0.5) -> list[s
         if len(paths) > len(shown):
             lines.append(f"- ……共 {len(paths)} 个，其余省略")
         lines.append("")
+    return lines
+
+
+def _baseline_fact_lines(baseline: BaselineContext) -> list[str]:
+    """QA 的「## 基线已知事实」段（v1.3.1 T4.2，docs/13 §7.3-5）。
+
+    **只给事实，不给判词**。四块内容：
+
+    1. 「基线文件（共 N 个，列前 80）」—— **明确写出省略了多少**（读者要能判断
+       "我看到的是全部还是节选"）；
+    2. 「骨架补缺（本次合并补进的模板文件）」≤20 条；
+    3. 「本次补丁改动（共 M 个文件）」≤40 条 + 省略计数；
+    4. 「模型自测冒烟」—— 只给 N 条命令 / K 条 exit=0 / 首个非 0 命令，整段
+       截断到 400 字符。
+
+    段末固定一行「以上为事实清单，不构成结论；请自行取证并给出证据链。」
+
+    Returns:
+        渲染行；**条件不全满足时返回 ``[]``**（不产生空标题）：
+        ``baseline.paths`` 与 ``baseline.patch_changed_paths`` 都为空
+        （= 既没有基线文件、也没有本次改动）时该段没有任何信息量。
+
+    ★ **刻意不渲染** ``baseline_runnability.status``：那是评测量尺算出来的中间
+    结论，写进 QA 上下文会诱导它直接抄判词，把「独立取证」变成「盖章」。
+    ★ 也刻意不渲染「通过 / 不通过」这类词：本段只描述**发生了什么**，
+    判定由 QA 自己下（用例断言：段内不含 ``判定`` / ``不通过`` / ``regression``）。
+    """
+    if not (baseline.paths or baseline.patch_changed_paths):
+        return []
+
+    lines: list[str] = ["## 基线已知事实", ""]
+
+    lines += _fact_block(
+        "基线文件",
+        list(baseline.paths),
+        limit=_MAX_BASELINE_PATHS_IN_QA_PROMPT,
+        show_listed=True,
+    )
+    lines += _fact_block(
+        "骨架补缺",
+        list(baseline.skeleton_added),
+        limit=_MAX_SKELETON_PATHS_IN_QA_PROMPT,
+        desc="本次合并补进的模板文件，",
+    )
+    lines += _fact_block(
+        "本次补丁改动",
+        list(baseline.patch_changed_paths),
+        limit=_MAX_CHANGED_PATHS_IN_QA_PROMPT,
+        unit="个文件",
+    )
+
+    summary = " ".join(str(baseline.smoke_summary or "").split())
+    if len(summary) > _MAX_SMOKE_SUMMARY_CHARS:
+        summary = summary[:_MAX_SMOKE_SUMMARY_CHARS] + TRUNCATED_MARK
+    lines += ["### 模型自测冒烟", "", f"- {summary or '（无冒烟记录）'}", ""]
+
+    lines += ["以上为事实清单，不构成结论；请自行取证并给出证据链。", ""]
+    return lines
+
+
+def _fact_block(
+    title: str,
+    items: list[str],
+    *,
+    limit: int,
+    desc: str = "",
+    unit: str = "个",
+    show_listed: bool = False,
+) -> list[str]:
+    """渲染一个「### 标题 + 条目清单（可截断）」块（含空清单的 ``（无）`` 占位）。
+
+    Args:
+        title: 块标题（``###`` 后紧跟的文字）。
+        items: 条目（路径清单，保序）。
+        limit: 最多列出多少条。
+        desc: 计数前的说明前缀（如「本次合并补进的模板文件，」）；空 ⇒ 直接「共 N 个」。
+        unit: 计数单位（``个`` / ``个文件``）。
+        show_listed: ``True`` ⇒ 标题里再写明「列前 K 个」（第 1 块的要求：
+            读者必须能看出自己看到的是节选）。
+    """
+    shown = items[:limit] if limit > 0 else []
+    counter = f"{desc}共 {len(items)} {unit}"
+    if show_listed:
+        counter += f"，列前 {len(shown)} 个"
+    lines: list[str] = [f"### {title}（{counter}）", ""]
+    lines += [f"- {item}" for item in shown] or ["- （无）"]
+    hidden = len(items) - len(shown)
+    if hidden > 0:
+        lines.append(f"- ……省略 {hidden} 个")
+    lines.append("")
     return lines
 
 

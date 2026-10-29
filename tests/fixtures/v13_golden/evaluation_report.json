@@ -1,0 +1,147 @@
+{
+  "suite_id": "default",
+  "suite_version": "1.0",
+  "project_id": "p",
+  "run_id": null,
+  "artifact_version": null,
+  "repair_round": null,
+  "verdict_source": "harness",
+  "generated_at": "2026-01-01T00:00:00+00:00",
+  "weights": {
+    "requirement_conformance": 0.3,
+    "runnability": 0.3,
+    "convention": 0.2,
+    "architecture": 0.2
+  },
+  "thresholds": {
+    "total": 75.0,
+    "runnability": 60.0
+  },
+  "tasks": [
+    {
+      "id": "t-eval-rich",
+      "scenario": "s",
+      "status": "evaluated",
+      "skip_reason": null,
+      "project_id": "p",
+      "run_id": "r",
+      "requirement": "加一个导出接口",
+      "artifact_ref": {
+        "artifact_id": "a1"
+      },
+      "dimensions": [
+        {
+          "name": "runnability",
+          "label": "可运行性",
+          "score": 100.0,
+          "weight": 0.3,
+          "rationale": "2/2 检查通过",
+          "evidence": [
+            {
+              "kind": "command",
+              "ref": "python -m pytest -q",
+              "detail": "2 passed"
+            }
+          ],
+          "cost_cny": 0.0,
+          "tokens": 0,
+          "degraded": false
+        }
+      ],
+      "total_score": 70.0,
+      "runnability": 100.0,
+      "passed": true,
+      "thresholds": {},
+      "wall_time_ms": 0,
+      "cost_cny": 0.0,
+      "tokens": 0,
+      "warnings": [
+        "基线不可用 → 分数与基线内运行不可比"
+      ],
+      "baseline_runnability": {
+        "status": "healthy",
+        "score": 100.0,
+        "passed": true,
+        "checks": [
+          {
+            "command": "python -m pytest -q",
+            "exit_code": 0,
+            "timed_out": false,
+            "skipped": false,
+            "output": "2 passed"
+          }
+        ],
+        "reason": "",
+        "duration_ms": 12,
+        "cached": false
+      },
+      "regression": false,
+      "regression_reason": "",
+      "blocking_failed": [],
+      "skipped_checks": []
+    },
+    {
+      "id": "t-eval-plain",
+      "scenario": "",
+      "status": "evaluated",
+      "skip_reason": null,
+      "project_id": null,
+      "run_id": null,
+      "requirement": "普通任务",
+      "artifact_ref": {},
+      "dimensions": [],
+      "total_score": 60.0,
+      "runnability": 50.0,
+      "passed": false,
+      "thresholds": {},
+      "wall_time_ms": 0,
+      "cost_cny": 0.0,
+      "tokens": 0,
+      "warnings": [],
+      "baseline_runnability": null,
+      "regression": false,
+      "regression_reason": "",
+      "blocking_failed": [],
+      "skipped_checks": []
+    },
+    {
+      "id": "t-skipped",
+      "scenario": "",
+      "status": "skipped",
+      "skip_reason": "未绑定产物",
+      "project_id": "p",
+      "run_id": null,
+      "requirement": "",
+      "artifact_ref": {
+        "artifact_id": null
+      },
+      "dimensions": [],
+      "total_score": 0.0,
+      "runnability": 0.0,
+      "passed": false,
+      "thresholds": {
+        "total": 75.0,
+        "runnability": 60.0
+      },
+      "wall_time_ms": 0,
+      "cost_cny": 0.0,
+      "tokens": 0,
+      "warnings": [],
+      "baseline_runnability": null,
+      "regression": false,
+      "regression_reason": "",
+      "blocking_failed": [],
+      "skipped_checks": []
+    }
+  ],
+  "total_score": 65.0,
+  "runnability": 75.0,
+  "passed": false,
+  "cost_cny": 0.0,
+  "total_tokens": 0,
+  "wall_time_ms": 1234,
+  "executed_count": 2,
+  "skipped_count": 1,
+  "first_pass_rate": 0.5,
+  "final_pass_rate": 0.5
+}
