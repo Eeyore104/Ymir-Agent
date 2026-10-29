@@ -1,0 +1,72 @@
+%% ymir-agent v1.3.1 时序图：以合入结果为新基线（POST /projects/{project_id}/baselines/from-merge）
+%% 十步与拒绝语义全在 promote_merged_to_baseline（纯数据进、纯数据出）；端点只取数 + 组装响应。
+
+sequenceDiagram
+    autonumber
+    participant U as 控制台_版本行
+    participant AC as ArtifactsRouter
+    participant PM as promote_merged_to_baseline
+    participant ST as ArtifactStore
+    participant MG as merge_trees_纯函数
+
+    Note over U,AC: 端点层（薄层）：只收引用（run / stage / 版本号），绝不收文件正文
+    U->>AC: POST /projects/{project_id}/baselines/from-merge {run_id, stage_id?, artifact_version?}
+    AC->>AC: 查项目 / Run（须属于该项目）/ 产出 code 的最后一次成功阶段 / 该版本产物（session）
+    alt 项目或 run 不存在 / run 不属于该项目 / 无 code 产物
+        AC-->>U: 1002 NotFoundError
+    else 取数成功
+        AC->>AC: run.context["baseline"] → base_ref（artifact_id@version，R9 铁律不取最新）
+        AC->>PM: promote_merged_to_baseline(store, project_id, artifact_id, version, base_ref, skeleton, template_id, template_hash, run_id)
+    end
+
+    Note over PM,ST: 十步：每一步都在下一步之前拒绝；体积上限在 store.save 之前
+    PM->>ST: ① load(artifact_id, version) → files
+    PM->>PM: ① parse_patch_manifest(files["patch_manifest.json"])
+    alt 无 manifest 或 manifest.mode != "patch"
+        PM-->>AC: 1001「该版本不是增量产物…请使用上传基线接口」
+    else mode == "patch"
+        PM->>PM: ② prov = manifest.provenance；再看 prov.missing() 的缺口
+    end
+    alt provenance 为 None / 有缺口
+        PM-->>AC: 1003「缺少合入溯源信息 / 溯源信息不完整」
+    end
+    PM->>ST: ③ _load_pinned_baseline(base_ref, prov)：按 artifact_id@version 钉住
+    alt 引用缺失 / 与溯源不一致 / content_hash 三方不等
+        PM-->>AC: 1003「基线引用与产物记录不一致 / 基线被替换或版本目录丢失」
+    end
+    PM->>PM: ④ strip_bookkeeping(files) 后算指纹，与 prov.patch_files_hash 比对
+    alt 不等
+        PM-->>AC: 1003「产物内容不完整（补丁文件指纹与记录不一致）」
+    end
+    PM->>PM: ⑤ template_id / template_hash 比对（模板 YAML 原始字节 sha256，改注释也算改）
+    alt 不等
+        PM-->>AC: 1003「模板已变更（a→b）…请用当前模板重新跑一次」
+        Note right of PM: 刻意写「模板文件有改动（含注释）」—— 写「版本变了」会让用户找不到原因
+    end
+    PM->>MG: ⑥ merge_trees(base, patch, mode="patch", skeleton, base_paths, deleted, max_file_bytes=max_file_bytes or 默认, symbol_deletions=prov.symbol_policy or "off")
+    alt 原 run 用 off（放行），而 manifest 被改成 reject
+        MG-->>PM: raise SymbolRegressionConflict(reason="symbol_regression")
+        PM-->>AC: 1003（防篡改方向：改成 ignore 则树不同 ⇒ ⑦ 同样拒绝）
+    else 参数与当时实际生效的一致
+        MG-->>PM: MergeResult（重建树）
+    end
+    PM->>PM: ⑦ merged_files_hash 比对（重建树必须等于当时评测树）
+    alt 不等
+        PM-->>AC: 1003「重建结果与当时评测树不一致（合并树指纹不符），拒绝据此新建基线」
+    end
+    PM->>PM: ⑧ 体积上限：文件数 ≤ max_files(300) 且字节 ≤ max_bytes(5 MB)
+    alt 超限
+        PM-->>AC: 1001「合并结果超出基线上限（N 文件 / M 字节）」
+        Note right of PM: 卡在 store.save 之前 —— 绝不落半成品基线
+    end
+    PM->>ST: ⑨ _find_same_latest(project_id, content_hash)
+    alt 已有同内容的最新基线
+        ST-->>PM: 既有版本
+        PM-->>AC: PromoteResult(reused=true, version=既有版本)
+        AC-->>U: 201 {…, reused: true}（幂等：连点两次不产出 vN+1）
+    else 无同内容版本
+        PM->>ST: ⑩ save(name="baseline", files=merged_files, message="from-merge: run=… base=vN (← code vM)")
+        ST-->>PM: SavedVersion
+        PM-->>AC: PromoteResult(reused=false, version=新版本)
+        AC-->>U: 201 {artifact_id, version, content_hash, file_count, size_bytes, reused: false}
+    end

@@ -1,0 +1,272 @@
+%% ymir-agent v1.3.1 类图（只画相对 v1.3 的增量与受影响类；基线类见 class-diagram-v1.3.mermaid）
+%% 上层包（rank 0/1）在上、内层（rank 5）在下；跨层只传纯数据。
+%% 每个名字都对着代码核过：模块 / 行号见 docs/13 §9.4 的逐条对照。
+
+classDiagram
+    direction TB
+
+    %% ---------------- templates（rank 2） ----------------
+    class ProtectedSpec {
+        +list~str~ paths
+        +str on_hit = reject
+        +float max_change_ratio = 0.5
+        +SymbolPolicy symbol_deletions = off
+    }
+    class CheckSpec {
+        +str run
+        +str group
+        +bool blocking = false
+        +str requires
+        +list~str~ requires_files
+        +float timeout_s = null
+    }
+    class Loader {
+        +load_template(id) TemplateSpec
+        +list_templates() list~TemplateEntry~
+        +_validate(spec, stem, known_roles) TemplateSpec
+    }
+
+    %% ---------------- common（rank 5，纯字面量口径） ----------------
+    class SymbolPolicy {
+        <<type alias Literal>>
+        off_默认不进入代码路径
+        reject_命中即抛冲突
+        ignore_丢弃模型内容保留基线版
+    }
+
+    %% ---------------- artifacts（rank 3，纯函数 + 异常 + 一个服务模块） ----------------
+    class MergeProvenance {
+        <<frozen dataclass>>
+        +str base_artifact_id
+        +int base_version
+        +str base_content_hash
+        +str patch_files_hash
+        +str template_id
+        +str template_hash
+        +str merged_files_hash
+        +str protected_policy
+        +str symbol_policy
+        +int max_file_bytes
+        +missing() tuple~str~
+        +to_dict() dict
+        +from_dict(payload) MergeProvenance
+    }
+    class PatchManifest {
+        +str mode
+        +MergeProvenance provenance
+        +PatchCounts counts
+        +list~ManifestConflict~ conflicts
+        +list~str~ warnings
+    }
+    class PatchCounts {
+        +int protected_hits
+        +int symbol_removals
+    }
+    class SymbolRemoval {
+        <<frozen dataclass>>
+        +str path
+        +tuple~str~ symbols
+    }
+    class Symbols {
+        <<module symbols>>
+        +detect_symbol_removals(base, patch, deleted, referenced_only) tuple~SymbolRemoval~
+    }
+    class ProtectedPathConflict {
+        <<v1.3 既有>>
+        +tuple~str~ paths
+        +str reason = protected_path
+    }
+    class SymbolRegressionConflict {
+        +str reason = symbol_regression
+    }
+    class Merge {
+        <<module merge>>
+        +merge_trees(base, patch, mode, skeleton, deleted, max_file_bytes, symbol_deletions, ...) MergeResult
+    }
+    class PromoteResult {
+        <<frozen dataclass>>
+        +str artifact_id
+        +int version
+        +str content_hash
+        +int file_count
+        +int size_bytes
+        +bool reused
+        +str source_artifact_id
+        +int source_version
+    }
+    class ManifestConflict {
+        +str path
+        +str reason
+    }
+    class Provenance {
+        <<module provenance>>
+        +promote_merged_to_baseline(store, project_id, artifact_id, version, base_ref, skeleton, template_id, template_hash, run_id, max_files, max_bytes, max_change_ratio) PromoteResult
+        +strip_bookkeeping(files) dict
+        +template_yaml_hash(templates_dir, template_id) str
+    }
+
+    %% ---------------- evaluation（rank 1） ----------------
+    class EvalCheck {
+        +str run
+        +str group
+        +list~str~ requires_files
+    }
+    class BuildProbeTree {
+        <<module function>>
+        +build_probe_tree(base_files, skeleton, reserved_paths, max_file_bytes) tuple
+    }
+    class BaselineProbe {
+        <<frozen dataclass>>
+        +str status
+        +str reason
+        +str probe_mode
+        +tuple~str~ skeleton_added
+        +bool healthy
+        +bool unhealthy
+    }
+    class Probe {
+        <<module baseline_probe>>
+        +probe_baseline(files, checks, sandbox_provider, cache_key, skeleton) BaselineProbe
+    }
+    class BaselineCheckOut {
+        +bool skipped
+        +str skipped_reason
+    }
+    class BaselineProbeOut {
+        +str status
+        +str probe_mode
+        +list~BaselineCheckOut~ checks
+    }
+    class FailureAttribution {
+        <<frozen dataclass>>
+        +AttributionVerdict verdict
+        +str basis
+        +tuple~str~ baseline_only_files
+        +tuple~str~ changed_files
+        +tuple~str~ shared_files
+        +tuple~str~ sample_markers
+    }
+    class Attribution {
+        <<module attribution>>
+        +attribute_failure(merged_failures, probe_outputs, probe_skipped_commands, changed_paths, probe_healthy) FailureAttribution
+    }
+    class FailureAttributionOut {
+        +str verdict
+        +str basis
+        +list~str~ baseline_only_files
+        +list~str~ changed_files
+        +list~str~ shared_files
+        +list~str~ sample_markers
+    }
+    class TaskOut {
+        +BaselineProbeOut baseline_runnability
+        +bool regression
+        +str regression_reason
+        +list~str~ blocking_failed
+        +FailureAttributionOut failure_attribution
+    }
+    class EvaluationHarness {
+        +evaluate_task(task, project_id, suite) TaskOut
+        -_regression(probe, runs) tuple
+        -_attribution(probe, runs, task) FailureAttribution
+    }
+
+    %% ---------------- roles（rank 2） ----------------
+    class BaselineContext {
+        +str artifact_id
+        +int version
+        +tuple~str~ paths
+        +tuple~str~ patch_changed_paths
+        +tuple~str~ skeleton_added
+        +str smoke_summary
+    }
+    class Prompts {
+        <<module prompts>>
+        +build_user(role, stage_input) str
+        +_baseline_fact_lines(baseline) list~str~
+    }
+
+    %% ---------------- orchestrator（rank 1） ----------------
+    class RoleStageExecutor {
+        +execute(run, stage, attempt) StageOutcome
+        -_baseline_facts(run, baseline, stage_input) BaselineContext
+        -_run_sandbox_smoke(run, output, files, template_spec) dict
+        -_apply_patch_contract(run, stage, stage_input, output, template_spec, base_files) tuple
+        -_attach_provenance(run, output, merged, base_files, template_spec, protected_policy, symbol_policy, max_file_bytes) MergeResult
+        -_protected_feedback(conflict) str
+    }
+    class SmokeTemplateChecks {
+        <<module function>>
+        +_smoke_template_checks(template_spec) list
+    }
+    class SummarizeSmoke {
+        <<module function>>
+        +_summarize_smoke(raw) str
+    }
+    class BuildProvenance {
+        <<module function>>
+        +_build_provenance(run, output, merged, base_files, template_spec, protected_policy, symbol_policy, max_file_bytes) MergeProvenance
+    }
+
+    %% ---------------- api（rank 0） ----------------
+    class BaselineUploadOut {
+        <<v1.2 既有>>
+        +str artifact_id
+        +int version
+        +str content_hash
+        +int file_count
+        +int size_bytes
+    }
+    class BaselineMergeRequest {
+        +str run_id
+        +str stage_id = null
+        +int artifact_version = null
+    }
+    class BaselineMergeOut {
+        +bool reused = false
+    }
+    class ArtifactsRouter {
+        <<module routers.artifacts>>
+        +promote_baseline_from_merge(project_id, payload) BaselineMergeOut
+    }
+
+    %% ---------------- 关系 ----------------
+    ProtectedSpec ..> SymbolPolicy : symbol_deletions 取值
+    Loader ..> ProtectedSpec : 校验 23（取值非法即拒）
+    CheckSpec --> EvalCheck : requires_files 透传（探针侧前置文件）
+    PatchManifest *-- MergeProvenance
+    PatchManifest *-- PatchCounts
+    PatchManifest *-- "0..n" ManifestConflict
+    Merge ..> ManifestConflict : ignore 策略记 reason=symbol_regression
+    Symbols ..> SymbolRemoval : 返回排序去重后的元组
+    Merge ..> Symbols : 同层调用纯函数
+    ProtectedPathConflict <|-- SymbolRegressionConflict : 继承（三段式零改动复用）
+    Merge ..> SymbolRegressionConflict : symbol_deletions=reject
+    Merge ..> SymbolPolicy
+    RoleStageExecutor ..> Merge : 调用纯函数（mode=patch + 骨架）
+    RoleStageExecutor ..> SymbolRegressionConflict : 捕获→按 reason 换回喂文案
+    RoleStageExecutor ..> SmokeTemplateChecks : 只取 frontend_build 组（≤2 条）
+    RoleStageExecutor ..> SummarizeSmoke : 压 smoke_report.json 为一行事实
+    RoleStageExecutor ..> BuildProvenance : _attach_provenance 组装溯源
+    Provenance ..> Merge : 重建用同一函数（mode=patch）
+    Provenance ..> MergeProvenance : 十步校验的唯一依据
+    Provenance ..> SymbolRegressionConflict : 篡改 symbol_policy 时抛
+    Provenance ..> PromoteResult
+    ArtifactsRouter ..> Provenance : 薄层（纯数据进、纯数据出）
+    ArtifactsRouter ..> BaselineMergeRequest
+    ArtifactsRouter ..> BaselineMergeOut
+    BaselineUploadOut <|-- BaselineMergeOut : 继承（不给基类加 reused）
+    BuildProbeTree ..> Merge : merge_trees(patch={}, mode=patch)
+    Probe ..> BuildProbeTree : probe_mode 只由它决定
+    Probe ..> BaselineProbe
+    EvaluationHarness ..> Probe : 传 skeleton（baseline_skeleton）
+    EvaluationHarness ..> TaskOut
+    EvaluationHarness ..> Attribution : _attribution（提示，不进 verdict）
+    TaskOut *-- BaselineProbeOut
+    BaselineProbeOut *-- "0..n" BaselineCheckOut
+    TaskOut *-- FailureAttributionOut
+    Attribution ..> FailureAttribution
+    FailureAttributionOut ..> FailureAttribution : 纯数据 → 报告形态
+    RoleStageExecutor ..> BaselineContext : 仅 qa 补三块事实
+    BaselineContext ..> Prompts : _baseline_fact_lines（≤80/20/40/400）
+    RoleStageExecutor ..> BaselineContext : _summarize_smoke 产 smoke_summary
