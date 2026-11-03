@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -53,6 +54,8 @@ from ymir.storage.repositories import (
 from ymir.templates import DEFAULT_TEMPLATES_DIR
 
 router = APIRouter(tags=["artifacts"])
+
+logger = logging.getLogger(__name__)
 
 #: 基线产物名（同项目内复用同名 artifact，多次上传即 v1 -> v2 -> …）。
 #:
@@ -421,6 +424,36 @@ async def promote_baseline_from_merge(
 
     base_ref = _promote_baseline_ref(run)
     skeleton, template_id, template_hash = _promote_template_ref(run)
+    # ---- v1.4 T2.1（docs/15 §3.2）：合并树健康度闸门 ----
+    # ★ 只**复用** run 已有的评测结论（``evaluation_report.json`` 里的
+    #   ``blocking_failed`` / ``regression``）⇒ 零额外沙箱调用。
+    # ★ 这里**不**现跑探针（``health_probe=None``）：HTTP 提升动作没有 run 级沙箱，
+    #   为一个低频只读动作临时起一个沙箱会话（最长 120s）不划算，且会在集成测试里
+    #   真的在宿主环境跑模板 checks。
+    # ★★ 因此 ``strict_health=True``（v1.4 QA 返修 P1-3）：拿不到结论 ⇒ 409
+    #   ``baseline_health_unknown``，``force=true`` 才放行并留痕。首版传 ``None``
+    #   探针 + "未知放行" ⇒ **不评测即可绕过整个闸门**（比没闸门更糟：给出已校验的错觉）。
+    # ★ ``tenant_id`` 必须透传（P2-4）：首版守默认值，非默认租户下闸门静默失效。
+    # ★★ ``artifact_version`` 必须透传（返修 3，P1）：报告只有**评过同一版树**
+    #   才算数；只按 ``run_id`` 匹配会把"另一版树的结论"当成这棵树的（判据串味）。
+    #   这里传的是**已解析的**版本（``payload.artifact_version`` 覆盖之后的值）——
+    #   与下面 ``promote_merged_to_baseline(version=artifact_version)`` 完全同一口径。
+    # ★ 返修 5（Q-R5-03）：还要绑定**产物身份** —— 同一 run 里"对别的产物（版本号
+    #   恰好相等）评测一次"不能给这棵树背书（返修 4 自己打开的口子，返修前是
+    #   fail-closed）。名称取自产物元数据；读不到就传 None（退化为"只绑版本"）。
+    try:
+        artifact_meta, _ = await store.get_artifact_detail(artifact_id, tenant_id=tenant_id)
+        artifact_name: str | None = str(getattr(artifact_meta, "name", "") or "") or None
+    except Exception:  # noqa: BLE001 - 附加守卫读不到名称时不该让提升 500
+        artifact_name = None
+    known_health = await _known_merged_health(
+        store,
+        project_id=project_id,
+        run_id=run.id,
+        tenant_id=tenant_id,
+        artifact_version=artifact_version,
+        artifact_name=artifact_name,
+    )
 
     result = await promote_merged_to_baseline(
         store,
@@ -435,6 +468,10 @@ async def promote_baseline_from_merge(
         max_files=settings.baseline_max_files,
         max_bytes=settings.baseline_max_bytes,
         tenant_id=tenant_id,
+        force=payload.force,
+        known_health=known_health,
+        health_probe=None,
+        strict_health=True,
     )
     return {
         "code": 0,
@@ -445,6 +482,7 @@ async def promote_baseline_from_merge(
             content_hash=result.content_hash,
             size_bytes=result.size_bytes,
             reused=result.reused,
+            warning=result.warning,
         ),
     }
 
@@ -545,3 +583,253 @@ def _promote_template_ref(run: PipelineRun) -> tuple[dict[str, str], str, str]:
     if not template_hash:
         raise NotFoundError(f"模板文件不可读: {template_id}.yaml")
     return dict(spec.skeleton_files()), template_id, template_hash
+
+
+# ------------------------------------------------- v1.4 T2.1：合并树健康度（★3 闸门）
+
+
+#: 评测报告产物名（与 ``api.routers.evaluations.REPORT_ARTIFACT_NAMES`` 同值）。
+#:
+#: 刻意复写而不 import：两个 router 互相 import 会形成环（``evaluations`` 也依赖
+#: ``artifacts`` 侧的助手），而这两个名字是**产物名契约**（``EvaluationReport.save``
+#: 的 ``name`` 参数），改动频率极低；两侧各有注释互指。
+_REPORT_ARTIFACT_NAMES: tuple[str, ...] = ("evaluation_report", "eval_verdict")
+
+#: 评测报告里装「合并树健康结论」的 JSON 正文名。
+_REPORT_JSON_NAME: str = "evaluation_report.json"
+
+#: 合并树健康度三态字面量（与 ``artifacts.provenance.HEALTH_*`` **同源**）。
+#:
+#: ★ 复写而不 import 的理由同上（本模块已 import 了 ``provenance`` 的部分名字，这两
+#: 个字面量刻意不 import 以免"看起来像契约"）：``api``(0) -> ``artifacts``(3) 是**顺**
+#: 层，技术上可以 import；但这两个值只在本文件的判定里用，复写更不易漂移（一处改动
+#: 就会同时被抓：``tests/test_baseline_promote.py::TestMergedHealthFromReport``）。
+_HEALTHY: str = "healthy"
+_UNHEALTHY: str = "unhealthy"
+
+
+def _report_health_status(
+    raw: str | None,
+    expected_version: int | None = None,
+    expected_artifact: str | None = None,
+) -> str:
+    """从 ``evaluation_report.json`` 正文里取**合并树**健康结论（坏数据 ⇒ ``""``）。
+
+    ★★ **v1.4 QA 返修 P0-1：方向反了，必须改口径。**
+    首版读的是报告里的 ``baseline_runnability.status``，但那个值探的是**基线**
+    （``evaluation/harness.py`` 里 ``_probe(task, base_files)``，``base_files`` 来自
+    ``_resolve_baseline(...)``）。等价于拿 ``health(B_N)`` 去判断 ``M_N``：
+
+    - 基线健康、合并树坏 ⇒ 放行坏树（正是 R-c1 的形态）；
+    - 基线坏、合并树好 ⇒ 误拦。
+    比没有闸门更糟：它给出"已校验"的错觉。
+
+    **合并树的结论就在同一份报告里**（``evaluation.report.TaskOut``）：
+
+    - ``blocking_failed`` 非空 ⇒ 阻断项失败 ⇒ ``unhealthy``；
+    - ``regression=True`` ⇒ 合并树比基线更差 ⇒ ``unhealthy``；
+    - 报告存在且两者都空 ⇒ ``healthy``。
+
+    ★★ **v1.4 返修 3（P1）：报告必须与**被提升的 artifact 版本**绑定。**
+    ``HarnessEvaluationGate.evaluate`` 评的是 artifact 的**当时最新版本**，而
+    ``_known_merged_health`` 原先只按 ``run_id`` 匹配 ⇒ 同一 run 的报告可能对应
+    **另一版树**（真跑 ``data/v14/INDEX.md`` §4.5：为 run ``29f52b8f`` 补评实际评了
+    code v4，而提升的是 v3）。用 v4 的结论去闸 v3 的树就是**判据串味**：v4 修好了
+    不代表 v3 能跑，v3 的结论也不该由 v4 的报告给出。
+
+    因此报告根部的 ``artifact_version``（``EvaluationReport.artifact_version``）必须
+    等于本次要提升的版本，否则一律按"拿不到结论"处理：
+
+    Args:
+        raw: 报告 JSON 正文（可空 / 可损坏）。
+        expected_version: 本次要提升的 artifact 版本；``None`` ⇒ 不做版本绑定
+            （只有"不知道提升哪一版"的调用方才该传 ``None``，HTTP 主路径恒传具体值）。
+        expected_artifact: 本次要提升的**产物名**；报告若声明了别的产物（
+            ``tasks[].artifact_ref.name``）⇒ 不采信（见 :func:`_report_artifact_matches`，
+            ``None`` ⇒ 不做产物绑定）。
+
+    Returns:
+        ``healthy`` / ``unhealthy`` / ``""``（拿不到结论 / 版本或产物不匹配）。
+
+    Note:
+        **绝不抛**：报告正文可能被人工改过 / 是旧版本格式。读不出来就返回 ``""``，
+        由调用方按 fail-closed（HTTP 主路径）或放行（探针路径）处置。
+        报告里**没有任何已评测任务**（空 ``tasks`` / 全是 ``skipped``）也算拿不到结论
+        —— "没评测"不等于"跑得好"。
+        报告**缺** ``artifact_version``（旧格式）同样按不匹配处理 —— **不猜**：
+        猜错的代价是"用别的树"的结论去放行坏树。
+    """
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if not _report_version_matches(payload, expected_version):
+        return ""
+    if not _report_artifact_matches(payload, expected_artifact):
+        return ""
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return ""
+    evaluated = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or "").strip().lower()
+        if status and status != "evaluated":
+            continue  # 跳过项没有跑过检查，不能拿它当"健康"的证据
+        evaluated += 1
+        blocking = task.get("blocking_failed")
+        if isinstance(blocking, list) and any(str(item or "").strip() for item in blocking):
+            return _UNHEALTHY
+        if task.get("regression") is True:
+            return _UNHEALTHY
+    return _HEALTHY if evaluated else ""
+
+
+def _report_artifact_matches(payload: dict[str, Any], expected_artifact: str | None) -> bool:
+    """报告若**声明了**评的是哪个产物，就必须与本次要提升的产物同名（``None`` ⇒ 不绑定）。
+
+    ★ 为什么需要（QA R5 `Q-R5-03`，P3）：返修 4 之后 API 报告带上了
+    ``artifact_version``，而 ``_known_merged_health`` 只按 ``(run_id, 版本号)`` 匹配 ——
+    于是"对**同 run 的另一个产物**（版本号恰好相等）评测一次"就能给这棵树背书：
+    对 ``prd`` v1 的 healthy 结论会被当成 ``code`` v1 的结论，坏代码树可**静默**提升
+    （无 ``force``、无 ``warning``）。返修 4 之前这条路是 fail-closed（版本恒 ``null``），
+    所以这是**本轮自己打开的口子**。
+
+    判据来源：真实报告天然带 ``tasks[].artifact_ref``（``harness._load_task`` 写入
+    ``{"artifact_id","name","version"}``）。**没声明不否决** —— 合成/手写夹具可能没有这
+    一栏，而"没写"不等于"别的产物"；一旦写了别的产物名，结论就不能给这棵树背书。
+    这条不作安全边界（本地产物本来就可人工改），只作"判据不串味"的守卫。
+    """
+    if not expected_artifact:
+        return True
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return True
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        ref = task.get("artifact_ref")
+        if not isinstance(ref, dict):
+            continue
+        name = str(ref.get("name") or "").strip()
+        if name and name != expected_artifact:
+            logger.warning(
+                "报告评测的产物不是本产物：report=%s promote=%s ⇒ 按未知处置",
+                name,
+                expected_artifact,
+            )
+            return False
+    return True
+
+
+def _report_version_matches(payload: dict[str, Any], expected_version: int | None) -> bool:
+    """报告的 ``artifact_version`` 是否等于本次要提升的版本（``None`` ⇒ 不绑定）。
+
+    ★ 缺失 / ``null`` / 非整数一律**不匹配**：旧格式报告没有这个字段，而"不猜"的
+    代价只是 fail-closed（409 + ``force`` 人工通道），猜错的代价是放行坏树。
+    """
+    if expected_version is None:
+        return True
+    raw_version = payload.get("artifact_version")
+    if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+        logger.warning(
+            "合并树健康报告缺少 artifact_version，无法绑定到 promote v%s ⇒ 按未知处置",
+            expected_version,
+        )
+        return False
+    if raw_version != expected_version:
+        logger.warning(
+            "报告版本不匹配：report=v%s promote=v%s ⇒ 按未知处置（避免用别的树的结论）",
+            raw_version,
+            expected_version,
+        )
+        return False
+    return True
+
+
+async def _known_merged_health(
+    store: Any,
+    *,
+    project_id: str,
+    run_id: str,
+    tenant_id: str,
+    artifact_version: int | None,
+    artifact_name: str | None,
+) -> str:
+    """复用**该 run 已有评测报告**里的**合并树**健康结论（零额外沙箱调用）。
+
+    设计口径是"优先复用 run 自身已有的结论"：评测阶段已经真的跑过（并记录了
+    ``blocking_failed`` / ``regression``），提升时再跑一遍纯属重复付费。
+
+    ★ **v1.4 QA 返修**三处：
+
+    - P0-1：判据换成 ``blocking_failed`` / ``regression``（见
+      :func:`_report_health_status`），不再读 ``baseline_runnability``；
+    - P2-4：``tenant_id`` 必须**透传**给 ``list_artifacts`` / ``load``。
+      首版守默认值 ⇒ 非默认租户下这里永远返回 ``""``（闸门静默失效）；
+    - **P1-A（第二次返修）**：**必须遍历报告产物的全部版本**。``EvaluationReport.save``
+      固定用 ``name="evaluation_report"``，``store.save`` 按 ``(project, name)`` 复用
+      artifact 递增版本 ⇒ 一个项目只有 **1 个** 报告 artifact、N 次评测 = N 版。
+      首版调 ``store.load(artifact.id)`` 不传版本 ⇒ 取 ``artifact.current_version``
+      （**最近一次**评测）⇒ 除最近一次外，任何 run 都拿不到自己的报告：
+      更早 run 每次提升都被迫 ``force``，且 reason 会说"没有健康结论"（把已经评测过、
+      结论是 unhealthy 的树指向"补评测"而不是"修代码"）。
+
+    ★ **返修 3（P1）：报告必须绑定到被提升的 ``artifact_version``。**
+    ``artifact_version`` 是**必填**关键字（不给默认 ``None``）：漏传等于闸门静默退回
+    "只看 run_id"的串味口径，且没有任何报错 —— 这类"忘传就失效"的参数不该有默认值。
+    同一 run 落了多份报告时，**从新到旧**找第一份"版本匹配且能给出结论"的；都不匹配
+    就返回 ``""``（fail-closed ⇒ 409 ``baseline_health_unknown``）。
+
+    ★ **返修 5（Q-R5-03）：``artifact_name`` 同样是必填关键字。**
+    只绑 ``run_id + 版本号`` 时，"对同 run 的**另一个产物**（版本号恰好相等）评测一次"
+    就能给这棵树背书（实测：``prd`` v1 的 healthy 结论被当成 ``code`` v1 的结论，
+    坏代码树静默提升）。``None`` 表示调用方确实不知道产物名（退化为只绑版本）。
+
+    Returns:
+        ``healthy`` / ``unhealthy`` / ``""``（拿不到 / 报告版本与被提升版本不匹配）。
+        **任何异常都降级成 ``""``** —— 这只是省成本的旁路，不能让 I/O 抖动变成 500。
+    """
+    try:
+        artifacts = await store.list_artifacts(project_id, tenant_id=tenant_id)
+    except Exception:  # noqa: BLE001 - 旁路：读不到就按"没结论"处置
+        return ""
+    for artifact in artifacts:
+        if str(getattr(artifact, "name", "")) not in _REPORT_ARTIFACT_NAMES:
+            continue
+        # ★ P1-A：拿**全部版本行**（含各自 ``run_id``），而不是只加载 current_version。
+        try:
+            _artifact, versions = await store.get_artifact_detail(
+                artifact.id, tenant_id=tenant_id
+            )
+        except Exception:  # noqa: BLE001 - 单个产物读不出来不影响其它候选
+            continue
+        matched = [
+            row for row in versions if str(getattr(row, "run_id", "") or "") == run_id
+        ]
+        if not matched:
+            # ★ 只认同一个 run 的报告：别的 run 的健康度与这棵树无关
+            #   （P2-6：这条判据必须有反向用例，否则"跨 run 串味"无测试守护；
+            #    P1-A 之后反向用例还必须断言"自己的看得到"，否则
+            #    "永远返回空"也能让隔离用例变绿）
+            continue
+        # ``list_versions`` 按版本号升序 ⇒ 同一 run 落了多份报告时**先看最新**那一版；
+        # 最新那版若是"别的 artifact 版本"的报告（返修 3 的串味形态），继续往旧版找。
+        for version_row in reversed(matched):
+            try:
+                loaded = await store.load(
+                    artifact.id, int(version_row.version), tenant_id=tenant_id
+                )
+            except Exception:  # noqa: BLE001 - 单个版本读不出来不影响其它候选
+                continue
+            status = _report_health_status(
+                loaded.files.get(_REPORT_JSON_NAME), artifact_version, artifact_name
+            )
+            if status:
+                return status
+    return ""

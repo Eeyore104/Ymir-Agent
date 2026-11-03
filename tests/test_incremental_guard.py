@@ -1888,3 +1888,77 @@ class TestQaBaselineFacts:
         run = SimpleNamespace(id=run_id, project_id=project_id, context={})
         await executor.execute(run=run, stage=stage, attempt=1)
         return runtime.inputs[0].baseline
+
+
+# ==================================================== v1.4 · T3.1 skeleton_filled 真跑形态
+
+
+class TestSkeletonFilledRealTemplate:
+    """W3（docs/15 §3.3 / A5）：**真实** fastapi 模板树缺一个骨架文件 ⇒ 真走补齐分支。
+
+    v1.3.1 之前 ``skeleton_filled`` 只有纯函数级证据：两个真跑基线都含全部骨架，
+    一律走 ``raw`` 短路（``build_probe_tree`` 的 ``all(path in base ...)`` 分支）。
+    这里用**仓库里真实的** ``fastapi-vue3`` 模板造一份"缺 ``ruff.toml``"的基线，
+    把那条从未被真实数据触发的分支钉住。
+    """
+
+    @staticmethod
+    def _tree_without_ruff() -> tuple[dict[str, str], dict[str, str]]:
+        """「真实生成产物」形态：模板骨架 + 一点业务代码，然后裁掉 ``ruff.toml``。"""
+        spec = load_template("fastapi-vue3")
+        skeleton = dict(spec.skeleton_files())
+        assert "ruff.toml" in skeleton  # 前提：模板真的带这个骨架
+        tree = dict(skeleton)
+        tree["app/tasks.py"] = "def list_tasks() -> list[str]:\n    return []\n"
+        del tree["ruff.toml"]
+        return tree, skeleton
+
+    def test_missing_ruff_is_filled_and_mode_is_skeleton_filled(self) -> None:
+        """缺骨架 ⇒ ``skeleton_filled`` + ``skeleton_added == ("ruff.toml",)``。"""
+        tree, skeleton = self._tree_without_ruff()
+
+        filled, mode, added = build_probe_tree(tree, skeleton)
+
+        assert mode == PROBE_MODE_SKELETON_FILLED
+        assert added == ("ruff.toml",)
+        # 补进来的就是模板骨架原文（不是空文件、不是猜测内容）
+        assert filled["ruff.toml"] == skeleton["ruff.toml"]
+        # 其余文件逐字节不变（补齐只做加法）
+        assert {path: body for path, body in filled.items() if path != "ruff.toml"} == tree
+        # 入参不被就地修改（纯函数纪律）
+        assert "ruff.toml" not in tree
+        # 与合并树同一条优先级表：等于 merge_trees(mode="patch", patch={}) 的结果
+        assert filled == merge_trees(
+            tree, {}, mode="patch", skeleton=skeleton, base_paths=frozenset(tree)
+        ).files
+
+    async def test_ruff_check_runs_on_the_filled_tree(self) -> None:
+        """补齐后的树上**真的执行**该检查（不是把"缺文件"糊过去）。"""
+        tree, skeleton = self._tree_without_ruff()
+        spec = load_template("fastapi-vue3")
+        checks = [
+            EvalCheck(run=check.run, weight=check.weight)
+            for check in spec.checks
+            if check.run.startswith("ruff check")
+        ]
+        assert checks, "fastapi 模板必须带 ruff 检查"
+
+        provider = _ScriptedProvider()
+        probe = await probe_baseline(
+            files=tree,
+            checks=checks,
+            sandbox_provider=provider,
+            skeleton=skeleton,
+        )
+
+        assert probe.probe_mode == PROBE_MODE_SKELETON_FILLED
+        assert probe.skeleton_added == ("ruff.toml",)
+        # 沙箱里写的是**补齐后**的树：ruff.toml 在，且内容就是模板骨架
+        written = provider.sessions[0].files
+        assert written["ruff.toml"] == skeleton["ruff.toml"]
+        assert "app/tasks.py" in written
+        # 检查真的跑了（有 exit_code、不是 skipped）且通过
+        assert probe.status == BASELINE_HEALTHY
+        assert probe.checks[0].skipped is False
+        assert probe.checks[0].exit_code == 0
+        assert checks[0].run in provider.sessions[0].executed

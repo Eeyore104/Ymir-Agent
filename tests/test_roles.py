@@ -30,7 +30,7 @@ from ymir.roles import (
 )
 from ymir.roles.io import RepairContext, StageOutput
 from ymir.roles.prompts import TRUNCATED_MARK, truncate_check_outputs
-from ymir.roles.schemas import PRDDocument
+from ymir.roles.schemas import CodeBundle, PRDDocument
 from ymir.sop.models import StageSpec
 from ymir.storage.repositories import ProjectRepository, RunRepository
 from ymir.tools import build_code_files, build_document_files, read_artifacts
@@ -714,3 +714,55 @@ def test_repair_context_is_package_exported() -> None:
     context = ExportedRepairContext(repair_round=1, max_rounds=2, directive="只改失败项")
     assert context.max_detail_chars == 1200  # 缺省与 RepairContextSpec 一致
     assert context.failed_checks == []
+
+
+class TestCodeMetaSampleMarkers:
+    """v1.4 · T4.2（docs/15 §3.4 / A6 后半）：``code.json`` 记账 ``sample_markers``。
+
+    证据链原本断在产物侧：归因标记只出现在 ``evaluation_report.json``，打开代码产物
+    看不到"这次失败落在哪几行"。这里把"记账"的字节纪律钉住：
+    **空 ⇒ 键不存在（与 v1.3.1 逐字节一致，红线 A9）；非空 ⇒ 保序去重地写进去。**
+    """
+
+    @staticmethod
+    def _bundle() -> CodeBundle:
+        return CodeBundle.model_validate(json.loads(CODE_JSON))
+
+    def test_empty_markers_keep_meta_byte_identical(self) -> None:
+        """不传 / 传空 ⇒ ``code.json`` 与 v1.3.1 **逐字节相同**（A9）。"""
+        bundle = self._bundle()
+        plain = build_code_files(bundle, name="code")
+        empty_list = build_code_files(bundle, name="code", sample_markers=[])
+        empty_none = build_code_files(bundle, name="code", sample_markers=None)
+
+        assert plain["code.json"] == empty_list["code.json"] == empty_none["code.json"]
+        assert "sample_markers" not in json.loads(plain["code.json"])
+
+    def test_markers_are_recorded_in_order_and_deduplicated(self) -> None:
+        """非空 ⇒ 记账（保序、去重、剔除空串），其它字段与正文纪律不变。"""
+        bundle = self._bundle()
+        plain = build_code_files(bundle, name="code")
+        with_markers = build_code_files(
+            bundle,
+            name="code",
+            sample_markers=["app/api.py:3", "  ", "app/api.py:3", "tests/test_api.py::test_x"],
+        )
+
+        meta = json.loads(with_markers["code.json"])
+        assert meta["sample_markers"] == ["app/api.py:3", "tests/test_api.py::test_x"]
+        # 记账是**唯一**差别：其它键与代码正文一字不改
+        assert meta["run_commands"] == ["python main.py"]
+        assert meta["files"] == ["main.py"]
+        assert with_markers["main.py"] == plain["main.py"]
+        assert with_markers["code.json"].endswith("\n")
+        # 元数据仍是一份合法 JSON（前端按 JSON 解析）
+        assert json.loads(with_markers["code.json"])["notes"] == "最小示例"
+
+    def test_accepts_single_string_and_garbage_without_raising(self) -> None:
+        """记账是旁路：入参形态不对也**绝不抛**（降级成"不记"或"记一条"）。"""
+        bundle = self._bundle()
+        one = build_code_files(bundle, name="code", sample_markers="app/api.py:3")
+        assert json.loads(one["code.json"])["sample_markers"] == ["app/api.py:3"]
+
+        garbage = build_code_files(bundle, name="code", sample_markers=42)
+        assert "sample_markers" not in json.loads(garbage["code.json"])

@@ -17,10 +17,26 @@ import {
   canPromote,
   isPromotableArtifact,
   parsePromoteManifest,
+  BASELINE_HEALTH_UNKNOWN_REASON,
+  BASELINE_UNHEALTHY_REASON,
+  FORCE_PROMOTE_LABEL,
+  HEALTH_UNKNOWN_CONFIRM_TITLE,
+  HEALTH_UNKNOWN_CONFIRM_WARNING,
+  PROMOTED_UNHEALTHY_CODE,
+  PROMOTED_UNKNOWN_CODE,
+  STATE_CONFLICT_CODE,
+  UNHEALTHY_CONFIRM_TITLE,
+  UNHEALTHY_CONFIRM_WARNING,
+  forceConfirmReason,
+  forceConfirmTitle,
+  forceConfirmWarning,
   promoteConfirmLines,
   promoteErrorText,
   promoteResultText,
+  promoteWarningText,
+  requiresForceConfirm,
   shortRunId,
+  withForce,
 } from '@/utils/promoteBaseline'
 
 /** 真实形态的 ``patch_manifest.json`` 正文（带合入溯源五元组 + 合并树指纹 + 生效策略）。 */
@@ -147,5 +163,145 @@ describe('utils/promoteBaseline', () => {
 
     // 按钮禁用的提示文案与后端"该版本无关联运行"口径一致
     expect(PROMOTE_DISABLED_HINT).toBe('该版本无关联运行')
+  })
+})
+
+/**
+ * v1.4 T2.2（docs/15 §3.2 / A3）：★3 闸门的前端配合。
+ *
+ * 三件事必须成立，且都断言**具体文案/字段**（不只断言"没抛"）：
+ * ① 只有「1003 + ``details.reason`` ∈ {unhealthy, health_unknown}」才算"需要强制确认"
+ *    （其它 1003 不能越；**不靠** ``message`` 里找 ``force`` —— v1.4 返修 P1-3）；
+ * ② 带 force 的请求体是**新对象**，原请求体不被改写；
+ * ③ 留痕短码出现时必须给出显著提示（不静默），且两种短码的文案不同，没出现时返回空串。
+ */
+describe('utils/promoteBaseline · unhealthy 闸门（v1.4 T2.2）', () => {
+  const PAYLOAD = {
+    run_id: 'run-abcdef123456',
+    stage_id: 'coding',
+    artifact_version: 3,
+  }
+
+  it('forceConfirmReason / requiresForceConfirm：只认「1003 + details.reason」', () => {
+    // 服务端闸门拒绝：reason 决定一切（文案随便写都不影响判定）
+    expect(
+      requiresForceConfirm({
+        code: STATE_CONFLICT_CODE,
+        message: '合并树存在阻断项失败（blocking_failed）或相对基线出现回归（regression）：…',
+        details: { reason: BASELINE_UNHEALTHY_REASON, status: 'unhealthy' },
+      }),
+    ).toBe(true)
+    expect(
+      forceConfirmReason({
+        code: STATE_CONFLICT_CODE,
+        message: '该运行还没有可用的合并树健康结论（评测报告缺失或不可读）…',
+        details: { reason: BASELINE_HEALTH_UNKNOWN_REASON, status: 'unknown' },
+      }),
+    ).toBe(BASELINE_HEALTH_UNKNOWN_REASON)
+
+    // ★ 文案里**没有** force 也照样是闸门（旧实现靠 message.includes('force') ⇒ 会漏）
+    expect(
+      requiresForceConfirm({
+        code: STATE_CONFLICT_CODE,
+        message: '合并树不健康，拒绝提升',
+        details: { reason: BASELINE_UNHEALTHY_REASON },
+      }),
+    ).toBe(true)
+
+    // 其它 1003（指纹不符 / 缺溯源 / 模板已变更）**不能**用 force 越过
+    expect(
+      requiresForceConfirm({
+        code: STATE_CONFLICT_CODE,
+        message: '重建结果与当时评测树不一致（合并树指纹不符），拒绝据此新建基线',
+      }),
+    ).toBe(false)
+    expect(
+      requiresForceConfirm({
+        code: STATE_CONFLICT_CODE,
+        message: '模板已变更，请用当前模板重新跑一次',
+        details: { reason: 'template_changed' },
+      }),
+    ).toBe(false)
+    // 别的业务码即使 reason 命中也不算（force 越不过 1001）
+    expect(
+      requiresForceConfirm({
+        code: 1001,
+        message: '请带 force=true 重试',
+        details: { reason: BASELINE_UNHEALTHY_REASON },
+      }),
+    ).toBe(false)
+    // 非对象 / 空值 / 坏 details 一律 false（绝不抛）
+    expect(requiresForceConfirm(null)).toBe(false)
+    expect(requiresForceConfirm('force')).toBe(false)
+    expect(requiresForceConfirm(new Error('boom'))).toBe(false)
+    expect(requiresForceConfirm({ code: STATE_CONFLICT_CODE, details: 'unhealthy' })).toBe(false)
+  })
+
+  it('forceConfirmWarning / forceConfirmTitle：按 reason 分支，两种处境不共用文案', () => {
+    expect(forceConfirmTitle(BASELINE_UNHEALTHY_REASON)).toBe(UNHEALTHY_CONFIRM_TITLE)
+    expect(forceConfirmTitle(BASELINE_HEALTH_UNKNOWN_REASON)).toBe(
+      HEALTH_UNKNOWN_CONFIRM_TITLE,
+    )
+    expect(forceConfirmWarning(BASELINE_HEALTH_UNKNOWN_REASON)).toBe(
+      HEALTH_UNKNOWN_CONFIRM_WARNING,
+    )
+    // 两条文案必须**不同**（"评测说它坏了" ≠ "没有评测说它好"）
+    expect(HEALTH_UNKNOWN_CONFIRM_WARNING).not.toBe(UNHEALTHY_CONFIRM_WARNING)
+    expect(HEALTH_UNKNOWN_CONFIRM_WARNING).toContain('没有可用')
+    // 没有原因 ⇒ 空串（调用方不渲染）
+    expect(forceConfirmWarning(null)).toBe('')
+    expect(forceConfirmTitle(null)).toBe('')
+  })
+
+  it('withForce：返回 force=true 的新对象，原请求体不被改写', () => {
+    const forced = withForce(PAYLOAD)
+
+    expect(forced.force).toBe(true)
+    expect(forced.run_id).toBe(PAYLOAD.run_id)
+    expect(forced.stage_id).toBe('coding')
+    expect(forced.artifact_version).toBe(3)
+    // 纯函数：入参一个字节都没变（少一个 force 键）
+    expect(Object.prototype.hasOwnProperty.call(PAYLOAD, 'force')).toBe(false)
+  })
+
+  it('promoteWarningText：两种留痕码各自成句，未出现时返回空串', () => {
+    expect(PROMOTED_UNHEALTHY_CODE).toBe('baseline_promoted_unhealthy:1')
+    expect(PROMOTED_UNKNOWN_CODE).toBe('baseline_promoted_unknown:1')
+
+    const created = promoteWarningText({
+      reused: false,
+      version: 4,
+      warning: PROMOTED_UNHEALTHY_CODE,
+    })
+    expect(created).toContain('强制提升不健康的合并树')
+    expect(created).toContain('v4')
+
+    // 幂等命中（未新建版本）也要说清，且不编造版本号
+    const reused = promoteWarningText({
+      reused: true,
+      version: 4,
+      warning: PROMOTED_UNHEALTHY_CODE,
+    })
+    expect(reused).toContain('未新建版本')
+
+    // ★ 未知态留痕的文案必须与不健康**分开**（否则用户分不清该修代码还是补评测）
+    const unknown = promoteWarningText({
+      reused: false,
+      version: 5,
+      warning: PROMOTED_UNKNOWN_CODE,
+    })
+    expect(unknown).toContain('没有健康结论')
+    expect(unknown).toContain('v5')
+    expect(unknown).not.toBe(created)
+
+    // 没有降级 ⇒ 空串（调用方据此走常规成功提示）
+    expect(promoteWarningText({ reused: false, version: 4 })).toBe('')
+    expect(promoteWarningText({ reused: false, version: 4, warning: 'other:warn' })).toBe('')
+  })
+
+  it('UNHEALTHY_CONFIRM_WARNING / FORCE_PROMOTE_LABEL：文案说清后果与出口', () => {
+    expect(UNHEALTHY_CONFIRM_WARNING).toContain('不健康')
+    expect(UNHEALTHY_CONFIRM_WARNING).toContain('污染后续基线')
+    expect(FORCE_PROMOTE_LABEL).toContain('force')
   })
 })

@@ -29,6 +29,7 @@ from ymir.evaluation.attribution import (
     MAX_SAMPLE_MARKERS,
     CommandOutput,
     attribute_failure,
+    is_installed_path,
 )
 
 #: 基线侧 ruff 输出：5 条错误，全部落在基线自带的 ``app/storage.py``。
@@ -398,3 +399,81 @@ def test_command_name_whitespace_is_normalized() -> None:
     assert result.basis == BASIS_MARKER_DELTA
     assert result.baseline_only_files == ("app/storage.py",)
     assert result.sample_markers[0] == "app/storage.py:5"
+
+
+# ================================================ ⑥ v1.4 · T4.1 安装目录噪声必须滤除
+
+
+#: 合并树侧 ruff 输出：项目内新增 1 条 + **安装目录**里的 3 条噪声。
+RUFF_MERGED_WITH_STDLIB_NOISE = (
+    "app/api.py:3:1: F401 'httpx' imported but unused\n"
+    "/usr/lib/python3.12/site-packages/httpx/_client.py:77:1: F401 'typing' imported but unused\n"
+    "/usr/local/lib/python3.12/dist-packages/requests/api.py:12:1: E501 Line too long\n"
+    "C:/Python312/Lib/site-packages/anyio/_core.py:9:1: F401 'os' imported but unused\n"
+)
+
+
+def test_installed_paths_are_dropped_from_samples_and_delta() -> None:
+    """安装目录标记**既不进 sample_markers，也不参与差集**（A6 前半）。"""
+    result = attribute_failure(
+        merged_failures=[
+            CommandOutput(command=RUFF_COMMAND, output=RUFF_MERGED_WITH_STDLIB_NOISE)
+        ],
+        probe_outputs=[CommandOutput(command=RUFF_COMMAND, output="")],
+        changed_paths=["app/api.py"],
+    )
+
+    assert result.verdict == ATTRIBUTION_INTRODUCED
+    assert result.sample_markers == ("app/api.py:3",)
+    assert all("site-packages" not in item for item in result.sample_markers)
+    assert all("dist-packages" not in item for item in result.sample_markers)
+    # 项目内路径必须保留（否则归因会把真问题当噪声丢掉）
+    assert result.changed_files == ("app/api.py",)
+    assert result.baseline_only_files == ()
+
+
+def test_installed_noise_does_not_hide_pre_existing_verdict() -> None:
+    """只有噪声时不得凭空产生 ``introduced``：两侧都只剩项目内标记 ⇒ 各有归属。"""
+    result = attribute_failure(
+        merged_failures=[
+            CommandOutput(
+                command=RUFF_COMMAND,
+                output=(
+                    "app/storage.py:5:1: F401 'os' imported but unused\n"
+                    "/usr/lib/python3.12/site-packages/x/y.py:1:1: F401 'z' imported but unused\n"
+                ),
+            )
+        ],
+        probe_outputs=[
+            CommandOutput(
+                command=RUFF_COMMAND,
+                output="app/storage.py:5:1: F401 'os' imported but unused\n",
+            )
+        ],
+        changed_paths=["app/other.py"],
+    )
+    assert result.verdict == ATTRIBUTION_PRE_EXISTING
+    assert result.sample_markers == ("app/storage.py:5",)
+    assert result.shared_files == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "noise"),
+    [
+        ("/usr/lib/python3.12/site-packages/pkg/mod.py", True),
+        ("/usr/local/lib/python3.11/dist-packages/pkg/mod.py", True),
+        ("C:/Python312/Lib/site-packages/pkg/mod.py", True),
+        ("C:/Python312/Lib/mod.py", True),
+        ("/usr/lib/python3.12/mod.py", True),
+        ("site-packages/pkg/mod.py", True),
+        # ★ 相对路径里的 lib/ 是**用户代码**，不能误伤（误伤的后果是把真问题丢掉）
+        ("lib/utils.py", False),
+        ("app/main.py", False),
+        ("tests/test_api.py", False),
+        ("web/src/App.vue", False),
+        ("", False),
+    ],
+)
+def test_is_installed_path_scope(path: str, noise: bool) -> None:
+    """``is_installed_path`` 的判定面：安装目录为真、项目内相对路径为假。"""
+    assert is_installed_path(path) is noise

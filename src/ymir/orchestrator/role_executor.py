@@ -337,10 +337,16 @@ class RoleStageExecutor:
         ★ v1.3.1（T3.2 / M3）：「符号删除」冲突走**同一套**三段式（
         :class:`SymbolRegressionConflict` 继承 :class:`ProtectedPathConflict`，
         上面那个 ``except`` 零改动复用），但第三段必须**同时**把
-        ``symbol_deletions`` 从 ``reject`` 降为 ``ignore`` —— 否则第二次
+        ``symbol_deletions`` 从 ``reject`` 降级 —— 否则第二次
         ``_apply_patch_contract` 会再次抛出且无人捕获。回喂文案按 ``reason``
         分支（:func:`_protected_feedback`，M2）：删了符号却被告知"请新建文件"
         会把模型推向"新建空壳 + 入口留空"，比不拦更糟。
+
+        ★★ v1.4（T1.1/T1.2，docs/15 §3.1）：第三段的降级目标从 ``ignore`` 改成
+        ``revert`` —— ``ignore`` 是**整文件回退**，会把模型在同一个 ``.py`` 里的
+        正当重构一起吃掉；``revert`` 只把「被删且仍被引用」的公共顶层符号搬回该文件，
+        其余编辑保留。二者都由 ``merge_trees`` 的 ``symbol_deletions`` 承担，
+        编排层只换那个字面量（一处），**不改** ``_apply_patch_contract`` 的任何逻辑。
 
         Returns:
             ``(stage_output, merge_result, protected_retry)``。
@@ -442,7 +448,12 @@ class RoleStageExecutor:
             # ``SymbolRegressionConflict`` 且此处无人捕获 ⇒ 阶段异常。
             # 只有声明 ``reject`` 才降级：声明 ``off`` 时**不得**擅自开启检测
             # （否则"未配置 ⇒ 行为与 v1.3 一致"立刻破功）。
-            fallback_symbols = "ignore" if symbol_policy == "reject" else symbol_policy
+            # ★★ v1.4（T1.2，docs/15 §3.1）：降级目标从 ``ignore`` 改成 ``revert``。
+            #   ``ignore`` 的语义是「丢弃模型内容、保留基线版本」⇒ **整文件回退**，
+            #   模型在同一个 ``.py`` 里的正当重构会被一起吃掉（docs/14 §3.2-★2，
+            #   v1.3.1 真跑 R-b / R-c1 / R-c2 三个 run 全部命中）。``revert`` 只把
+            #   「被删且仍被引用」的公共顶层符号搬回来，其余编辑原样保留。
+            fallback_symbols = "revert" if symbol_policy == "reject" else symbol_policy
             merged = self._apply_patch_contract(
                 combined,
                 template_spec=template_spec,

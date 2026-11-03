@@ -30,6 +30,19 @@
 - ``change_ratio`` / ``warnings`` 只进 manifest，**不改变** ``files``；
 - ``manifest_json()`` 采「非默认值才序列化」，未触发新能力时与 v1.2 **逐字节一致**（A4）。
 
+**v1.4 追加：符号级回退第三态 ``revert``（T1.1，docs/15 §3.1）**
+
+- ``symbol_deletions="revert"`` ⇒ 命中时**保留补丁**（模型对同文件其它部分的编辑留着），
+  只把「被删且仍被引用」的公共顶层符号从基线**搬回**该文件（
+  :func:`ymir.artifacts.symbols.revert_symbols`），记
+  ``conflicts(reason="symbol_regression")`` + ``counts.symbol_removals`` +
+  短码 ``symbol_regression_reverted:<n>``；符号命中的文件**删除通道同样不生效**；
+- ★ ``revert`` **只能由运行时兜底路径传入**（``role_executor`` 三段式的第三段）：
+  模板侧 ``protected.symbol_deletions`` 仍是 ``common.contracts.SymbolPolicy``
+  （``off`` / ``reject`` / ``ignore``），因此「在模板里写 revert」在加载期就是 1001；
+- ★ ``off`` / ``reject`` / ``ignore`` 三条路径的行为与 v1.3.1 **逐字节一致**：
+  ``revert`` 只在「``reject`` 撞了两次墙」之后才被用（红线 A9 / A2）。
+
 **v1.3.1 追加：引用感知的符号删除检测（T3.2）**
 
 - ``symbol_deletions="off"``（默认）⇒ 检测代码路径**完全不进入** ⇒ 行为与 v1.3
@@ -59,9 +72,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ymir.artifacts.symbols import SymbolRemoval, detect_symbol_removals
+from ymir.artifacts.symbols import SymbolRemoval, detect_symbol_removals, revert_symbols
 from ymir.artifacts.versioning import compute_content_hash
-from ymir.common.contracts import SymbolPolicy
 from ymir.common.errors import InvalidParamError, StateConflictError
 from ymir.common.paths import normalize_rel_path, normalize_scope_path
 
@@ -112,13 +124,13 @@ ConflictReason = Literal[
 #: 与 :data:`MergeMode` / ``RunMode`` 的既有做法一致。
 ProtectedPolicy = Literal["reject", "ignore"]
 
-#: 符号删除检测策略（v1.3.1 T3.2，docs/13 §7.2.4）。
+#: 符号删除检测策略（v1.3.1 T3.2，docs/13 §7.2.4）。取值语义见
+#: :data:`ymir.common.contracts.SymbolPolicy`（``off`` / ``reject`` / ``ignore``）。
 #:
-#: ★ 与 :data:`ProtectedPolicy` 不同：这一份**从 ``common.contracts`` 导入**而不是
-#: 本地复写 —— 因为 ``templates``(2) 的 ``ProtectedSpec.symbol_deletions`` 也要用它，
-#: 两边都只能向下依赖 common(5)，不会造出逆层边（``ProtectedPolicy`` 只有
-#: ``artifacts`` 一侧消费，本地复写反而更省一条边）。取值语义见
-#: :data:`ymir.common.contracts.SymbolPolicy`。
+#: ★ v1.4 起本模块**不再 import** 它：``merge_trees`` 的入参类型换成
+#: :data:`MergeSymbolPolicy`（多一个 ``revert``）。契约侧那份仍由
+#: ``templates.models.ProtectedSpec.symbol_deletions`` 使用 —— "模板能声明什么"
+#: 与"运行时能传什么"从此**故意不同**，这正是 ``revert`` 不可由模板声明的表达方式。
 
 #: 改动面告警阈值缺省值（v1.3 T1.3，docs/11 §7.2.3）。
 #:
@@ -126,11 +138,27 @@ ProtectedPolicy = Literal["reject", "ignore"]
 #: （两处注释互指），但同样不跨层 import。
 DEFAULT_MAX_CHANGE_RATIO: float = 0.5
 
+#: ``merge_trees(symbol_deletions=...)`` 的**完整**取值集合（v1.4 T1.1）。
+#:
+#: ★ 比 ``common.contracts.SymbolPolicy`` 多一个 ``revert``：它**只能由运行时兜底路径**
+#: 传入（``orchestrator.role_executor`` 三段式的第三段），**不可由模板声明** ——
+#: 模板侧字段类型仍是 ``common.contracts.SymbolPolicy``（``off`` / ``reject`` /
+#: ``ignore``），所以「在 YAML 里写 ``symbol_deletions: revert``」在**加载期**就被
+#: pydantic 的 Literal 拒成 1001，进不到这里。这条边界是刻意的：
+#: 允许模板声明 ``revert`` 等于"默认就回退"，那会把正常重构的删除动作也一并还原。
+MergeSymbolPolicy = Literal["off", "reject", "ignore", "revert"]
+
 #: ``warnings`` 短码前缀（≤3 条、每条 ≤64 字节，docs/11 §7.5-2）。
 CHANGE_RATIO_WARNING_PREFIX: str = "change_ratio_exceeded:"
 PROTECTED_HIT_WARNING_PREFIX: str = "protected_path_ignored:"
 #: 符号删除被 ``ignore`` 兜底时的短码前缀（v1.3.1 T3.3 ④，docs/13 §7.5-1）。
 SYMBOL_REGRESSION_WARNING_PREFIX: str = "symbol_regression_ignored:"
+#: 符号删除被 ``revert`` 兜底（**符号级**还原，v1.4 T1.1）时的短码前缀。
+#:
+#: ★ 与上面那个前缀**刻意分开**：``ignored`` = 整文件回退、模型内容全丢；
+#: ``reverted`` = 只还原被删符号、模型其它编辑保留。两者混用会让"到底回了什么"
+#: 从短码上读不出来（docs/14 §3.2-★2 的误读正是这样发生的）。
+SYMBOL_REGRESSION_REVERT_WARNING_PREFIX: str = "symbol_regression_reverted:"
 
 #: ``warnings`` 条数与单条字节上限（体积硬约束，docs/11 §7.5-2）。
 WARNINGS_MAX_ITEMS: int = 3
@@ -307,7 +335,9 @@ class MergeProvenance:
     merged_files_hash: str = ""
     #: 本次**实际生效**的受保护路径策略：``reject`` | ``ignore``（兜底后可能是 ``ignore``）
     protected_policy: str = ""
-    #: 本次**实际生效**的符号删除策略：``off`` | ``reject`` | ``ignore``
+    #: 本次**实际生效**的符号删除策略：``off`` | ``reject`` | ``ignore`` | ``revert``
+    #: （v1.4 起含运行时兜底值 ``revert``：产物里记的是**生效值**，重建据此才能
+    #: 复现同一棵树 —— 用模板声明值会重新抛冲突或把被还原的符号当成模型产出）
     symbol_policy: str = ""
     #: 本次合并实际用的单文件上限（``0`` = 未知 ⇒ 重建时用 ``DEFAULT_MAX_FILE_BYTES``）
     max_file_bytes: int = 0
@@ -671,7 +701,7 @@ def merge_trees(
     protected_paths: AbstractSet[str] = frozenset(),
     on_protected_hit: ProtectedPolicy = "reject",
     max_change_ratio: float = DEFAULT_MAX_CHANGE_RATIO,
-    symbol_deletions: SymbolPolicy = "off",
+    symbol_deletions: MergeSymbolPolicy = "off",
 ) -> MergeResult:
     """合并基线树与补丁树（纯函数），并按优先级表处理骨架注入。
 
@@ -697,11 +727,15 @@ def merge_trees(
             ``ignore`` = 丢弃模型内容、保留基线版本、记 manifest。
         max_change_ratio: 改动面告警阈值（v1.3 T1.3，``(0, 1]``）。超阈值只记
             ``warnings``，**不阻断**合并。
-        symbol_deletions: 符号删除检测策略（v1.3.1 T3.2）。``off``（默认）⇒
+        symbol_deletions: 符号删除检测策略（v1.3.1 T3.2 / v1.4 T1.1）。``off``（默认）⇒
             检测代码路径完全不进入 ⇒ 行为与 v1.3 **逐字节一致**；``reject`` ⇒
             抛 :class:`SymbolRegressionConflict`；``ignore`` ⇒ 丢弃模型内容、
-            保留基线版本、记 ``conflicts`` / ``counts.symbol_removals``。
-            ★ 与 ``protected_paths`` 同纪律：**只要命中就在应用补丁之前抛出**。
+            保留基线版本（**整文件回退**）、记 ``conflicts`` / ``counts.symbol_removals``；
+            ``revert``（v1.4，**仅运行时兜底可用**）⇒ **保留补丁**、只把被删的公共顶层
+            符号从基线搬回该文件（:func:`~ymir.artifacts.symbols.revert_symbols`），
+            记 ``conflicts`` / ``counts.symbol_removals`` + 短码
+            ``symbol_regression_reverted:<n>``。
+            ★ 与 ``protected_paths`` 同纪律：**只要命中就在应用补丁之前抛出**（``reject``）。
 
     Returns:
         :class:`MergeResult`：``files``（合并后树）+ ``manifest``（可序列化记账）。
@@ -733,7 +767,7 @@ def merge_trees(
         raise InvalidParamError(f"max_file_bytes 必须为正数: {max_file_bytes}")
     if on_protected_hit not in ("reject", "ignore"):
         raise InvalidParamError(f"非法受保护路径策略: {on_protected_hit!r}")
-    if symbol_deletions not in ("off", "reject", "ignore"):
+    if symbol_deletions not in ("off", "reject", "ignore", "revert"):
         raise InvalidParamError(f"非法符号删除策略: {symbol_deletions!r}")
     if not (0 < max_change_ratio <= 1):
         raise InvalidParamError(
@@ -808,6 +842,10 @@ def merge_trees(
     #: "reserved 文件同时在 deleted 里" 从 ``delete_conflict`` 静默改成"跳过删除"
     #: ⇒ 改变 v1.3 既有行为。只让符号命中影响删除，既有语义零变化。
     symbol_hit_paths: set[str] = set()
+    #: ``revert`` 策略还原出的正文（``path -> content``，v1.4 T1.1）。只在
+    #: ``symbol_deletions == "revert"`` 时非空；命中路径的补丁正文在**进入补丁循环
+    #: 之前**就被替换成"模型编辑 + 被删符号"的合体。
+    reverted_files: dict[str, str] = {}
     if symbol_deletions != "off" and base_norm:
         detected = detect_symbol_removals(base_norm, patch_norm, deleted_paths)
         # ★ S4：受保护路径已命中的路径不再算符号冲突 —— 同一路径只记一条冲突、
@@ -819,12 +857,34 @@ def merge_trees(
                 # 整批抛出（不是"抛第一个"）：回喂模型时必须给出全部命中路径
                 raise SymbolRegressionConflict(sorted(symbol_paths))
             for path in sorted(symbol_paths):
-                # ignore：丢弃模型内容、保留基线版本（``files`` 里已有基线正文）
                 conflicts.append(Conflict(path=path, reason="symbol_regression"))
-                drop_model.add(path)
-                symbol_hit_paths.add(path)
             counts.symbol_removals = len(symbol_paths)
-            symbol_warning = f"{SYMBOL_REGRESSION_WARNING_PREFIX}{len(symbol_paths)}"
+            if symbol_deletions == "revert":
+                # ★ v1.4 T1.1：**符号级**回退 —— 保留补丁，只把被删符号插回去。
+                #   与 ``ignore`` 的区别只有一句：``ignore`` 丢模型内容（整文件回退），
+                #   ``revert`` 留模型内容（只补符号）。这正是 A1 的判定点。
+                reverted_files = revert_symbols(base_norm, patch_norm, symbol_removals)
+                for path, content in reverted_files.items():
+                    if path in patch_norm:
+                        patch_norm[path] = content
+                # 删除通道：符号命中的路径**一律不删**。整份删除时基线里"全部符号
+                # 都被删"，而引用方还在 ⇒ 删掉必然 ImportError；且此处没有补丁正文
+                # 可供插入（``revert_symbols`` 只处理有正文的路径），唯一正确动作是
+                # 取消删除、保留基线文件。
+                dropped = frozenset(symbol_paths)
+                deleted_paths = [item for item in deleted_paths if item not in dropped]
+                deleted_set = set(deleted_paths)
+                # ★ 计数口径是**命中路径数**（与 ``counts.symbol_removals`` 同一口径），
+                #   不是"真的插回去了几个"：``revert_symbols`` 在 AST 坏掉等降级场景会
+                #   返回空字典（它绝不抛异常），此时树里仍是"符号被删"的状态 —— 短码
+                #   按命中数报，配合 ``conflicts``/``reject`` 语义才不会把事故读成"没事"。
+                symbol_warning = f"{SYMBOL_REGRESSION_REVERT_WARNING_PREFIX}{len(symbol_paths)}"
+            else:
+                for path in sorted(symbol_paths):
+                    # ignore：丢弃模型内容、保留基线版本（``files`` 里已有基线正文）
+                    drop_model.add(path)
+                    symbol_hit_paths.add(path)
+                symbol_warning = f"{SYMBOL_REGRESSION_WARNING_PREFIX}{len(symbol_paths)}"
 
     if mode != "merge":
         for path in sorted(skeleton_norm):

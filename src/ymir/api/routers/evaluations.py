@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from fastapi import APIRouter
 from pydantic import ValidationError
@@ -176,6 +177,41 @@ async def get_evaluation(
     return {"code": 0, "data": report}
 
 
+async def _infer_report_run_id(
+    store: Any, target: Any, version: int | None, *, tenant_id: str
+) -> str | None:
+    """按「产物版本行」反查产出该版本的 run（缺省 ``run_id`` 时兜底）。
+
+    ★ 为什么需要（QA R5 `Q-R5-01`，P2）：提升闸门按 ``run_id`` 取报告，而
+    **前端唯一的评测入口**只传 ``suite_id / artifact_name / version / save``
+    （``web/src/views/EvalReport.vue``），``EvaluationRunRequest.run_id`` 一直是空
+    ⇒ UI 用户"补评测 → 再提升"永远 409，只能 ``force``，而留痕写的是"没评测过"。
+
+    修法选在服务端而不是加 UI 选择器：产物版本行本来就记着 ``run_id``
+    （``artifact_versions.run_id``），反查零歧义。
+
+    **边界（QA R6 ``Q-R6-01`` 如实标注）**：这里补的是**报告归属** —— 报告根部
+    ``run_id`` 与报告产物的版本行；**不是** ``model_calls.run_id``。后者的唯一通道是
+    ``eval_task.run_id``（``harness._bound_judge``），而该字段还会参与基线解析
+    （``harness._baseline_ref_of``），改它属于口径变更，不在本次返修范围。
+    因此本端点的 judge 成本仍记在 ``model_calls.run_id = NULL``。
+
+    Returns:
+        run id 字符串；产物不存在 / 该版本无归属 run / 读取失败 ⇒ ``None``
+        （保持原行为：报告不带 run，闸门按"没有结论"fail-closed）。
+    """
+    if target is None:
+        return None
+    try:
+        _artifact, row = await store.get_version_meta(
+            target.id, version, tenant_id=tenant_id
+        )
+    except Exception:  # noqa: BLE001 - 反查失败只影响归属，不该让评测本身 500
+        return None
+    run_id = getattr(row, "run_id", None)
+    return str(run_id) if run_id else None
+
+
 @router.post(
     "/projects/{project_id}/evaluations",
     response_model=ApiResponse[EvaluationReport],
@@ -193,10 +229,18 @@ async def run_evaluation(
     if project is None:
         raise NotFoundError("项目不存在")
 
-    if payload.version is None:
-        artifacts = await harness.store.list_artifacts(project_id, tenant_id=tenant_id)
-        if not any(a.name == payload.artifact_name for a in artifacts):
-            raise InvalidParamError(f"项目内不存在产物 `{payload.artifact_name}`，无法评测")
+    artifacts = await harness.store.list_artifacts(project_id, tenant_id=tenant_id)
+    target = next((a for a in artifacts if a.name == payload.artifact_name), None)
+    if target is None and payload.version is None:
+        raise InvalidParamError(f"项目内不存在产物 `{payload.artifact_name}`，无法评测")
+
+    # ★ v1.4 返修 5（QA R5 Q-R5-01）：UI 发起的评测**不带 run_id**，而提升闸门按
+    # ``run_id`` 取报告 ⇒ Web 用户的"补评测"永远解锁不了提升。这里按**产物版本行**
+    # 反查产出该版本的 run 兜底：前端零改动，报告获得正确的 **run 归属**。
+    # （**不是** ``model_calls`` 的成本归属 —— 见 ``_infer_report_run_id`` 的边界说明。）
+    effective_run_id = payload.run_id or await _infer_report_run_id(
+        harness.store, target, payload.version, tenant_id=tenant_id
+    )
 
     report = await harness.evaluate_project(
         project_id,
@@ -204,10 +248,12 @@ async def run_evaluation(
         artifact_name=payload.artifact_name,
         version=payload.version,
         requirement=payload.requirement,
+        # ★ 返修 4（Q-R4-02）：报告要自证归属（版本 + run），否则版本绑定读不到。
+        run_id=effective_run_id,
     )
 
     if payload.save:
-        await report.save(harness.store, project_id=project_id, run_id=payload.run_id)
+        await report.save(harness.store, project_id=project_id, run_id=effective_run_id)
 
     if payload.run_id:
         await events.emit(

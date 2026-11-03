@@ -252,6 +252,14 @@ class ProtectedSpec(BaseModel):
             "reject = 命中即抛；ignore = 保留基线版本并记短码"
         ),
     )
+    #: ★ v1.4（docs/15 §3.1）：**模板不可声明** ``revert``（运行时兜底值）。
+    #:
+    #: 字段类型刻意仍是 :data:`ymir.common.contracts.SymbolPolicy`（不含 ``revert``）：
+    #: 「符号级回退」只允许由编排层在**第二次撞墙之后**启用
+    #: （``role_executor._execute_with_patch_contract`` 第三段）。若允许模板声明它，
+    #: 每一次正常重构（模型确实想删某个符号）都会被自动还原，等于把 `reject` 的
+    #: 语义静默改成"总是兜底"——那就没有再拦的意义了。
+    #: 在这里写 ``symbol_deletions: revert`` 会在**加载期**被 Literal 拒成 1001。
 
 
 class ScoringSpec(BaseModel):

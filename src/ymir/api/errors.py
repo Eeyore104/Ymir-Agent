@@ -14,8 +14,18 @@ from ymir.common.errors import BizCode, YmirError
 logger = logging.getLogger("ymir.api")
 
 
-def _error_body(code: int, message: str) -> dict[str, object]:
-    return {"code": code, "message": message}
+def _error_body(code: int, message: str, details: object = None) -> dict[str, object]:
+    """统一错误信封 ``{code, message}``（+ **仅在有值时**附带 ``details``）。
+
+    ★ ``details`` 是 v1.4 QA 返修（P1-3）新增的合法载荷：前端要按
+    ``details.reason`` 区分"探针不健康"与"没有健康结论"（两者的 ``code`` 都是 1003、
+    文案也不同，靠 ``message`` 里找关键字是脆的）。**没有 details 的错误响应逐字节
+    不变** —— 键根本不会出现（与 ``patch_manifest.json`` 的"非默认值才序列化"同纪律）。
+    """
+    body: dict[str, object] = {"code": code, "message": message}
+    if details is not None:
+        body["details"] = details
+    return body
 
 
 def _format_validation_error(exc: RequestValidationError) -> str:
@@ -33,7 +43,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _handle_ymir_error(_request: Request, exc: YmirError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.http_status,
-            content=_error_body(int(exc.biz_code), exc.message),
+            content=_error_body(int(exc.biz_code), exc.message, exc.details),
         )
 
     @app.exception_handler(RequestValidationError)

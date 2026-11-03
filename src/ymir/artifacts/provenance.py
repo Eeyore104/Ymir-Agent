@@ -30,8 +30,50 @@
 超体积上限            1001（在 ``store.save`` 之前拒）
 ====================  ==================================================
 
-**两条铁律（docs/09 §4.3，W6 沿用的同一条）**
+**v1.4 追加：提升前的「合并树健康度」闸门（T2.1，docs/15 §3.2 / ★3）**
 
+坏补丁被提升成新基线 ⇒ **喂给下一轮 run**，质量传染是语义必然（docs/14 §3.2-★3：
+v1.3.1 真跑 R-c1 的前端构建就是坏的，v2 因此也坏）。因此提升前必须过一道闸门：
+
+| 合并树健康度 | ``force=False``（默认） | ``force=True`` |
+|---|---|---|
+| ``healthy`` | 正常提升 | 正常提升（``force`` 无副作用） |
+| ``unhealthy`` | **``BaselineUnhealthyError``（1003）** | 放行 + 不健康留痕短码 |
+| ``skipped`` | 放行（"跑不了"≠"跑坏了"） | 放行 |
+| 未知（``""``） | 见下 | 放行 + 未知留痕短码 |
+
+**未知态：默认放行，HTTP 主路径改为 fail-closed（v1.4 QA 返修 P1-3）**
+
+"未知"有两种来源，处置**必须分开**：
+
+1. **探针路径**（``health_probe`` 注入 / 探针自己抛异常）：未知 ⇒ **放行**。理由不变 ——
+   因探针故障把提升打死比拦不下来更贵；
+2. **HTTP 主路径**（``require_known_health=True``）：未知 ⇒ **抛
+   ``BaselineHealthUnknownError``（1003 / 409）**。理由：API 请求里
+   ``health_probe=None``（现起沙箱最长 120s，不划算），于是 `known_health` 就是**唯一**
+   的健康结论来源；若它拿不到还放行，闸门等于"只要不评测就能绕过"——比没闸门更糟
+   （v1.4 首版就是这个形态）。真要让用户越过，``force=true`` 保留人工通道并留痕
+   ``baseline_promoted_unknown:1``。
+
+**健康度怎么来（成本从零到一次，绝不多花）**
+
+1. **优先复用 run 已有的结论**：调用方（API 层）从该 run 已有的
+   ``evaluation_report.json`` 里读出**合并树**的健康结论（``blocking_failed`` /
+   ``regression``，见 ``api.routers.artifacts._report_health_status``）传进
+   ``known_health`` ⇒ **零额外沙箱调用**；
+2. 否则用调用方注入的 ``health_probe`` 对**合并树**跑一次探针（纯数据进、状态出，
+   零模型调用）。探针函数由 rank ≤1 的调用方传入（``evaluation.baseline_probe``），
+   因为 ``artifacts``(3) 不能 import ``evaluation``(1)（逆层，CI 拦）；
+3. 两者都没有 ⇒ 状态未知 ⇒ 按上面两条规则处置。**不做"猜一个 unhealthy"**：
+   猜坏会误拦，而误拦比漏拦更容易掩盖真问题。
+
+★ **留痕为什么不写进 ``patch_manifest.json``**：新基线的 ``content_hash`` 必须等于
+``merged_files_hash``（步骤 7 已逐字节校验），往文件树里塞任何字节都会让"确定性重建"
+当场破功。因此留痕落在**版本行的 ``message``**（落盘、可查询、可追溯）与响应体的
+``warning`` 字段上，短码字面量见 :data:`BASELINE_PROMOTED_UNHEALTHY_CODE` 与
+:data:`BASELINE_PROMOTED_UNKNOWN_CODE`。
+
+**两条铁律（docs/09 §4.3，W6 沿用的同一条）**
 1. **禁止「拿最新基线顶上」**：只认 ``base_ref`` 里的 ``artifact_id@version``，
    绝不回退到该 artifact 的 ``current_version``；
 2. **指纹不符不得继续 merge**：``base_ref["content_hash"]`` ==
@@ -59,7 +101,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,12 +123,168 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BASELINE_ARTIFACT_NAME",
+    "BASELINE_PROMOTED_UNHEALTHY_CODE",
+    "BASELINE_PROMOTED_UNKNOWN_CODE",
+    "HEALTH_HEALTHY",
+    "HEALTH_SKIPPED",
+    "HEALTH_UNHEALTHY",
+    "BaselineHealthUnknownError",
+    "BaselineUnhealthyError",
+    "MergedHealth",
     "MergeProvenance",
     "PromoteResult",
     "promote_merged_to_baseline",
+    "resolve_merged_health",
     "strip_bookkeeping",
     "template_yaml_hash",
 ]
+
+#: 合并树健康度三态（字面量与 ``evaluation.baseline_probe`` **同源**）。
+#:
+#: ★ 为什么不 import 那边的常量：``artifacts``(3) -> ``evaluation``(1) 是逆层
+#: （CI 用 AST 断言拦）。两处字面量由本条注释互指，与 ``BASELINE_ARTIFACT_NAME``
+#: 的处理方式一致。
+HEALTH_HEALTHY: str = "healthy"
+HEALTH_UNHEALTHY: str = "unhealthy"
+HEALTH_SKIPPED: str = "skipped"
+
+#: 「不健康的合并树被强制提升」的留痕短码（v1.4 T2.1，A4：不静默）。
+BASELINE_PROMOTED_UNHEALTHY_CODE: str = "baseline_promoted_unhealthy:1"
+
+#: 「没有健康结论却被强制提升」的留痕短码（v1.4 返修 P1-3）。
+#:
+#: ★ 与上一条**分开**：一个说"探针说它坏了"，一个说"没人说它好"。混成同一个字面量
+#: 会让排障时无法区分"真坏"与"没评测"，而这两件事的处置完全不同（前者要修代码，
+#: 后者要补评测）。
+BASELINE_PROMOTED_UNKNOWN_CODE: str = "baseline_promoted_unknown:1"
+
+
+class BaselineUnhealthyError(StateConflictError):
+    """合并树**自身**判定不健康，拒绝提升为基线（v1.4 T2.1，docs/15 §3.2）。
+
+    判据是这棵合并树的：``blocking_failed`` 非空（有阻断项失败）或
+    ``regression=True``（相对基线出现回归）。**不是** ``baseline_runnability``
+    —— 那一条探的是上一轮的基线（``health(M_{N-1})``），拿它判断 ``M_N`` 会让
+    "基线健康、合并树坏"的补丁一路放行（v1.4 QA 返修 P0-1 已否定的口径）。
+
+    业务码沿用 ``1003``（HTTP 409）**不新增**：语义就是"状态冲突"——
+    这次提升会把一个已知不健康的树变成下一轮的起点。
+
+    ``details`` 固定为 ``{"reason": "baseline_unhealthy", "status": ...,
+    "message": ...}``，供 API 层 / 前端直接消费（前端据此展示红色警告并走
+    `force` 二次确认）。
+
+    ★ v1.4 第二次返修（P2-C）：文案此前写"合并树探针不健康（baseline_runnability=
+    unhealthy）"，经 ``promoteErrorText`` 原样上屏，把 P0-1 已否定的口径重新教给
+    用户（用户会去查基线探针，而真正该改的是合并树里的阻断项失败 / 回归）。
+    """
+
+    def __init__(self, status: str = HEALTH_UNHEALTHY, message: str = "") -> None:
+        text = message or (
+            "合并树存在阻断项失败（blocking_failed）或相对基线出现回归（regression），"
+            "提升为新基线会把坏补丁喂给下一轮（health="
+            f"{status or 'unknown'}）。"
+            "如确认可以接受，请带 force=true 重试"
+        )
+        self.reason: str = "baseline_unhealthy"
+        self.status = status
+        super().__init__(
+            text,
+            details={"reason": self.reason, "status": status, "message": text},
+        )
+
+
+class BaselineHealthUnknownError(StateConflictError):
+    """拿不到合并树健康结论，拒绝提升为基线（v1.4 QA 返修 P1-3，fail-closed）。
+
+    为什么需要它（v1.4 首版的漏洞）：HTTP 主路径固定 ``health_probe=None``，全仓没有
+    任何注入方；``known_health=""`` 又按"未知 ⇒ 放行"处理 ⇒ **不跑评测即可绕过整个
+    ★3 闸门**（先不评测，再提升）。这比没有闸门更糟：它给出"已校验"的错觉。
+
+    业务码同样沿用 ``1003``（HTTP 409）。``details`` 形状与
+    :class:`BaselineUnhealthyError` **同族**（``reason`` / ``status`` / ``message``），
+    只是 ``reason`` 为 ``baseline_health_unknown``、``status`` 为 ``unknown``，
+    前端据此换文案（"没有健康结论" ≠ "探针不健康"）。
+    """
+
+    def __init__(self, message: str = "") -> None:
+        text = message or (
+            "该运行还没有可用的合并树健康结论（评测报告缺失、版本/产物不匹配或不可读）："
+            "闸门无法判断这棵树是否跑得起来。请先对这一版完成评测"
+            "（控制台「产物库 → 发起四维评测」，无需额外参数），"
+            "或带 force=true 明确接受「未评测的树被提升为基线」的风险"
+        )
+        self.reason: str = "baseline_health_unknown"
+        self.status: str = "unknown"
+        super().__init__(
+            text,
+            details={"reason": self.reason, "status": self.status, "message": text},
+        )
+
+
+@dataclass(frozen=True)
+class MergedHealth:
+    """「待提升合并树」的健康度结论（纯数据）。
+
+    Attributes:
+        status: ``healthy`` / ``unhealthy`` / ``skipped`` / ``""``（未知）。
+        source: 结论来源，仅供日志与排障：``run``（复用 run 已有结论）/
+            ``probe``（对合并树现跑一次探针）/ ``unknown``。
+    """
+
+    status: str = ""
+    source: str = "unknown"
+
+    @property
+    def unhealthy(self) -> bool:
+        """合并树自身就失败（提升将污染下一轮基线）。"""
+        return self.status == HEALTH_UNHEALTHY
+
+    @property
+    def known(self) -> bool:
+        """是否有**可用的**健康结论（``healthy`` / ``unhealthy`` / ``skipped``）。
+
+        ★ ``skipped`` 算"已知"：那是探针明确回报"这个环境跑不了检查"，是结论而不是
+        缺失。只有 ``""`` 才是"什么都没拿到"。
+        """
+        return self.status in {HEALTH_HEALTHY, HEALTH_UNHEALTHY, HEALTH_SKIPPED}
+
+
+async def resolve_merged_health(
+    files: Mapping[str, str],
+    *,
+    known_status: str = "",
+    probe: Callable[[Mapping[str, str]], Awaitable[str]] | None = None,
+) -> MergedHealth:
+    """判定「待提升合并树」的健康度（成本从零到一次探针，绝不多花）。
+
+    Args:
+        files: 重建出来的合并树（**已剔除簿记文件**，与落盘口径一致）。
+        known_status: 调用方已知的结论（通常来自 run 已有的
+            ``evaluation_report.json`` 里**合并树自己**的判据：
+            ``blocking_failed`` 非空 / ``regression=true`` ⇒ ``unhealthy``）。
+        probe: 现跑探针的可调用对象（``files -> status``）；``None`` ⇒ 不跑。
+
+    Returns:
+        :class:`MergedHealth`。**绝不抛异常**：探针自身报错一律降级成"未知"
+        （拦不下来是产品风险，因探针故障把提升打死更糟）。
+
+    Note:
+        优先级：``known_status`` > ``probe`` > 未知。理由：探针有成本
+        （一次沙箱会话），而 run 已有结论是**评测时真的跑过**的同一件事。
+    """
+    normalized = str(known_status or "").strip().lower()
+    if normalized:
+        return MergedHealth(status=normalized, source="run")
+    if probe is None:
+        return MergedHealth(status="", source="unknown")
+    try:
+        status = str(await probe(files) or "").strip().lower()
+    except Exception:  # noqa: BLE001 - 探针故障不得阻断提升（降级为"未知"）
+        logger.warning("合并树健康度探针异常，按未知处理（不阻断提升）", exc_info=True)
+        return MergedHealth(status="", source="unknown")
+    return MergedHealth(status=status, source="probe")
+
 
 #: 基线产物名（与 ``api.routers.artifacts.BASELINE_ARTIFACT_NAME`` 同一字面量）。
 #:
@@ -161,6 +359,13 @@ class PromoteResult:
     #: 来源增量产物（审批 / 追溯用）
     source_artifact_id: str
     source_version: int
+    #: 强制提升留痕（v1.4 T2.1，A4）：合并树 ``unhealthy`` 且 ``force=True`` 时为
+    #: ``baseline_promoted_unhealthy:1``，其余情况为空串。**不静默**是这一项的纪律。
+    warning: str = ""
+    #: 本次提升用到的合并树健康度（``healthy`` / ``unhealthy`` / ``skipped`` / ``""``）
+    health_status: str = ""
+    #: 健康度结论来源：``run``（复用已有结论）/ ``probe``（现跑探针）/ ``unknown``
+    health_source: str = "unknown"
 
 
 async def promote_merged_to_baseline(
@@ -178,6 +383,10 @@ async def promote_merged_to_baseline(
     max_bytes: int = 5 * 1024 * 1024,
     max_change_ratio: float = DEFAULT_MAX_CHANGE_RATIO,
     tenant_id: str = DEFAULT_TENANT_ID,
+    force: bool = False,
+    known_health: str = "",
+    health_probe: Callable[[Mapping[str, str]], Awaitable[str]] | None = None,
+    strict_health: bool = False,
 ) -> PromoteResult:
     """把「增量产物的合入结果」落成**新基线版本**（v1.3.1 T5.2，docs/13 §7.3-7）。
 
@@ -200,6 +409,20 @@ async def promote_merged_to_baseline(
         max_change_ratio: 重建时的改动面阈值（**只影响** ``manifest.warnings``，
             **不改变树**、不进 ``merged_files_hash``）。
         tenant_id: 租户。
+        force: 合并树 ``unhealthy`` 时是否放行（v1.4 T2.1）。``False``（默认）⇒ 抛
+            :class:`BaselineUnhealthyError`（1003 / 409）；``True`` ⇒ 放行并留痕
+            ``baseline_promoted_unhealthy:1``（进版本 ``message`` 与
+            :attr:`PromoteResult.warning`）。
+        known_health: 调用方已知的合并树健康度（通常复用 run 已有评测报告的
+            **合并树**结论）⇒ **零额外沙箱调用**。
+        health_probe: 现跑探针（``files -> status``）。仅在 ``known_health`` 为空时
+            被调用；``None`` ⇒ 不跑（状态未知）。
+        strict_health: 未知态是否 fail-closed（v1.4 返修 P1-3）。
+            ``False``（默认）⇒ 未知放行（探针路径的既有纪律）；
+            ``True`` ⇒ 未知且 ``force=False`` 时抛
+            :class:`BaselineHealthUnknownError`（1003 / 409）。**HTTP 主路径必传
+            ``True``**：那里 ``health_probe=None``，不 fail-closed 就等于
+            "不评测即可绕过闸门"。
 
     Returns:
         :class:`PromoteResult`（``reused=True`` 时指向已存在的最新基线版本）。
@@ -209,6 +432,11 @@ async def promote_merged_to_baseline(
             按 1003 处置（见下）—— 因为版本行在而目录丢失也是 1003，两者同一类事故。
         InvalidParamError: 非增量产物 / 超体积上限（1001）。
         StateConflictError: 无溯源 / 基线或补丁或模板或重建树指纹不符（1003）。
+        BaselineUnhealthyError: 合并树 ``unhealthy`` 且 ``force=False``（1003 / 409，
+            ``details={"reason": "baseline_unhealthy", ...}``）。
+        BaselineHealthUnknownError: ``strict_health`` 且拿不到健康结论且
+            ``force=False``（1003 / 409，
+            ``details={"reason": "baseline_health_unknown", ...}``）。
     """
     loaded = await store.load(artifact_id, version, tenant_id=tenant_id)
     artifact_name = loaded.artifact.name
@@ -307,6 +535,44 @@ async def promote_merged_to_baseline(
             f"上限 {max_files} / {_human_bytes(max_bytes)}）"
         )
 
+    # ---- 步骤 8b：合并树健康度闸门（v1.4 T2.1，docs/15 §3.2 / ★3）----
+    # ★ 位置是刻意的：放在**便宜**的校验（指纹 / 体积）之后、幂等与落盘之前。
+    #   探针最贵，前面能拒的就别白跑一次沙箱。
+    health = await resolve_merged_health(
+        merged_files, known_status=known_health, probe=health_probe
+    )
+    warning = ""
+    if health.unhealthy:
+        if not force:
+            # 1003 / 409：默认拦住。质量传染（坏补丁变坏基线）是语义必然，
+            # 不是"偶发失败"，必须在闸门处挡；force 保留人工越权通道。
+            raise BaselineUnhealthyError(health.status)
+        # force：放行但**留痕**（A4：不静默）。写不进文件树（会破坏 content_hash =
+        # merged_files_hash 的逐字节契约），因此落在版本 message + 响应体 warning。
+        warning = BASELINE_PROMOTED_UNHEALTHY_CODE
+        logger.warning(
+            "以不健康的合并树提升基线（force=true，已留痕）：project=%s run=%s status=%s",
+            project_id,
+            run_id,
+            health.status,
+        )
+    elif strict_health and not health.known:
+        # ---- v1.4 QA 返修 P1-3：未知态 fail-closed ----
+        # ★ 只在 ``strict_health`` 下生效：HTTP 主路径没有 ``health_probe``，
+        #   ``known_health`` 是**唯一**结论来源，拿不到还放行 ⇒ "不评测即可绕过"。
+        #   探针路径（``health_probe`` 注入）继续"未知 ⇒ 放行"：因探针故障把提升
+        #   打死比拦不下来更贵，而那条路径本来就有别的证据（真跑过探针）。
+        if not force:
+            raise BaselineHealthUnknownError()
+        warning = BASELINE_PROMOTED_UNKNOWN_CODE
+        logger.warning(
+            "以「没有健康结论」的合并树提升基线（force=true，已留痕）："
+            "project=%s run=%s source=%s",
+            project_id,
+            run_id,
+            health.source,
+        )
+
     # ---- 步骤 9：幂等（store.save 本身不去重，连点两次不该产生 vN+1）----
     reused = await _find_same_latest(
         store, project_id=project_id, content_hash=merged_hash, tenant_id=tenant_id
@@ -321,9 +587,18 @@ async def promote_merged_to_baseline(
             reused=True,
             source_artifact_id=artifact_id,
             source_version=version,
+            warning=warning,
+            health_status=health.status,
+            health_source=health.source,
         )
 
     # ---- 步骤 10：落盘为新基线版本 ----
+    message = (
+        f"from-merge: run={run_id} base=v{prov.base_version} (← {artifact_name} v{version})"
+    )
+    if warning:
+        # ★ 留痕必须进**落盘**正文（版本行 message）：只写日志等于没写。
+        message = f"{message} [{warning}]"
     saved = await store.save(
         project_id=project_id,
         name=BASELINE_ARTIFACT_NAME,
@@ -331,9 +606,7 @@ async def promote_merged_to_baseline(
         files=merged_files,
         run_id=run_id,
         created_by="user",
-        message=(
-            f"from-merge: run={run_id} base=v{prov.base_version} (← {artifact_name} v{version})"
-        ),
+        message=message,
         tenant_id=tenant_id,
     )
     logger.info(
@@ -344,13 +617,27 @@ async def promote_merged_to_baseline(
         version,
         run_id,
     )
-    return _result_from_saved(saved, reused=False, artifact_id=artifact_id, version=version)
+    return _result_from_saved(
+        saved,
+        reused=False,
+        artifact_id=artifact_id,
+        version=version,
+        warning=warning,
+        health=health,
+    )
 
 
 def _result_from_saved(
-    saved: SavedVersion, *, reused: bool, artifact_id: str, version: int
+    saved: SavedVersion,
+    *,
+    reused: bool,
+    artifact_id: str,
+    version: int,
+    warning: str = "",
+    health: MergedHealth | None = None,
 ) -> PromoteResult:
     """:class:`SavedVersion` → :class:`PromoteResult`（字段一一对应，不猜）。"""
+    resolved = health if health is not None else MergedHealth()
     return PromoteResult(
         artifact_id=saved.artifact_id,
         version=saved.version,
@@ -360,6 +647,9 @@ def _result_from_saved(
         reused=reused,
         source_artifact_id=artifact_id,
         source_version=version,
+        warning=warning,
+        health_status=resolved.status,
+        health_source=resolved.source,
     )
 
 

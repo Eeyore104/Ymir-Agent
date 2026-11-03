@@ -244,10 +244,12 @@ async def test_parity_covers_template_checks_and_layout(
         run, artifact_name="code", default_suite=SUITE_ID
     )
     # 模板 checks 覆盖套件 checks（fastapi-vue3 有 4 条后端 + 1 条前端构建，v1.3）
+    # v1.4 T5：``--ignore B008``（全局放宽）改成 ``--per-file-ignores``（仅 app/**），
+    # 命令行必须与 ``config/templates/fastapi-vue3.yaml`` 的 skeleton 口径一致。
     assert [check.run for check in batch_task.checks] == [
         "python -m compileall -q app",
         "python -m pytest -q",
-        "ruff check --ignore B008 .",
+        'ruff check --per-file-ignores "app/**:B008" .',
         'python -c "from app.main import app"',
         "fe-build web",
     ]

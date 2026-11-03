@@ -375,6 +375,15 @@ export interface BaselineUploadResult {
 export interface BaselineMergeResult extends BaselineUploadResult {
   /** ``true`` = 复用已有版本（未新建）；``false`` = 本次新建。 */
   reused: boolean
+  /**
+   * 降级留痕（v1.4 T2.1；返修 P1-3 起有两种取值）：
+   * ``baseline_promoted_unhealthy:1``（评测说合并树坏了）/ ``baseline_promoted_unknown:1``
+   * （没有可用健康结论）。
+   *
+   * ★ 缺省（键不存在）= 没有任何降级，与 v1.3.1 的响应正文逐字节一致；
+   * 出现该键 = 这次是**强制**提升，UI 必须显著提示（两种值的文案不同）。
+   */
+  warning?: string
 }
 
 /**
@@ -383,11 +392,17 @@ export interface BaselineMergeResult extends BaselineUploadResult {
  * ``run_id`` 必填（服务端 ``min_length=1``）：溯源信息挂在 run 上，没有 run 就无从
  * 重建。``stage_id`` 省略时服务端取「本 run 中产出 ``code`` 的最后一次成功阶段」；
  * ``artifact_version`` 省略时取该阶段 ``output_refs[0]`` 的版本。
+ *
+ * ``force``（v1.4 T2.1）：合并树**不健康**（阻断项失败 / 相对基线回归）或**没有
+ * 健康结论**时是否仍然提升。
+ * 缺省 ``false`` ⇒ 服务端 1003 / 409 拒绝（``details.reason`` 区分两种原因）；
+ * ``true`` ⇒ 放行并在响应 ``warning`` 上留痕。
  */
 export interface BaselineMergePayload {
   run_id: string
   stage_id?: string | null
   artifact_version?: number | null
+  force?: boolean
 }
 
 /** 推送目标（对应后端 ``ExportTarget``，``extra="forbid"``：多一个键即 1001）。 */

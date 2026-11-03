@@ -79,13 +79,24 @@ skeleton:
         [lint]
         select = ["E", "F", "I", "B", "UP", "C4", "SIM", "W"]
         # FastAPI 的依赖注入写法是 `x: T = Depends(...)`，与 B008（禁止函数调用作
-        # 参数默认值）天然冲突；业界通行做法是在 FastAPI 项目里忽略 B008，
-        # 否则**任何**合规代码都恒被判违规（T5.1 真跑实测：基线 4 条 B008 把基线
-        # 探针判成 unhealthy，导致 regression 归因失效）。
-        # ★ 只忽略 B008：其余规则（含 F401 未使用导入）照常生效。
-        ignore = ["B008"]
+        # 参数默认值）天然冲突；否则**任何**合规代码都恒被判违规（T5.1 真跑实测：
+        # 基线 4 条 B008 把基线探针判成 unhealthy，导致 regression 归因失效）。
+        #
+        # ★ v1.4（T5.2，docs/15 §3.5）：全局 `ignore = ["B008"]` 改为
+        #   **per-file-ignores** —— 只在「用 Depends 做依赖注入」的**应用层**
+        #   （入口与路由）忽略它，服务层 / 脚本 / 测试里的"函数调用作默认值"
+        #   照常报 B008。全局 ignore 等于把这条规则整个关掉，那不是"框架惯例例外"，
+        #   而是**放松检查**。
+        #
+        # ★ 作用域为什么是 `app/**`：模板自己的骨架入口是 `app/main.py`，模型产出的
+        #   路由层落在 `app/` 下（`app/api/*.py` / `app/routers/*.py` 都覆盖），
+        #   而 `tests/` 与仓库根目录的脚本**不在**该作用域内 —— 那里出现 B008
+        #   通常是真的写错了（例如把 `time.time()` 当默认值），必须报出来。
+        [lint.per-file-ignores]
+        "app/**" = ["B008"]
         # 注：本骨架只在"基线没有 ruff.toml"时生效；模板 checks 里的
-        # `ruff check --ignore B008 .` 负责覆盖"基线自带旧配置"的情形（两者互补）。
+        # `--per-file-ignores "app/**:B008"` 负责覆盖"基线自带旧配置"的情形，
+        # 两者互补（同一条作用域，不同落点）。
     - path: requirements.txt
       reserved: false
       content: |
@@ -118,13 +129,17 @@ skeleton:
 checks:
   - { type: command, run: "python -m compileall -q app", weight: 1, group: backend }
   - { type: command, run: "python -m pytest -q", weight: 2, group: backend }
-  # ★ `--ignore B008` 是**基线无关**的那一半修复（另一半是骨架 ruff.toml 里的 ignore）：
-  #   骨架优先级 1 规定"基线已有该路径 ⇒ 骨架完全不参与"（记 skipped_existing），
-  #   所以当基线**自带** ruff.toml（例如 v1.2 时代生成的既有工程）时，合并树用的是
-  #   基线那份旧配置 —— 只改骨架对这类基线无效。CLI 的 `--ignore` 在 ruff 0.6.9 上是
-  #   **追加**语义（实测：配置里 ignore E501 仍生效），因此这一条对"骨架注入"与
-  #   "基线自带配置"两种形态都生效，且只多忽略 B008 这一条。
-  - { type: command, run: "ruff check --ignore B008 .", weight: 1, group: backend }
+  # ★ v1.4（T5.2）：`--ignore B008` 改成**限定作用域**的 `--per-file-ignores`。
+  #   这一条负责"基线无关"的那一半修复（另一半是骨架 ruff.toml 里的
+  #   `[lint.per-file-ignores]`）：骨架优先级 1 规定"基线已有该路径 ⇒ 骨架完全不参与"
+  #   （记 skipped_existing），所以当基线**自带** ruff.toml（例如 v1.2 时代生成的
+  #   既有工程）时，合并树用的是基线那份旧配置 —— 只改骨架对这类基线无效。
+  #   作用域与骨架**同一条**（仅应用层 `app/`），其余目录的 B008 照常报错：
+  #   全局 `--ignore B008` 会把规则整个关掉，那是放松检查而不是框架惯例例外。
+  #   ⚠ 已记录的取舍：ruff 的 CLI `--per-file-ignores` 会**覆盖**配置文件里的
+  #   per-file-ignores；基线自带的 per-file-ignores 因此在检查时失效（方向是
+  #   "多报错"= fail-closed，不会放过真问题）。
+  - { type: command, run: 'ruff check --per-file-ignores "app/**:B008" .', weight: 1, group: backend }
   - { type: command, run: 'python -c "from app.main import app"', weight: 1, group: backend }
   - type: command
     run: "fe-build web"

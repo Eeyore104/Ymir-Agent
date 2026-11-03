@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from ymir.artifacts.exporter import ExportTarget
 from ymir.models.enums import RunMode
@@ -112,6 +112,13 @@ class BaselineMergeRequest(BaseModel):
     ``stage_id`` / ``artifact_version`` 都可缺省：前者缺省 = "该 run 里产出了 ``code``
     的最后一次成功阶段"（不按角色名硬编码）；后者缺省 = 该阶段记录里的那一版。
     两者一起给，就是"重跑之后取历史版本"的场景。
+
+    ``force``（v1.4 T2.1，docs/15 §3.2；返修 P1-3）：闸门拒绝时是否仍然提升。
+    缺省 ``False`` ⇒ 服务端以 1003 / 409 拒绝，``details.reason`` 有两种：
+    ``baseline_unhealthy``（评测说合并树坏了）/ ``baseline_health_unknown``
+    （该 run 没有可用健康结论，fail-closed）；
+    ``True`` ⇒ 放行并在响应 ``warning`` 与基线版本 ``message`` 上留痕。
+    ★ 缺省值必须是 ``False``：既有调用方（不带该字段）行为与 v1.3.1 **完全一致**。
     """
 
     run_id: str = Field(..., min_length=1, description="产生该增量产物的运行 id")
@@ -121,10 +128,17 @@ class BaselineMergeRequest(BaseModel):
     artifact_version: int | None = Field(
         default=None, ge=1, description="产物版本号；缺省 = 该阶段记录里的版本"
     )
+    force: bool = Field(
+        default=False,
+        description=(
+            "合并树不健康（存在阻断项失败 blocking_failed 或相对基线回归 regression）"
+            "或拿不到健康结论时是否仍然提升（true ⇒ 放行并留痕）"
+        ),
+    )
 
 
 class BaselineMergeOut(BaselineUploadOut):
-    """「以合入结果为新基线」响应（v1.3.1 §7.3-8）。
+    """「以合入结果为新基线」响应（v1.3.1 §7.3-8 / v1.4 T2.1）。
 
     ★ **刻意继承** :class:`BaselineUploadOut` 而不是给基类加字段：
     给基类加 ``reused`` 会让 ``POST /baselines`` 的响应 JSON 多出 ``"reused": false``
@@ -132,9 +146,33 @@ class BaselineMergeOut(BaselineUploadOut):
 
     ``reused=True``：重建结果与当前基线最新版**内容相同**，未新建版本（幂等）。
     HTTP 状态仍是 201（与既有基线端点一致），语义只靠该字段区分。
+
+    ``warning``（v1.4 T2.1 / 返修 P1-3）：取值集合封闭，目前两种——
+
+    - ``baseline_promoted_unhealthy:1`` = 这次是**强制**把一个探针不健康的合并树提成了
+      基线（前端据此提示"后续回归比较的起点不健康"）；
+    - ``baseline_promoted_unknown:1`` = 这次是**强制**提升的，而该 run **没有**可用的
+      健康结论（"没人说它好"≠"评测说它坏"，前端文案与上一条分开）。
+
+    空串 = 没有可披露的降级（非强制提升时**不出现**该键的语义等价物）。
     """
 
     reused: bool = False
+    #: 强制提升留痕（空串 = 无）。取值集合封闭：
+    #: ``baseline_promoted_unhealthy:1`` / ``baseline_promoted_unknown:1``。
+    warning: str = ""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        """``warning`` 为空时把键摘掉（与 v1.3.1 的响应正文**逐字节一致**）。
+
+        纪律与 ``TaskOut.failure_attribution`` / ``BaselineProbeOut.probe_mode`` 同源：
+        未发生降级 ⇒ 键不存在，历史前端与快照测试都不受影响（A9）。
+        """
+        data = handler(self)
+        if not data.get("warning"):
+            data.pop("warning", None)
+        return data
 
 
 class RunOut(BaseModel):

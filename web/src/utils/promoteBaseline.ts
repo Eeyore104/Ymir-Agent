@@ -13,6 +13,11 @@
  * 前端算不出来也不该假装算。它们的 ``message`` 由 :func:`promoteErrorText`
  * **原样上屏**，绝不改写成「操作失败」：那句话本身就是给用户看的修复指引。
  *
+ * ★ v1.4 T2.2（docs/15 §3.2）：**健康度闸门**同理 —— 前端**无法预估**合并树是否
+ * 不健康（那要跑一遍 checks），所以不猜：等 409 回来，用 :func:`requiresForceConfirm`
+ * 认出"这条 409 允许 force 越过"，再把确认框切成红色警告 + :data:`FORCE_PROMOTE_LABEL`。
+ * 越过闸门必须是**人**的一次点击（:func:`withForce` 只造新请求体，不自动重试）。
+ *
  * ★ 为什么版本行不用 :func:`canPromote` 做门控（它不是死代码）
  * 产物库的版本行只带 ``run_id`` / ``stage_id`` / ``version``，**不带文件正文**。
  * 为了拿正文而多发一次 ``GET /artifacts/{id}/versions/{n}/content?path=…``，
@@ -77,14 +82,203 @@ export interface PromoteOutcome {
   reused: boolean
   /** 本次落成 / 命中的基线版本号。 */
   version: number
+  /** 降级留痕（v1.4 T2.1）：``baseline_promoted_unhealthy:1`` 或缺省。 */
+  warning?: string
 }
 
 /** 提示条载荷（交给 ``ElMessage``）。 */
 export interface PromoteMessage {
-  /** Element Plus 提示类型：成功 = ``success``，幂等命中 = ``info``（不是错误）。 */
+  /** Element Plus 提示类型：成功 = ``success``，幂等命中 / 强制提升 = ``info``（不是错误）。 */
   type: 'success' | 'info'
   /** 展示文案。 */
   text: string
+}
+
+/**
+ * 业务码「状态冲突」（后端 ``BizCode.STATE_CONFLICT``）。
+ *
+ * ★ 闸门拒绝（``baseline_unhealthy`` / ``baseline_health_unknown``）走的就是
+ * 1003 / 409：语义是"这次状态不允许"，不是参数错，因此前端据此**追问 force**，
+ * 而不是把用户堵死。
+ */
+export const STATE_CONFLICT_CODE = 1003
+
+/**
+ * 强制提升留痕短码（后端 ``artifacts.provenance.BASELINE_PROMOTED_UNHEALTHY_CODE``）。
+ *
+ * 服务端在"合并树探针不健康但用户坚持提升"时返回它，前端必须**显著提示**，
+ * 让人知道"后续回归比较的起点本身就不健康"。
+ */
+export const PROMOTED_UNHEALTHY_CODE = 'baseline_promoted_unhealthy:1'
+
+/**
+ * 「没有健康结论却被强制提升」的留痕短码（后端
+ * ``artifacts.provenance.BASELINE_PROMOTED_UNKNOWN_CODE``，v1.4 返修 P1-3）。
+ *
+ * ★ 与上面那个**分开**：一个说"评测说它坏了"，一个说"没有评测说它好"。
+ * 混成一个字面量会让用户无法判断该修代码还是该补评测。
+ */
+export const PROMOTED_UNKNOWN_CODE = 'baseline_promoted_unknown:1'
+
+/**
+ * 闸门拒绝原因（后端错误信封 ``details.reason``，v1.4 返修 P1-3）。
+ *
+ * ★ 这是**唯一**可靠的判定依据：``code`` 都是 1003（指纹不符 / 缺溯源 / 模板已变更
+ * 也是 1003，那些**不能**用 force 越过），``message`` 是给人看的文案（会改）。
+ */
+export const BASELINE_UNHEALTHY_REASON = 'baseline_unhealthy'
+
+/** 闸门拒绝原因：拿不到任何健康结论（fail-closed ⇒ 409）。 */
+export const BASELINE_HEALTH_UNKNOWN_REASON = 'baseline_health_unknown'
+
+/** 可用 ``force`` 越过的闸门原因（其余 1003 一律不许越）。 */
+export const FORCE_CONFIRM_REASONS: readonly string[] = [
+  BASELINE_UNHEALTHY_REASON,
+  BASELINE_HEALTH_UNKNOWN_REASON,
+]
+
+/** 闸门原因的字面量类型。 */
+export type ForceConfirmReason =
+  | typeof BASELINE_UNHEALTHY_REASON
+  | typeof BASELINE_HEALTH_UNKNOWN_REASON
+
+/**
+ * 强制确认框里的红色警告（v1.4 T2.2，docs/15 §3.2；v1.4 返修按 reason 分支）。
+ *
+ * ★ 文案要同时说清三件事：**现在是什么状态**、**做了会怎样**、**能怎么办**。
+ * 只说"操作失败"等于把用户堵死；把两种情况说成同一句话等于骗人
+ * （"没有评测"和"评测说它坏了"是两种完全不同的处境）。
+ */
+export const UNHEALTHY_CONFIRM_WARNING =
+  '该合并树不健康（存在阻断项失败或相对基线回归）：提升为基线会污染后续基线' +
+  '（下一轮 run 将以一棵跑不起来的树为起点）'
+
+/** 「没有健康结论」时的红色警告文案（fail-closed 闸门）。 */
+export const HEALTH_UNKNOWN_CONFIRM_WARNING =
+  '该运行没有可用的合并树健康结论（评测报告缺失或不可读）：闸门无法判断这棵树是否跑得起来，' +
+  '提升为基线等于拿未评测的树当下一轮的起点'
+
+/** 强制确认框的标题（按 reason 分支；缺省用不健康那条）。 */
+export const UNHEALTHY_CONFIRM_TITLE = '合并树不健康（阻断项失败 / 回归）'
+
+/** 「没有健康结论」时的确认框标题。 */
+export const HEALTH_UNKNOWN_CONFIRM_TITLE = '没有健康结论'
+
+/** 强制提升按钮的文案（与"取消"并排，措辞带风险）。 */
+export const FORCE_PROMOTE_LABEL = '仍要提升（force）'
+
+/**
+ * 强制提升成功后的提示文案（``warning`` 命中留痕短码时）。
+ *
+ * @param result 服务端回执（只看 ``warning`` / ``version`` / ``reused``）
+ */
+export function promoteWarningText(result: PromoteOutcome): string {
+  const warning = result.warning
+  if (warning !== PROMOTED_UNHEALTHY_CODE && warning !== PROMOTED_UNKNOWN_CODE) {
+    return ''
+  }
+  const suffix = promoteSuffix(result)
+  const head =
+    warning === PROMOTED_UNHEALTHY_CODE
+      ? '已强制提升不健康的合并树为新基线'
+      : '已强制提升「没有健康结论」的合并树为新基线'
+  const tail =
+    warning === PROMOTED_UNHEALTHY_CODE
+      ? '后续回归比较的起点不健康'
+      : '该树未经过评测，后续回归比较没有可信起点'
+  return `${head}${suffix}：${tail}`
+}
+
+/** 版本号后缀（幂等命中 / 已知版本 / 未知三种口径）。 */
+function promoteSuffix(result: PromoteOutcome): string {
+  if (result.reused) {
+    return '（未新建版本：基线已是该内容）'
+  }
+  const version = asVersion(result.version)
+  return version === null ? '' : `（v${version}）`
+}
+
+/**
+ * 该错误是否属于「闸门拒绝、可用 force 二次确认」（v1.4 返修 P1-3）。
+ *
+ * 判据是**两件事同时成立**：业务码 1003 + ``details.reason`` 属于
+ * :data:`FORCE_CONFIRM_REASONS`。只认 ``1003`` 不行：非增量 run / 指纹不符 /
+ * 模板已变更也都是 1003，那些**不能**用 force 越过（服务端也不会放行），
+ * 追问只会让用户白点一次。
+ *
+ * ★ 也**不再**靠 ``message.includes('force')``：文案是给人看的，改一个字就失效；
+ * 而"改文案"和"改判定"之间没有任何机制保证同步（首版就是这样静默退化的）。
+ *
+ * @param error 捕获到的异常（``BizError`` / 任意值）
+ * @returns 命中的闸门原因；不是闸门拒绝 ⇒ ``null``
+ */
+export function forceConfirmReason(error: unknown): ForceConfirmReason | null {
+  if (typeof error !== 'object' || error === null) {
+    return null
+  }
+  const record = error as { code?: unknown; details?: unknown }
+  if (record.code !== STATE_CONFLICT_CODE) {
+    return null
+  }
+  const details = asRecord(record.details)
+  const reason = details === null ? '' : details.reason
+  if (typeof reason !== 'string' || !FORCE_CONFIRM_REASONS.includes(reason)) {
+    return null
+  }
+  return reason as ForceConfirmReason
+}
+
+/**
+ * 该错误是否属于「闸门拒绝、需要 force 二次确认」（布尔便捷形态）。
+ *
+ * @param error 捕获到的异常（``BizError`` / 任意值）
+ */
+export function requiresForceConfirm(error: unknown): boolean {
+  return forceConfirmReason(error) !== null
+}
+
+/**
+ * 按闸门原因取确认框文案（``null`` ⇒ 不展示警告）。
+ *
+ * @param reason :func:`forceConfirmReason` 的返回值
+ */
+export function forceConfirmWarning(reason: ForceConfirmReason | null): string {
+  if (reason === BASELINE_HEALTH_UNKNOWN_REASON) {
+    return HEALTH_UNKNOWN_CONFIRM_WARNING
+  }
+  return reason === BASELINE_UNHEALTHY_REASON ? UNHEALTHY_CONFIRM_WARNING : ''
+}
+
+/**
+ * 按闸门原因取确认框标题（``null`` ⇒ 空串，调用方不渲染）。
+ *
+ * @param reason :func:`forceConfirmReason` 的返回值
+ */
+export function forceConfirmTitle(reason: ForceConfirmReason | null): string {
+  if (reason === BASELINE_HEALTH_UNKNOWN_REASON) {
+    return HEALTH_UNKNOWN_CONFIRM_TITLE
+  }
+  return reason === BASELINE_UNHEALTHY_REASON ? UNHEALTHY_CONFIRM_TITLE : ''
+}
+
+/**
+ * 把请求体改写成「强制提升」形态（服务端据此越过闸门并留痕）。
+ *
+ * 纯函数、不改入参：``force`` 只在这一份新对象上为 ``true``。
+ *
+ * @param payload 原请求体（``run_id`` 必填）
+ */
+export function withForce(payload: {
+  run_id: string
+  stage_id?: string | null
+  artifact_version?: number | null
+}): {
+  run_id: string
+  stage_id?: string | null
+  artifact_version?: number | null
+  force: true
+} {
+  return { ...payload, force: true }
 }
 
 /** 判定「该产物是否允许另存为新基线」的名字口径。 */

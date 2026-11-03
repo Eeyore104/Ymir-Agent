@@ -15,6 +15,8 @@ export interface ApiEnvelope<T> {
   code: number
   data: T
   message?: string
+  /** 与 v1.4 起的合法错误载荷（如闸门拒绝的 ``reason``）；无值时键不存在。 */
+  details?: unknown
 }
 
 /** 列表分页数据体。 */
@@ -23,14 +25,23 @@ export interface PageData<T> {
   total: number
 }
 
-/** 业务错误（HTTP 层可达，但 code ≠ 0）：保留业务码供上层判定。 */
+/**
+ * 业务错误（HTTP 层可达，但 code ≠ 0）：保留业务码 + 可选 ``details`` 供上层判定。
+ *
+ * ★ v1.4 QA 返修（P1-3）：``details`` 是后端错误信封里的同名字段（**有值才出现**）。
+ * 前端据此区分"合并树不健康"与"没有健康结论"—— 两者的 ``code`` 都是 1003，
+ * 只靠 ``message`` 里找关键字既脆又会在文案微调时静默失效。
+ */
 export class BizError extends Error {
   readonly code: number
 
-  constructor(code: number, message: string) {
+  readonly details?: unknown
+
+  constructor(code: number, message: string, details?: unknown) {
     super(message)
     this.name = 'BizError'
     this.code = code
+    this.details = details
   }
 }
 
@@ -46,17 +57,17 @@ client.interceptors.response.use(
     const body = response.data as ApiEnvelope<unknown> | undefined
     if (body && typeof body === 'object' && 'code' in body && body.code !== 0) {
       return Promise.reject(
-        new BizError(body.code, body.message ?? `业务错误 ${body.code}`),
+        new BizError(body.code, body.message ?? `业务错误 ${body.code}`, body.details),
       )
     }
     return response
   },
-  (error: AxiosError<{ code?: number; message?: string }>) => {
+  (error: AxiosError<{ code?: number; message?: string; details?: unknown }>) => {
     if (error.response) {
       const body = error.response.data
       const code = body?.code ?? error.response.status
       const message = body?.message ?? `请求失败（HTTP ${error.response.status}）`
-      return Promise.reject(new BizError(code, message))
+      return Promise.reject(new BizError(code, message, body?.details))
     }
     if (error.code === AxiosError.ECONNABORTED) {
       return Promise.reject(new BizError(-1, '请求超时，请检查后端服务'))

@@ -63,7 +63,7 @@ from ymir.evaluation.report import BaselineCheckOut, BaselineProbeOut, FailureAt
 from ymir.evaluation.run_task import resolve_checks, template_spec_for_run
 from ymir.evaluation.suite import Thresholds
 from ymir.sandbox.base import ExecResult, NetworkPolicy, SandboxSession
-from ymir.storage.repositories import ProjectRepository
+from ymir.storage.repositories import ProjectRepository, RunRepository
 
 SUITES_DIR = PROJECT_ROOT / "evals" / "suites"
 
@@ -674,6 +674,134 @@ async def test_evaluations_api_flow(client) -> None:
 
     global_listing = (await client.get("/api/v1/evaluations")).json()["data"]
     assert global_listing["total"] >= 1
+
+
+async def test_evaluations_api_binds_report_to_evaluated_version(client) -> None:
+    """★ v1.4 返修 4（Q-R4-02）：报告必须自证「评的是哪一版树」。
+
+    没有这一条，**「补评测 → 解锁提升」永不收敛**：提升闸门按报告根部的
+    ``artifact_version`` 做版本绑定（``api/routers/artifacts.py``），而本端点存盘的
+    报告此前恒写 ``null`` ⇒ 补评完仍是 409 ``baseline_health_unknown``。
+
+    修法与 ``evaluation/gate.py::HarnessEvaluationGate._build_report`` 同源：
+    取 ``TaskOut.artifact_ref["version"]``（**实际加载到的那一版**），而不是调用方
+    嘴上说的 ``payload.version``。两条断言分别钉住：
+
+    - 显式 ``version=1`` ⇒ 报告标 1（不能被"最新版 2"顶掉）；
+    - 不传 ``version``（缺省 latest）⇒ 报告标 2（不能因为没传就写 null）。
+    """
+    _install_fake_harness(client)
+    project_id = await _create_project(client, "评测版本绑定")
+    store = client._transport.app.state.artifacts
+    await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.json": PRD_JSON}
+    )
+    for _ in range(2):  # code v1 / v2：两棵树内容相同也照样是两版
+        await store.save(
+            project_id=project_id, name="code", artifact_type="code", files=CODE_FILES
+        )
+    # 报告要挂到真实 run 上（``artifact_versions.run_id`` 有外键）
+    session_factory = client._transport.app.state.session_factory
+    async with session_factory() as session:
+        run_id = (await RunRepository(session).create(project_id=project_id, requirement="x")).id
+        await session.commit()
+
+    pinned = await client.post(
+        f"/api/v1/projects/{project_id}/evaluations",
+        json={
+            "artifact_name": "code",
+            "version": 1,
+            "requirement": "实现待办 API",
+            "run_id": run_id,
+        },
+    )
+    assert pinned.status_code == 200, pinned.text
+    assert pinned.json()["data"]["artifact_version"] == 1
+
+    latest = await client.post(
+        f"/api/v1/projects/{project_id}/evaluations",
+        json={"artifact_name": "code", "requirement": "实现待办 API"},
+    )
+    assert latest.status_code == 200, latest.text
+    assert latest.json()["data"]["artifact_version"] == 2
+
+    # 落盘正文也要带（闸门读的是产物文件，不是响应体）
+    saved = [a for a in await store.list_artifacts(project_id) if a.name == "evaluation_report"]
+    assert saved, "评测报告未入库"
+    raw_latest = json.loads((await store.load(saved[-1].id)).files["evaluation_report.json"])
+    assert raw_latest["artifact_version"] == 2
+    raw_pinned = json.loads(
+        (await store.load(saved[-1].id, 1)).files["evaluation_report.json"]
+    )
+    assert raw_pinned["artifact_version"] == 1
+    assert raw_pinned["run_id"] == run_id
+
+    # ★ 生产者 ↔ 消费者口径必须接通（QA Q-R4-02 的真正痛点）：
+    # 把刚落盘的正文喂给提升闸门的解析器，**同版本**必须给出结论。
+    # 修复前这里恒为 ``""``（版本缺失）⇒ 闸门 409 unknown ⇒ "补评测"永远救不回来。
+    from ymir.api.routers.artifacts import _report_health_status
+
+    body = (await store.load(saved[-1].id, 1)).files["evaluation_report.json"]
+    assert _report_health_status(body, 1) == "healthy"
+    assert _report_health_status(body, 2) == ""  # 别的版本仍按未知处置（绑定生效）
+
+
+async def test_evaluations_api_infers_run_id_from_artifact_version(client) -> None:
+    """★ v1.4 返修 5（QA R5 Q-R5-01）：UI 不传 ``run_id`` 时按产物版本行反查。
+
+    **为什么必须有用例**：提升闸门按 ``run_id`` 取报告，而前端唯一的评测入口
+    （`web/src/views/EvalReport.vue`）只传 `suite_id / artifact_name / version / save`
+    ⇒ 落盘报告 `run_id=null` ⇒ UI 用户的"补评测 → 再提升"**永远 409**，只能 force，
+    而留痕写的是"没评测过"（与刚评测完的事实相反）。
+
+    服务端按 `artifact_versions.run_id` 反查产出该版本的 run 兜底：前端零改动，
+    报告获得正确的 **run 归属**（**不是** `model_calls` 的成本归属）。
+    断言链一路走到**闸门真的能取到这份报告**。
+    """
+    from ymir.api.routers.artifacts import _known_merged_health
+
+    _install_fake_harness(client)
+    project_id = await _create_project(client, "评测 run 反查")
+    store = client._transport.app.state.artifacts
+    await store.save(
+        project_id=project_id, name="prd", artifact_type="prd", files={"prd.json": PRD_JSON}
+    )
+    session_factory = client._transport.app.state.session_factory
+    async with session_factory() as session:
+        run_id = (await RunRepository(session).create(project_id=project_id, requirement="x")).id
+        await session.commit()
+    # 产物由该 run 产出（``artifact_versions.run_id`` 记着归属）
+    await store.save(
+        project_id=project_id,
+        name="code",
+        artifact_type="code",
+        files=CODE_FILES,
+        run_id=run_id,
+    )
+
+    # 模拟 UI：只传 artifact_name / version，**不传 run_id**
+    resp = await client.post(
+        f"/api/v1/projects/{project_id}/evaluations",
+        json={"artifact_name": "code", "version": 1, "requirement": "实现待办 API"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["run_id"] == run_id
+
+    saved = [a for a in await store.list_artifacts(project_id) if a.name == "evaluation_report"]
+    assert saved, "评测报告未入库"
+    body = (await store.load(saved[-1].id)).files["evaluation_report.json"]
+    assert json.loads(body)["run_id"] == run_id
+
+    # ★ 端到端（零沙箱）：闸门按 (run, 产物, 版本) 真的取到了这份报告
+    status = await _known_merged_health(
+        store,
+        project_id=project_id,
+        run_id=run_id,
+        tenant_id="default",
+        artifact_version=1,
+        artifact_name="code",
+    )
+    assert status == "healthy"
 
 
 async def test_evaluation_project_missing_artifact(client) -> None:

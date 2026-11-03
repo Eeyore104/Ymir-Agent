@@ -37,7 +37,14 @@ import {
   promoteConfirmLines,
   promoteErrorText,
   promoteResultText,
+  promoteWarningText,
+  forceConfirmReason,
+  forceConfirmTitle,
+  forceConfirmWarning,
+  withForce,
+  FORCE_PROMOTE_LABEL,
 } from '@/utils/promoteBaseline'
+import type { ForceConfirmReason } from '@/utils/promoteBaseline'
 import type { Artifact, ArtifactDetail, ArtifactVersion } from '@/api/types'
 
 const route = useRoute()
@@ -66,6 +73,20 @@ const promoteDialogVisible = ref(false)
 const promoteTarget = ref<ArtifactVersion | null>(null)
 /** 请求进行中（防重复点击）。 */
 const promoting = ref(false)
+/**
+ * 上一次尝试被闸门拒绝的原因（v1.4 T2.2；v1.4 返修按 ``details.reason`` 判定）。
+ *
+ * ``'baseline_unhealthy'`` / ``'baseline_health_unknown'`` ⇒ 对话框**不关闭**，改为
+ * 展示对应文案的红色警告并把主按钮换成「仍要提升（force）」；用户再点一次才带
+ * ``force=true`` 发出。刻意不做"自动重试"：越过闸门必须是**人**的动作（这是 ★3
+ * 闸门存在的意义）。
+ *
+ * ★ 存**原因**而不是布尔值：这两种处境的文案完全不同（"评测说它坏了" vs
+ * "没有评测说它好"），用一句话盖住两种状态等于骗人。
+ */
+const promoteForceReason = ref<ForceConfirmReason | null>(null)
+/** 是否处于"等待用户确认强制提升"状态。 */
+const promoteForceRequired = computed<boolean>(() => promoteForceReason.value !== null)
 /**
  * 已打开过的 ``patch_manifest.json`` 正文缓存（键 ``artifact_id@version``）。
  *
@@ -245,6 +266,7 @@ function openPromoteDialog(row: ArtifactVersion): void {
     }
   }
   promoteTarget.value = row
+  promoteForceReason.value = null
   promoteDialogVisible.value = true
 }
 
@@ -252,6 +274,7 @@ function openPromoteDialog(row: ArtifactVersion): void {
 function closePromoteDialog(): void {
   promoteDialogVisible.value = false
   promoteTarget.value = null
+  promoteForceReason.value = null
 }
 
 /**
@@ -268,16 +291,34 @@ async function onPromote(): Promise<void> {
   }
   promoting.value = true
   try {
-    const result = await promoteMergedToBaseline(projectId.value, {
+    const payload = {
       run_id: row.run_id,
       stage_id: row.stage_id ?? undefined,
       artifact_version: row.version,
-    })
-    const feedback = promoteResultText(result)
-    ElMessage({ type: feedback.type, message: feedback.text })
+    }
+    // ★ 只有用户**再点一次**（按钮已变成「仍要提升（force）」）才带 force
+    const result = await promoteMergedToBaseline(
+      projectId.value,
+      promoteForceRequired.value ? withForce(payload) : payload,
+    )
+    const warning = promoteWarningText(result)
+    if (warning) {
+      // 强制提升成功：必须把"起点不健康"说清楚（A4：不静默）
+      ElMessage.warning(warning)
+    } else {
+      const feedback = promoteResultText(result)
+      ElMessage({ type: feedback.type, message: feedback.text })
+    }
     closePromoteDialog()
     await loadBaselineDetail(projectId.value)
   } catch (e) {
+    const reason = forceConfirmReason(e)
+    if (reason !== null) {
+      // ★ 闸门拒绝：对话框**不关**，改成按原因分支的红色警告 + 强制按钮（人工越权通道）
+      promoteForceReason.value = reason
+      ElMessage.warning(promoteErrorText(e))
+      return
+    }
     ElMessage.error(promoteErrorText(e))
   } finally {
     promoting.value = false
@@ -569,10 +610,29 @@ function downloadBlob(blob: Blob, filename: string): void {
       <div class="promote-hint">
         模板文件有改动（含注释）、指纹不符、或合并结果超出基线上限时，服务端会拒绝并给出原因。
       </div>
+      <!--
+        v1.4 T2.2：闸门拒绝后的**红色警告**（★3）。文案说清"现在什么状态 / 做了会怎样 /
+        还能怎么办"，并明确这是人工越权通道（force），不是默认路径。
+        v1.4 返修：``title`` / ``description`` 按 ``details.reason`` 分支 ——
+        "评测说它坏了" 与 "没有评测说它好" 是两种处境，不能共用一句话。
+      -->
+      <el-alert
+        v-if="promoteForceRequired"
+        class="promote-unhealthy"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="forceConfirmTitle(promoteForceReason)"
+        :description="forceConfirmWarning(promoteForceReason)"
+      />
       <template #footer>
         <el-button @click="closePromoteDialog">取消</el-button>
-        <el-button type="primary" :loading="promoting" @click="onPromote">
-          确认另存为新基线
+        <el-button
+          :type="promoteForceRequired ? 'danger' : 'primary'"
+          :loading="promoting"
+          @click="onPromote"
+        >
+          {{ promoteForceRequired ? FORCE_PROMOTE_LABEL : '确认另存为新基线' }}
         </el-button>
       </template>
     </el-dialog>
@@ -716,6 +776,10 @@ function downloadBlob(blob: Blob, filename: string): void {
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.promote-unhealthy {
+  margin-top: 12px;
 }
 
 .promote-hint {

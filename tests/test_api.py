@@ -771,3 +771,40 @@ async def test_export_default_mode_is_v11_identical(
 
     assert "X-Export-Mode" not in default.headers  # 缺省响应头与 v1.1 一致
     assert default.headers["X-Manifest"] == "manifest.json"
+
+
+# =============================================== v1.4 · P3-④ 错误信封 details 透传
+
+
+def test_error_body_carries_details_only_when_present() -> None:
+    """P3-④：``YmirError.details`` 出现在信封；**没有 details 时键根本不存在**。
+
+    ★ 为什么钉这个：前端按 ``details.reason`` 区分两种闸门 409（"合并树不健康" /
+    "没有健康结论"），``_error_body`` 若把 ``details: null`` 也序列化出去，
+    "有值才出现"的契约就破了（前端 ``'details' in body`` 的判定会误判）。
+    """
+    from ymir.api.errors import _error_body
+
+    plain = _error_body(1001, "坏参数")
+    assert plain == {"code": 1001, "message": "坏参数"}
+    assert "details" not in plain
+
+    details = {"reason": "baseline_unhealthy", "status": "unhealthy", "message": "x"}
+    rich = _error_body(1003, "拒绝", details)
+    assert rich["details"] == details
+    assert rich["code"] == 1003
+
+
+async def test_plain_error_response_has_no_details_key(client: AsyncClient) -> None:
+    """P3-④ 端点侧：普通 ``YmirError``（无 details）的 HTTP 信封**没有**该键。
+
+    （带 details 的一侧由 ``tests/test_baseline_promote.py`` 的闸门 409 用例覆盖：
+    ``details.reason`` / ``details.status`` 原样出现在 HTTP 信封里。）
+    """
+    run_id = await _seed_run(client._transport.app.state.session_factory, status="failed")
+
+    resp = await client.post(f"/api/v1/runs/{run_id}/actions", json={"action": "fly"})
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1001
+    assert "details" not in resp.json()

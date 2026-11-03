@@ -15,6 +15,7 @@ fixture 全部放在 ``tests/fixtures/templates/``，**不依赖** ``config/temp
 from __future__ import annotations
 
 import copy
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -583,42 +584,40 @@ def test_fastapi_ruff_ignores_b008_only(real_templates: dict[str, TemplateSpec])
     被基线探针判成 ``unhealthy`` ⇒ ``regression`` 归因失效。这不是模型的错，
     是模板规则与框架惯例冲突（任何合规写法都恒扣分）。
 
-    ★ 同时锁定「只忽略 B008」：``select`` 必须还在，且其余三套模板的 ruff 配置里
-    **不得**出现 B008 —— 防止将来被"统一"顺手带上，那会真的放松检查。
+    ★ v1.4（T5.2，docs/15 §3.5 / A7）：忽略的**作用域**必须收窄 ——
+    全局 ``ignore = ["B008"]`` 等于把这条规则整个关掉。现在两层（骨架 + 检查命令）
+    都改成只在应用层 ``app/**`` 生效，因此本用例锁定四件事：
+
+    1. 骨架里**没有** ``ignore = ["B008"]`` 这种全局忽略（有它就是放松检查）；
+    2. 骨架有 ``[lint.per-file-ignores]``，且只对 ``app/**`` 挂 ``B008``；
+    3. 检查命令用 ``--per-file-ignores "app/**:B008"``，**不再**用全局 ``--ignore B008``
+       （后者对"基线自带旧 ruff.toml"那半边有效，但会连带关掉其它目录的 B008）；
+    4. 其余三套模板的 ruff 配置与命令里**不得**出现 B008 —— 防止将来被"统一"顺手
+       带上，那会真的放松检查。
     """
     fastapi_ruff = real_templates["fastapi-vue3"].skeleton_files()["ruff.toml"]
-    assert "[lint]" in fastapi_ruff, fastapi_ruff
-    assert "select" in fastapi_ruff, fastapi_ruff  # 规则集没被整个关掉
-    assert "ignore" in fastapi_ruff and "B008" in fastapi_ruff, fastapi_ruff
+    ruff_config = tomllib.loads(fastapi_ruff)  # TOML 必须可解析（骨架要能真跑）
+    lint = ruff_config["lint"]
+    assert "select" in lint, fastapi_ruff  # 规则集没被整个关掉
+    # ① 不许再有全局忽略（注释里提到 B008 是说明，键在才算放松检查）
+    assert "ignore" not in lint, fastapi_ruff
+    # ② per-file-ignores 只挂在应用层
+    assert lint["per-file-ignores"] == {"app/**": ["B008"]}, fastapi_ruff
 
-    # 骨架只覆盖 from_scratch / 基线缺配置两种情形；基线自带 ruff.toml 时骨架不参与
-    # （merge_trees 优先级 1），所以 ruff 检查命令里也要带 `--ignore B008`（基线无关）。
+    # ③ 检查命令同样是**限定作用域**的（覆盖"基线自带旧配置"那半边）
     ruff_checks = [
         check.run
         for check in real_templates["fastapi-vue3"].checks
         if check.run.startswith("ruff check")
     ]
-    assert ruff_checks == ["ruff check --ignore B008 ."], ruff_checks
-
-    # 骨架只覆盖 from_scratch / 基线缺配置两种情形；基线自带 ruff.toml 时骨架不参与
-    # （merge_trees 优先级 1），所以 ruff 检查命令里也要带 `--ignore B008`（基线无关）。
-    ruff_checks = [
-        check.run
-        for check in real_templates["fastapi-vue3"].checks
-        if check.run.startswith("ruff check")
-    ]
-    assert ruff_checks == ["ruff check --ignore B008 ."], ruff_checks
+    assert ruff_checks == ['ruff check --per-file-ignores "app/**:B008" .'], ruff_checks
+    assert all("--ignore B008" not in run for run in ruff_checks), ruff_checks
 
     for template_id in ("python-cli", "data-pipeline", "node-express"):
         content = real_templates[template_id].skeleton_files().get("ruff.toml")
         if content is None:  # node-express 用 tsc，不跑 ruff
             continue
         assert "B008" not in content, template_id
-        assert "ignore" not in content or "B008" not in content, template_id
-        # 命令层也不许带 B008（防止被"统一"顺手加上）
-        assert all("B008" not in check.run for check in real_templates[template_id].checks), (
-            template_id
-        )
         # 命令层也不许带 B008（防止被"统一"顺手加上）
         assert all("B008" not in check.run for check in real_templates[template_id].checks), (
             template_id
@@ -1034,6 +1033,14 @@ def test_check23_symbol_deletions_enum_and_default(tmp_path: Path) -> None:
     # Literal 由 pydantic 在加载期拦下（结构非法 → 1001）
     bad = _with_symbol_deletions(_demo(), "block")
     _expect_1001(tmp_path, bad)
+
+    # ★ v1.4（T1.1 硬约束，docs/15 §3.1）：``revert`` **不可由模板声明** ——
+    #   它只是运行时兜底值（``role_executor`` 三段式的第三段）。允许模板写它等于
+    #   "默认就回退"，每一次正常重构（模型确实想删某个符号）都会被自动还原，
+    #   那 ``reject`` 就失去了意义。这里把加载期行为钉死。
+    revert = _with_symbol_deletions(_demo(), "revert")
+    message = _expect_1001(tmp_path, revert)
+    assert "symbol_deletions" in message or "protected" in message, message
 
 
 def test_check23_policy_set_matches_contract() -> None:

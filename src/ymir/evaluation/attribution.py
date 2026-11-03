@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
 
 # --------------------------------------------------------------- 归因四态（唯一口径）
@@ -72,6 +73,13 @@ BASIS_CODES: frozenset[str] = frozenset(
 
 #: ``sample_markers`` 的条数上限（报告只做提示，不搬整段输出）。
 MAX_SAMPLE_MARKERS: int = 5
+
+#: Python **安装目录**的路径片段（v1.4 T4.1，docs/15 §3.4）。
+#:
+#: 出现即视为**噪声**：这些路径属于镜像里的解释器 / 三方包，与"本次模型生成"
+#: 毫无关系。v1.3.1 真跑的报告里因此混进了 ``/usr/lib/python3.12/site-packages/…``
+#: 一类的标记，读者要先自己排除一遍才能看出哪条是模型引入的。
+_INSTALLED_SEGMENTS: frozenset[str] = frozenset({"site-packages", "dist-packages"})
 
 #: ``path:line`` 通用标记（**不绑定任何 linter**）。
 #:
@@ -302,12 +310,68 @@ def _group_by_command(outputs: Sequence[CommandOutput]) -> dict[str, list[str]]:
     return grouped
 
 
+def _is_absolute_path(path: str) -> bool:
+    """是否为绝对路径（POSIX 根 ``/…`` 或 Windows 盘符 ``C:/…``）。
+
+    ★ 不自己写盘符正则：路径校验/拆分的**唯一实现**是 ``common.paths``
+    （docs/09 §13；``tests/test_common.py::test_common_paths_is_only_path_validator``
+    有守卫用例，禁止在别处复制第二份盘符正则）。这里只需要一个布尔判定，
+    复用 :mod:`pathlib` 的 ``is_absolute`` 即可 —— 同时覆盖 POSIX 与 Windows 形态，
+    且 ``C:/x`` 在 :class:`~pathlib.PurePosixPath` 下是相对、在
+    :class:`~pathlib.PureWindowsPath` 下是绝对，两者取或正好。
+    """
+    return PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
+
+
+def is_installed_path(path: str) -> bool:
+    """该标记路径是否落在 Python **安装目录**里（噪声，v1.4 T4.1）。
+
+    判据（只认这三条，避免"看起来像就丢"的宽泛猜测）：
+
+    1. 任一路径片段是 ``site-packages`` / ``dist-packages``（不管是否绝对路径）；
+    2. 任一路径片段以 ``python3`` 开头（``/usr/lib/python3.12/…``、``Python312``）；
+    3. **绝对路径**里出现 ``lib`` 片段（Windows 的 ``…/Lib/…`` 大小写不定，
+       统一 lower 后比较）。
+
+    ★ 第 3 条限定「绝对路径」：项目里很常见的相对目录 ``lib/utils.py`` 不能被误伤
+    （那是用户代码，它的标记必须留着，否则归因会把真问题当噪声丢掉）。
+
+    Args:
+        path: 标记里的路径（``path:line`` 的 path 部分）。
+
+    Returns:
+        ``True`` = 安装目录路径（应丢弃）。
+    """
+    text = str(path or "").strip().replace("\\", "/")
+    parts = [item for item in text.split("/") if item]
+    if not parts:
+        return False
+    absolute = _is_absolute_path(text)
+    for part in parts:
+        lowered = part.lower()
+        if lowered in _INSTALLED_SEGMENTS:
+            return True
+        if lowered.startswith("python3"):
+            return True
+        if absolute and lowered == "lib":
+            return True
+    return False
+
+
 def _collect(outputs: Sequence[str]) -> list[_Marker]:
-    """按出现顺序收集去重后的标记（列表而非集合：``sample_markers`` 需保序）。"""
+    """按出现顺序收集去重后的标记（列表而非集合：``sample_markers`` 需保序）。
+
+    v1.4（T4.1）：收集时**就地**丢弃安装目录路径（:func:`is_installed_path`）。
+    ★ 过滤必须在这里（而不是只在 ``sample_markers`` 采样处）—— 基线侧与合并树侧
+    都要过 ``_collect``，只有两侧口径一致，差集（``introduced`` / ``pre_existing``）
+    才有意义；只滤采样处会让"噪声标记"继续参与判定。
+    """
     seen: set[str] = set()
     markers: list[_Marker] = []
     for text in outputs:
         for marker in _scan(str(text or "")):
+            if is_installed_path(marker.path):
+                continue  # 安装目录噪声：与本次生成无关（docs/15 §3.4）
             if marker.key in seen:
                 continue
             seen.add(marker.key)
@@ -375,4 +439,5 @@ __all__ = [
     "CommandOutput",
     "FailureAttribution",
     "attribute_failure",
+    "is_installed_path",
 ]

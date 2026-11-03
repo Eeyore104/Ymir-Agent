@@ -620,8 +620,23 @@ class EvaluationHarness:
         version: int | None = None,
         requirement: str | None = None,
         suites_dir: Any = None,
+        run_id: str | None = None,
     ) -> EvaluationReport:
-        """项目级评测：对指定产物（默认 ``code``）跑套件口径的四维评估。"""
+        """项目级评测：对指定产物（默认 ``code``）跑套件口径的四维评估。
+
+        ★ v1.4 返修 4（QA R4 Q-R4-02）：报告必须**自证评的是哪一版树**。
+        ``artifact_version`` 取 ``TaskOut.artifact_ref["version"]``（**实际加载到的**
+        版本，不是调用方嘴上说的版本），与 ``gate.HarnessEvaluationGate._build_report``
+        完全同源 —— 那里的 ``artifact_version`` 早就这么取，本函数此前漏抄。
+
+        漏抄的后果是「补评测自愈」永不收敛：``POST /projects/{id}/evaluations``
+        存盘的报告 ``artifact_version`` 恒为 ``null`` ⇒ 提升闸门
+        （``api/routers/artifacts.py::_report_version_matches``）按"拿不到结论"
+        fail-closed 409，而用户刚刚补评完正是为了解锁 —— 越补越锁。
+
+        ``run_id`` 同理：报告根部记下归属 run（缺省 ``None`` ⇒ 沿用既有 ``"run_id": null``，
+        与 CLI / 脚本路径逐字节一致）。
+        """
         suite = EvalSuite.load(suite_id, suites_dir=suites_dir)
         checks = suite.tasks[0].checks if suite.tasks else []
         if requirement is None:
@@ -637,6 +652,7 @@ class EvaluationHarness:
         started = time.perf_counter()
         task_out = await harness.evaluate_task(task, project_id=project_id, suite=suite)
         wall_time_ms = int((time.perf_counter() - started) * 1000)
+        resolved_version = task_out.artifact_ref.get("version")
         return EvaluationReport.build(
             suite_id=suite.id,
             suite_version=suite.version,
@@ -645,6 +661,13 @@ class EvaluationHarness:
             thresholds=suite.thresholds,
             tasks=[task_out],
             wall_time_ms=wall_time_ms,
+            run_id=run_id,
+            artifact_version=(
+                resolved_version
+                if isinstance(resolved_version, int)
+                and not isinstance(resolved_version, bool)
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------ 加载
