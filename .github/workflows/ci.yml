@@ -78,9 +78,14 @@ jobs:
         run: docker build -f docker/sandbox.Dockerfile -t ymir-sandbox:ci .
 
       - name: Inspect image metadata
+        # 2026-11-03 修：镜像**完全没有 Labels 键**时 `.Config` 里取不到 `Labels`，
+        # 裸写 `index .Config.Labels "..."` 会 template parsing error
+        # （nightly 自 v1.3 起一直红，run 41431980817；本地已复现）。
+        # 注意 `{{if .Config.Labels}}` 同样报错（访问即失败），必须用
+        # `index .Config "Labels"` 判空 —— 缺键返回零值，不报错。
         run: |
           docker image inspect ymir-sandbox:ci \
-            --format 'image={{.Id}} size={{.Size}} base={{index .Config.Labels "org.opencontainers.image.base.name"}}'
+            --format 'image={{.Id}} size={{.Size}} base={{if index .Config "Labels"}}{{index (index .Config "Labels") "org.opencontainers.image.base.name"}}{{else}}unspecified{{end}}'
 
       - name: Smoke / offline toolchain (pytest + ruff + pandas + node)
         run: |

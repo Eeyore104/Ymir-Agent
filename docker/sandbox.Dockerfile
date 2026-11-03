@@ -39,6 +39,16 @@ FROM node:20-slim AS node-runtime
 # ---------- stage 2：沙箱主镜像 ----------
 FROM python:3.12-slim
 
+# OCI 元数据（2026-11-03）：CI 的 "Inspect image metadata" 步骤会读
+# `org.opencontainers.image.base.name` 作为该镜像的基础镜像名。
+# 镜像**没有任何 LABEL** 时 `.Config` 里根本没有 `Labels` 键，docker 的 Go 模板
+# 访问即报 `map has no entry for key "Labels"` 并让该步骤 exit 1 —— nightly
+# 因此自 v1.3 起长期红（run 41431980817）。这里补 LABEL 让字段有意义，
+# CI 侧另加判空兜底（`tests/test_ci_workflow_contract.py` 钉住）。
+LABEL org.opencontainers.image.base.name="python:3.12-slim" \
+      org.opencontainers.image.title="ymir-agent sandbox" \
+      org.opencontainers.image.description="pytest/ruff/pandas/numpy + node 20 toolchain, offline ready"
+
 # 可覆盖的 PyPI 索引（构建期参数，不写死在层里）
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
