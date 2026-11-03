@@ -223,6 +223,39 @@ v1.2 真跑暴露的核心问题：**模型在增量模式下会重写 `tests/co
 
 设计与实施记录见 **`docs/13-增量设计与任务列表-v1.3.1.md`**（§9 为 as-built：契约映射 / 八条红线 / 四条限定 / 真跑回写 / 遗留去向），验收结论与已知限制见 **`docs/14-验收报告-v1.3.1.md`**。
 
+### v1.4（验收完成 2026-11-02）：堵住两条质量传染路径 + 三项 P2
+
+本版的两项核心不是"新增功能"，而是**堵住两条质量传染路径**：坏补丁不再被整文件丢弃，也不再被静默固化成坏基线。
+
+| 能力 | 一句话 |
+|---|---|
+| **★2 符号级回退（`revert` 第四态）** | 符号删除命中后不再"整文件回退"（那会把该文件里的正当重构一起丢掉）：`revert` 只把**被删且仍被未改动基线文件引用**的顶层符号按依赖闭包（BFS，单文件上限 64）插回，恢复点落在其装饰器之后，模型对同一文件的其它改动逐字节保留 ⇒ 记为 `symbol_regression_reverted:<n>` |
+| **★3 提升健康度闸门** | `POST /projects/{id}/baselines/from-merge` 按报告裁决分流：`unhealthy` ⇒ **409**，`unknown`（含 CLI 无 `eval_verdict`、报告缺字段）⇒ **409** fail-closed；`force=true` 可越权，留痕落"版本 `message` + 响应 `warning`"（`baseline_promoted_unhealthy:1` / `..._unknown:1`），**不写** `patch_manifest.json`（否则破坏 `content_hash == merged_files_hash`） |
+| **报告版本与产物双绑定** | 报告写入 `run_id` + `artifact_version`，闸门对 `(run_id, artifact_version, artifact_name)` 三元组双向断言 —— 少一个字段、类型不符、或"用 `prd` 的报告给 `code` 背书"一律按未知处理；服务端从 `artifact_versions.run_id` 反查归属，控制台补评测无需额外参数即可收敛 |
+| **`skeleton_filled` 真跑覆盖** | 真实模板树裁掉骨架文件 ⇒ `probe_mode="skeleton_filled"`、`skeleton_added` 记录补了哪些，且 check 在**补齐后**的树上执行（W3 覆盖缺口） |
+| **`sample_markers` 过滤** | 失败采样标记过滤掉 `site-packages` / `dist-packages` / `python3*` / 绝对 `lib` 等 8 类 stdlib 与三方路径形态，噪声不再淹没证据 |
+| **`ruff` per-file-ignores** | 模板骨架改 `[lint.per-file-ignores]`、检查命令显式带 `--per-file-ignores "app/**:B008"` —— 放宽面收窄到单目录单规则，不再靠全局 `--ignore` |
+
+**质量数据（实测）**：后端 **1102 passed**（全部 mock LLM、0 费用）· 前端 **77 passed / 14 files** · `ruff check .` / `scripts/check_import_graph.py`（分层 + 循环依赖）/ `alembic check` 零漂移 / `npm run build`（1901 modules，`index` 492.44 kB / gzip 167.41 kB）全绿。
+
+| 项 | v1.3.1 | v1.4 |
+|---|---|---|
+| 后端测试 | 1000 | **1102**（+102） |
+| 前端测试 | 72 | **77**（+5，14 个文件） |
+| 数据库迁移 | — | **零新增**（`alembic check` 无漂移） |
+
+**真跑验收**：4 次真实模型 + 真实 Docker 沙箱 + 1 次 API 补评，累计 **¥1.016 894**（33 次调用 / 252 389 tokens；证据归档在 `data/v14/`，不入库）。R-a 真跑命中 `symbol_regression_reverted:1` —— `create_app` 与基线逐字节相同，而模型新增的 `app/core/deps.py` 等模块**全部保留**；R-b 真跑走通 `409 unknown ⇒ force 201`（留痕）与 `healthy ⇒ 201`（无 `warning`，不误拦）。
+
+**A1–A10 判定：9 PASS + 1 PARTIAL**（A6 `sample_markers` 记账）。A6 的过滤已做，但 `code.json` 在**编码阶段**落盘、归因标记在**评测阶段**才产生，接线要动"评测回写产物"的结构 ⇒ 留给 v1.5，已如实标注、未按 PASS 计。
+
+**v1.4 的三条能力边界**：
+
+1. **`revert` 只保证 `def` / `class` 依赖闭合**（含装饰器与同文件内引用，单文件上限 64）—— 模块级**赋值**与 `import` 别名不还原，因此不保证整棵树可运行；超限或闭包不闭合时退回原有语义；
+2. **闸门读的是"已有报告的结论"，不重跑探针**（零额外沙箱调用是设计目标）—— 因此 ① 报告正文可被人工改写，这条判据是"防串味"不是"防伪造"；② 报告路径下 `skipped` 一律按未知（只有探针路径才把"跑不了"当放行）；③ 模板的 `blocking` 集合只有 `fe-build web`，"后端导入即炸、前端能构建"的树仍会判 `healthy`；
+3. **`from-merge` 只接受 `mode == "patch"` 的增量产物**，且 CLI 入口不装配 repair stack ⇒ CLI 发起的 run 永远拿不到 `eval_verdict`，只能走 `force` 越权（fail-closed 的预期行为，非缺陷）。
+
+设计与任务分解见 **`docs/15-增量设计与任务列表-v1.4.md`**（§9 为 as-built：8 条偏差 + 3 条未覆盖），验收结论与已知限制见 **`docs/16-验收报告-v1.4.md`**（§5 记录七轮 QA 共 24 项缺陷的修复与复验）。
+
 ## 架构一览
 
 ```mermaid
