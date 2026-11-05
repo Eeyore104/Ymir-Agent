@@ -57,6 +57,22 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 SCORE_MIN = 0.0
 SCORE_MAX = 100.0
 
+# --- v1.5 环境缺失 / 无用例 / 缺构建物 的**唯一口径**短码（docs/17 §1.2.4）---
+
+#: 依赖缺失的跳过原因前缀（``requires_missing_deps:<pkg>``）：与"镜像没这个程序"
+#: （``requires_missing:<bin>``）及"基线缺文件"（``requires_file_missing:<path>``）
+#: **刻意不同**——三者问题不同、处置也不同。
+MISSING_DEPS_PREFIX: str = "requires_missing_deps:"
+
+#: 上游构建物缺失的跳过原因前缀（``requires_missing_files:<path>``）：级联跳过（T1-R6）。
+MISSING_BUILD_OUTPUT_PREFIX: str = "requires_missing_files:"
+
+#: 测试"没跑到"（pytest 未收集到用例 ⇒ 退出码 5）的跳过原因：**不是**失败（T1-R4）。
+NO_TESTS_COLLECTED: str = "no_tests_collected"
+
+#: 未验证组的报告告警前缀（``runnability_unverified:<group>``，R8 唯一文案）。
+UNVERIFIED_GROUP_PREFIX: str = "runnability_unverified:"
+
 
 def clamp(value: float, low: float = SCORE_MIN, high: float = SCORE_MAX) -> float:
     """将分数裁剪到 ``[low, high]``。"""
@@ -128,6 +144,9 @@ class CheckRun:
 
     command: str
     group: str = ""
+    #: ★ v1.5：可用性档位（从 ``EvalCheck.tier`` 抄来）。``harness`` 据此按
+    #: 「组 × 档」判"某组某档一条都没真的执行"⇒ ``unverified``（docs/17 §1.2.4）。
+    tier: str = ""
     status: str = "failed"  # passed | failed | skipped
     #: 该检查的权重（来自 ``EvalCheck.weight``）—— 分组配分公式
     #: ``Σ权重(通过)/Σ权重(非 skipped)`` 需要它；v1.3 追加，默认 1.0。
@@ -154,6 +173,7 @@ class CheckRun:
         return {
             "command": self.command,
             "group": self.group,
+            "tier": self.tier,
             "status": self.status,
             "weight": self.weight,
             "exit_code": self.exit_code,
@@ -189,6 +209,21 @@ class EvalCheck(BaseModel):
     #: 结尾的目录前缀 = 该目录下 ≥1 个文件）。**只在探针侧**生效：基线里一个都
     #: 没有 ⇒ 该检查 ``skipped`` + ``baseline_incomplete``，而不是判 unhealthy。
     requires_files: list[str] = Field(default_factory=list)
+    # ---- ★ v1.5（docs/17 §1.2.1 / §1.2.3 / §1.2.5）：四个新字段，全部带默认值 ----
+    #: 可用性档位：``loadable``(D1) / ``behavior``(D2) / ``style``(D3) / ``""``(老口径)。
+    #: **本模块不校验取值**（那是 ``templates.loader`` 校验 24 的职责，且方向更顺）：
+    #: 这里只做字段透传 + 抄进 ``CheckRun.tier`` 供 ``harness`` 按「组 × 档」判未验证。
+    tier: str = ""
+    #: 该检查依赖的**交付树依赖声明**（``python:*`` / ``node:*`` / 具体包名）。
+    #: 交付树里声明了、镜像却没预装 ⇒ ``skipped(requires_missing_deps:<pkg>)``，
+    #: **不扣分、不阻断**（PRD T1-R2：环境缺失必须与代码失败可区分）。
+    requires_deps: list[str] = Field(default_factory=list)
+    #: 该检查依赖的**本 run 上游产出的构建物**（以 ``/`` 结尾的目录前缀）。
+    #: 缺物 ⇒ 级联 ``skipped(requires_missing_files:<path>)``，不判 fail（T1-R6）。
+    requires_build_output: str = ""
+    #: 把该退出码映射为 ``skipped(no_tests_collected)``（pytest 未收集到用例 = 5）。
+    #: "没测"不是"测失败"：新建项目第一轮不该因空测试目录永远无法通过（T1-R4）。
+    no_tests_exit_code: int | None = Field(default=None, gt=0)
 
 
 class EvalTask(BaseModel):
@@ -237,6 +272,22 @@ class EvalTask(BaseModel):
     #: ``{}`` ⇒ 探针树 = 基线原样 ⇒ ``probe_mode`` 不进报告 ⇒ 与 v1.3 逐字节一致。
     #: ★ **刻意不设** ``baseline_reserved``（S3：``patch={}`` 下 reserved 分支不可达）。
     baseline_skeleton: dict[str, str] = Field(default_factory=dict)
+    #: ★判据自证（v1.5 §1.1.4）：本次用的判据**种类 / 归属 / 版本**。
+    #: 由唯一装配点（``evaluation.run_task._assemble``）写入，``harness`` 原样搬进
+    #: ``TaskOut`` ⇒ 报告根部自证判据来源（调用方**不能**传，杜绝"忘传就失效"）。
+    #: 空串 = 老口径（套件批量 / 未装配）⇒ 报告不带这三个键（字节契约）。
+    criteria_source: str = ""
+    template_id: str = ""
+    criteria_version: str = ""
+    #: ★ v1.5（docs/17 §1.2.3）：沙箱镜像预装的包清单（**纯数据**，生态名 -> 包名）。
+    #: 由唯一装配点（``evaluation.run_task``）从 ``templates.models.image_package_map()``
+    #: 注入；``evaluation`` 侧据此判 ``requires_deps`` 是否缺失（``evaluation.deps``）。
+    #: ★ 空 dict = "镜像表未知" ⇒ **不做依赖判定**（不误伤：宁可少跳过也不全军覆没）。
+    image_packages: dict[str, list[str]] = Field(default_factory=dict)
+    #: ★ v1.5 修复轮 D-2（`requirement` 的来源）：``run`` = 取归属 run 的原始需求；
+    #: ``caller`` = 无归属 run 时用调用方传的；``none`` = 两边都没有。
+    #: 由**装配点**写入、报告根部从 ``tasks[0]`` 派生 —— 调用方无法左右这个判断。
+    requirement_source: str = ""
 
 
 @dataclass
@@ -441,27 +492,40 @@ class Evaluator(ABC):
 _STREAM_LIMIT = 600
 
 
-async def run_checks(
+async def run_checks(  # noqa: PLR0913 - 环境判定的输入就是这么多（见 docstring）
     sandbox: SandboxSession | None,
     checks: Sequence[EvalCheck],
     *,
     exec_timeout: float = 120.0,
     evidence: list[Evidence] | None = None,
+    missing_deps: Mapping[str, Sequence[str]] | None = None,
+    image_packages: Mapping[str, Sequence[str]] | None = None,
 ) -> list[CheckRun]:
     """逐条执行 ``checks``，返回结构化结果（顺序 = 声明顺序，确定性）。
 
-    单条规则（v1.3 T1.2，docs/11 §7.3-3）：
+    单条规则（v1.3 T1.2，docs/11 §7.3-3；v1.5 T1-R2/R4/R6 扩充）：
 
-    1. ``requires`` 非空 → 先 ``command -v <bin>`` 探测；非 0 ⇒
+    1. ★ v1.5 **依赖缺失**：``requires_deps`` 声明了、而交付树声明的包镜像里没有
+       ⇒ ``skipped`` + ``requires_missing_deps:<pkg>``（**不扣分、不阻断**，PRD T1-R2）；
+    2. ★ v1.5 **缺上游构建物**：``requires_build_output`` 声明了、沙箱工作区里没有该
+       目录下任何文件 ⇒ ``skipped`` + ``requires_missing_files:<path>``（级联跳过，T1-R6）；
+    3. ``requires`` 非空 → 先 ``command -v <bin>`` 探测；非 0 ⇒
        ``status="skipped"`` + ``skipped_reason="requires_missing:<bin>"``（**不进分母**）；
-    2. 超时取 ``check.timeout_s or exec_timeout``；
-    3. ``exit_code == 0 and not timed_out`` ⇒ ``passed``，否则 ``failed``；
-    4. 证据 detail **保持 v1.2 原样**（``exit=… timed_out=… duration=…ms｜片段``），
+    4. 超时取 ``check.timeout_s or exec_timeout``；
+    5. ``exit_code == 0 and not timed_out`` ⇒ ``passed``；
+    6. ★ v1.5 **无用例**：退出码 == ``no_tests_exit_code``（pytest 的 5）⇒
+       ``skipped`` + ``no_tests_collected``（"没测"≠"测失败"，T1-R4）；其余非 0 ⇒ ``failed``；
+    7. 证据 detail **保持 v1.2 原样**（``exit=… timed_out=… duration=…ms｜片段``），
        仅当 ``check.blocking`` 时末尾追加 `` blocking=True``（``gate._EVIDENCE_RE``
        用的是 ``search``，仍能匹配）。
 
+    判定顺序是**刻意**的：①② 都是"运行前、与代码无关、可重复"的环境判定
+    （零沙箱调用，最便宜也最确定），先判它们才不会把"环境缺失"记成"代码坏了"。
+
     设计取舍：``sandbox is None`` 时**不执行**，全部记 ``skipped``（``no_sandbox``）——
     调用方（``runnability``）本来就有"无沙箱走静态判定"的分支，这里不重复实现降级。
+    ``skipped`` 一律**不写证据行**（v1.2 起的既有口径：证据 = 真的跑过的命令），
+    否则 ``gate._failed_checks`` 会把 ``exit=5`` 当成失败项。
     """
     runs: list[CheckRun] = []
     for check in checks:
@@ -469,41 +533,46 @@ async def run_checks(
             continue
         command = check.run
         group = check.group or ""
+        tier = str(getattr(check, "tier", "") or "")
         blocking = bool(check.blocking)
         requires = (check.requires or "").strip()
         timeout = check.timeout_s or exec_timeout
+
         if sandbox is None:
-            runs.append(
-                CheckRun(
-                    command=command,
-                    group=group,
-                    status="skipped",
-                    weight=check.weight,
-                    blocking=blocking,
-                    skipped_reason="no_sandbox",
-                )
-            )
+            runs.append(_skipped_run(check, "no_sandbox"))
             continue
+        # ① 依赖缺失（环境探针）
+        deps_reason = _dependency_skip_reason(check, missing_deps, image_packages)
+        if deps_reason:
+            runs.append(_skipped_run(check, deps_reason))
+            continue
+        # ② 上游构建物缺失（级联跳过）
+        build_output = str(getattr(check, "requires_build_output", "") or "").strip()
+        if build_output and not await _has_build_output(sandbox, build_output, timeout):
+            runs.append(_skipped_run(check, f"{MISSING_BUILD_OUTPUT_PREFIX}{build_output}"))
+            continue
+        # ③ 前置可执行文件
         if requires:
             probe = await sandbox.exec(f"command -v {requires}", timeout=timeout)
             if probe.exit_code != 0 or probe.timed_out:
-                runs.append(
-                    CheckRun(
-                        command=command,
-                        group=group,
-                        status="skipped",
-                        weight=check.weight,
-                        blocking=blocking,
-                        skipped_reason=f"requires_missing:{requires}",
-                    )
-                )
+                runs.append(_skipped_run(check, f"requires_missing:{requires}"))
                 continue
         result = await sandbox.exec(command, timeout=timeout)
+        no_tests_code = getattr(check, "no_tests_exit_code", None)
+        if (
+            not result.timed_out
+            and no_tests_code is not None
+            and result.exit_code == no_tests_code
+        ):
+            # ⑥ "没测"不是"测失败"：pytest 退出码 5（未收集到用例）
+            runs.append(_skipped_run(check, NO_TESTS_COLLECTED, exit_code=result.exit_code))
+            continue
         state = "passed" if result.exit_code == 0 and not result.timed_out else "failed"
         snippet = (result.stdout or result.stderr or "").strip()[:_STREAM_LIMIT]
         run = CheckRun(
             command=command,
             group=group,
+            tier=tier,
             status=state,
             weight=check.weight,
             exit_code=result.exit_code,
@@ -522,6 +591,55 @@ async def run_checks(
                 detail += " blocking=True"
             evidence.append(Evidence("command", command, detail))
     return runs
+
+
+def _skipped_run(
+    check: EvalCheck, reason: str, *, exit_code: int | None = None
+) -> CheckRun:
+    """构造「跳过」的检查结果（四处跳过分支共用，字段不会被写歪）。"""
+    return CheckRun(
+        command=check.run,
+        group=check.group or "",
+        tier=str(getattr(check, "tier", "") or ""),
+        status="skipped",
+        weight=check.weight,
+        exit_code=exit_code,
+        blocking=bool(check.blocking),
+        skipped_reason=reason,
+    )
+
+
+def _dependency_skip_reason(
+    check: EvalCheck,
+    missing_deps: Mapping[str, Sequence[str]] | None,
+    image_packages: Mapping[str, Sequence[str]] | None,
+) -> str:
+    """``requires_deps`` 判定（委托 :mod:`ymir.evaluation.deps`，本模块不重复实现）。"""
+    from ymir.evaluation.deps import check_requires_deps
+
+    return check_requires_deps(
+        getattr(check, "requires_deps", None),
+        missing_deps=missing_deps,
+        image_packages=image_packages,
+    )
+
+
+async def _has_build_output(
+    sandbox: SandboxSession, path: str, timeout: float
+) -> bool:
+    """工作区里是否已有 ``path``（目录前缀语义：该目录下 ≥1 个文件）。
+
+    ★ 为什么用 ``list_files`` 而不是记"上游检查跑过了"：构建可能**失败**（那本身已被
+    D1 阻断），此时 ``dist/`` 不存在 ⇒ 下游按"缺产物"跳过，而不是把同一件事记两次失败。
+    语义与 ``requires_files`` 的目录前缀判定**同构**（≥1 个文件），只是作用在不同侧。
+    """
+    try:
+        paths = await sandbox.list_files(".")
+    except Exception:  # noqa: BLE001 - 列不出文件按"缺产物"跳过（绝不判 fail）
+        return False
+    prefix = path if path.endswith("/") else f"{path}/"
+    return any(str(item).startswith(prefix) or str(item) == path for item in paths)
+
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}|[\u4e00-\u9fff]{2,}")
 _PY_SUFFIXES = (".py",)

@@ -550,6 +550,9 @@ class BenchmarkRunner:
                 project_id=project_id,
                 artifact_name=task.artifact_name,
                 checks=list(task.checks),
+                # ★ v1.5（T03.6）：镜像包表必须一起继承 —— 否则兜底路径的
+                # ``requires_deps`` 判定会静默失效（"同一把尺子"的第三个入口）。
+                image_packages=dict(task.image_packages),
             )
             outcome = await harness.evaluate_task(
                 bound, project_id=project_id, suite=suite

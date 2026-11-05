@@ -54,6 +54,8 @@ from ymir.evaluation.baseline_probe import (
 from ymir.evaluation.evaluators import default_evaluators
 from ymir.evaluation.evaluators.base import (
     DIMENSION_ORDER,
+    NO_TESTS_COLLECTED,
+    UNVERIFIED_GROUP_PREFIX,
     EvalContext,
     EvalScore,
     EvalTask,
@@ -298,6 +300,8 @@ class EvaluationHarness:
         regression, regression_reason = self._regression(probe, runs)
         # v1.3.1（T2.2）：归因**提示**（不参与 verdict / 分数 / regression）
         attribution = self._attribution(probe, runs, task)
+        # ★ v1.5（T03.7 / docs/17 §1.2.4）：某组某档"一条检查都没真的执行"⇒ 未验证
+        unverified_groups = _unverified_groups(task.checks, runs)
 
         warnings: list[str] = []
         if task.baseline_unavailable:
@@ -316,6 +320,11 @@ class EvaluationHarness:
             for run in runs
         ):
             warnings.append(FRONTEND_BUILD_SKIPPED_WARNING)
+        # v1.5：未验证必须**可披露**（R8 唯一文案；禁止出现"通过"字样）
+        warnings.extend(f"{UNVERIFIED_GROUP_PREFIX}{group}" for group in unverified_groups)
+        if any(run.skipped_reason == NO_TESTS_COLLECTED for run in runs):
+            # A4："没测"≠"测失败" —— 退出码 5 被映射成 skipped，但必须显式披露
+            warnings.append(NO_TESTS_COLLECTED)
 
         wall_time_ms = int((time.perf_counter() - started) * 1000)
         return TaskOut(
@@ -346,6 +355,16 @@ class EvaluationHarness:
             blocking_failed=blocking_failed,
             skipped_checks=skipped_checks,
             failure_attribution=attribution,
+            # v1.5（T01.3）：判据三键由装配点写入 ``EvalTask``，这里**原样平移** ——
+            # 报告根部（``EvaluationReport.build``）再从 ``tasks[0]`` 派生，
+            # 任何调用方都无法"忘传"（那是本轮要堵的失效形态）。
+            criteria_source=getattr(task, "criteria_source", "") or "",
+            template_id=getattr(task, "template_id", "") or "",
+            criteria_version=getattr(task, "criteria_version", "") or "",
+            # ★ v1.5（T03.7）：未验证的组（空 ⇒ 键不进 JSON，A19 字节契约不变）
+            unverified_groups=unverified_groups,
+            # ★ v1.5 修复轮 D-2：需求来源随任务进报告（空 ⇒ 键不进 JSON）
+            requirement_source=getattr(task, "requirement_source", "") or "",
         )
 
     async def _probe(
@@ -372,6 +391,9 @@ class EvaluationHarness:
             cache=self._probe_cache,
             cache_key=baseline_cache_key(base_files, checks, skeleton=skeleton or None),
             skeleton=skeleton or None,
+            # ★ v1.5（T03.6）：探针侧与合并树侧用**同一份**镜像包表 ⇒ 同一个
+            # ``requires_deps`` 在两侧得到同一个结论（否则"探针说跳过、合并树说失败"）。
+            image_packages=dict(getattr(task, "image_packages", None) or {}),
         )
 
     @staticmethod
@@ -480,6 +502,11 @@ class EvaluationHarness:
                 "runnability": (limits.runnability if limits else 60.0),
             },
             wall_time_ms=int((time.perf_counter() - started) * 1000),
+            # v1.5（T01.3）：未执行的任务也要自证"本来打算按哪套判据评"
+            criteria_source=getattr(task, "criteria_source", "") or "",
+            template_id=getattr(task, "template_id", "") or "",
+            criteria_version=getattr(task, "criteria_version", "") or "",
+            requirement_source=getattr(task, "requirement_source", "") or "",
         )
 
     def without_judge(self) -> EvaluationHarness:
@@ -621,13 +648,26 @@ class EvaluationHarness:
         requirement: str | None = None,
         suites_dir: Any = None,
         run_id: str | None = None,
+        template_id: str | None = None,
+        template_hash: str | None = None,
+        requirement_source: str = "",
     ) -> EvaluationReport:
-        """项目级评测：对指定产物（默认 ``code``）跑套件口径的四维评估。
+        """项目级评测（**薄壳**）：装配交给唯一装配点，本函数只做参数解析与落报告。
+
+        ★ v1.5（T01.2，docs/17 §1.1.2）：**不再自拼 ``EvalTask``、不再直接取套件首个
+        任务的 ``checks``** —— 那正是"补评测用套件 checks、gate 用模板
+        checks"这条双实现裂缝（v1.4 §0.3 的闸门旁路）。现在统一走
+        :func:`ymir.evaluation.run_task.build_task_for_project`，与 gate 的
+        ``build_task_for_run`` 共用 :func:`_assemble`（A8"同尺"总断言）。
+
+        模板（判据来源）按优先级回退（§1.1.3 候选③）：
+        调用方反查的 ``template_id``（归属 run 的模板）> 目标产物的
+        ``patch_manifest.provenance`` > 套件口径（显式 ``criteria_source="suite"``）。
 
         ★ v1.4 返修 4（QA R4 Q-R4-02）：报告必须**自证评的是哪一版树**。
         ``artifact_version`` 取 ``TaskOut.artifact_ref["version"]``（**实际加载到的**
-        版本，不是调用方嘴上说的版本），与 ``gate.HarnessEvaluationGate._build_report``
-        完全同源 —— 那里的 ``artifact_version`` 早就这么取，本函数此前漏抄。
+        版本，不是调用方嘴上说的版本），与 ``build_run_report`` 完全同源 ——
+        那里的 ``artifact_version`` 早就这么取，本函数此前漏抄。
 
         漏抄的后果是「补评测自愈」永不收敛：``POST /projects/{id}/evaluations``
         存盘的报告 ``artifact_version`` 恒为 ``null`` ⇒ 提升闸门
@@ -636,18 +676,78 @@ class EvaluationHarness:
 
         ``run_id`` 同理：报告根部记下归属 run（缺省 ``None`` ⇒ 沿用既有 ``"run_id": null``，
         与 CLI / 脚本路径逐字节一致）。
+
+        Args:
+            project_id: 项目 id。
+            suite_id: 套件 id（缺省 ``default``）。
+            artifact_name: 目标产物名（缺省 ``code``）。
+            version: 目标产物版本（``None`` = latest）。
+            requirement: 需求文本（``None`` ⇒ 从项目最新 run 的 context 取）。
+            suites_dir: 套件目录覆盖（测试用）。
+            run_id: 报告的归属 run（**不进 ``EvalTask``**，见 §5 的边界）。
+            template_id: 调用方反查出的模板 id（最高优先级判据来源）。
+            template_hash: 与之同源的模板指纹（可空 ⇒ 由 ``patch_manifest`` 或现算补足）。
+            requirement_source: ``requirement`` 的来源（``run`` / ``caller`` / ``none``，
+                v1.5 D-2）。端点在有归属 run 时传 ``"run"``（与 gate 的输入同源）。
         """
-        suite = EvalSuite.load(suite_id, suites_dir=suites_dir)
-        checks = suite.tasks[0].checks if suite.tasks else []
+        # ★ 惰性 import：``run_task`` 顶层 import 本模块（``EvaluationHarness``），
+        #   模块级反向 import 会成环。函数级 import 是唯一不会破图的写法。
+        from ymir.evaluation.run_task import build_task_for_project  # noqa: PLC0415
+
         if requirement is None:
+            # ★ 兜底取"最新 run 的 requirement"时，**来源也要跟着改成 run** ——
+            #   否则报告会写着"需求来自 run"，``requirement_source`` 却说 ``none``
+            #   （v1.5 修复轮 D-2 的一致性收口）。
             requirement = await self._latest_requirement(project_id)
-        task = EvalTask(
-            id=f"project:{project_id}",
-            requirement=requirement or "",
+            if requirement.strip() and requirement_source in {"", "none"}:
+                requirement_source = "run"
+        # 第 2 档（产物溯源）只在第 1 档拿不到时才付费读一次产物正文（§1.1.3 的取舍）
+        manifest_files = (
+            None
+            if template_id
+            else await self._load_version_files(project_id, artifact_name, version)
+        )
+        task, suite, _criteria = build_task_for_project(
+            project_id=project_id,
             artifact_name=artifact_name,
             version=version,
-            checks=checks,
+            template_id=template_id,
+            template_hash=template_hash,
+            manifest_files=manifest_files,
+            run_id=run_id,
+            requirement=requirement,
+            # ★ v1.5 修复轮 D-2：需求来源由端点判定（有归属 run ⇒ "run"）
+            requirement_source=requirement_source,
+            default_suite=suite_id,
+            suites_dir=suites_dir,
         )
+        return await self.evaluate_project_task(
+            task, suite, project_id=project_id, run_id=run_id
+        )
+
+    async def evaluate_project_task(
+        self,
+        task: EvalTask,
+        suite: EvalSuite,
+        *,
+        project_id: str | None,
+        run_id: str | None = None,
+    ) -> EvaluationReport:
+        """评测一个**已装配**的项目维度任务并产出报告（与 gate 的 ``build_run_report`` 同构）。
+
+        拆出来的理由（§1.1.2）：调用方若已用 ``build_task_for_project`` 装配好任务
+        （例如需要复用 ``criteria`` 三元组做披露），不该再让本模块重装配一次 ——
+        重装配就是"两份拼装"的起点。
+
+        Args:
+            task: 已装配任务（``artifact_name`` / ``version`` / 判据三元组均已就位）。
+            suite: 该任务所属套件（weights / thresholds 来源）。
+            project_id: 取材项目。
+            run_id: 报告的归属 run（只进报告，不进 ``EvalTask``）。
+
+        Returns:
+            :class:`~ymir.evaluation.report.EvaluationReport`（未落盘）。
+        """
         harness = self.with_evaluators(default_evaluators(suite.weights))
         started = time.perf_counter()
         task_out = await harness.evaluate_task(task, project_id=project_id, suite=suite)
@@ -669,6 +769,36 @@ class EvaluationHarness:
                 else None
             ),
         )
+
+    async def _load_version_files(
+        self, project_id: str, artifact_name: str, version: int | None
+    ) -> dict[str, str] | None:
+        """读目标产物版本的**文件集**（供判据第 2 档：``patch_manifest`` 溯源）。
+
+        ★ 只在调用方拿不到模板时被调用（§1.1.3：这笔 I/O 只在第 1 档失败时才付）。
+        已知代价：``_load_task`` 稍后还会再读一次；本地产物读取是毫秒级，
+        若日后 profiling 显示是热点，再引入"预读文件集透传"（本版不做）。
+        **任何异常都返回 ``None``** —— 判据来源缺失只降级，不让评测 500。
+        """
+        try:
+            artifacts = await self._store.list_artifacts(project_id)
+        except Exception:  # noqa: BLE001 - 读不到产物列表 ⇒ 直接落套件口径
+            logger.warning("判据来源：产物列表不可读，按套件口径处理", exc_info=True)
+            return None
+        target = next((item for item in artifacts if item.name == artifact_name), None)
+        if target is None:
+            return None
+        try:
+            loaded = await self._store.load(target.id, version)
+        except Exception:  # noqa: BLE001 - 版本不可读 ⇒ 交给 _load_task 统一处理
+            logger.warning(
+                "判据来源：产物版本不可读（artifact=%s version=%s）",
+                artifact_name,
+                version,
+                exc_info=True,
+            )
+            return None
+        return dict(loaded.files)
 
     # ------------------------------------------------------------------ 加载
 
@@ -895,6 +1025,53 @@ class _Ref:
 def _is_per_task(suite: EvalSuite | None) -> bool:
     """套件是否按任务绑定产物（``None`` 视为既有单项目路径）。"""
     return suite is not None and suite.is_per_task
+
+
+def _unverified_groups(
+    checks: Sequence[Any], runs: Sequence[Any]
+) -> list[str]:
+    """「某组某档声明了检查、却**一条都没真的执行**」的组名（v1.5 T03.7，保序去重）。
+
+    ★★ 判据精确到**「组 × 档」而不是「整组」**（docs/17 §1.2.4 的理由）：
+
+    以 A2 的场景为例——交付树声明了镜像没装的包，于是 ``pytest``（behavior）与
+    ``import app``（loadable）被跳过，而 ``compileall``（loadable，不 import）**照常
+    跑过**。若按"整组全 skipped"判，``backend`` 组不算未验证 ⇒ A2 的
+    ``runnability_unverified:backend`` 断言不成立，而用户的真实疑问
+    （"行为到底验过没有"）也得不到回答。
+
+    组成规则：
+    - 只统计 ``group`` 非空的检查（无组 = 老口径，没有"组"可披露）；
+    - 同一 ``(group, tier)`` 下**全部** ``skipped`` ⇒ 该组未验证
+      （多档只报一次：``unverified`` 是组级结论）；
+    - ``tier`` 为空的检查照常成组（老模板也可能有 group）；
+    - 返回顺序 = 声明顺序（报告稳定，便于断言）。
+
+    Args:
+        checks: 任务声明的检查（``EvalTask.checks``）。
+        runs: 实际执行结果（``run_checks`` 的产物，与**命令类**检查一一对应）。
+    """
+    command_checks = [
+        check
+        for check in checks
+        if getattr(check, "type", "") == "command" and str(getattr(check, "run", "")).strip()
+    ]
+    statuses: dict[tuple[str, str], list[str]] = {}
+    order: list[str] = []
+    for check, run in zip(command_checks, runs, strict=False):
+        group = str(getattr(check, "group", "") or "").strip()
+        if not group:
+            continue
+        tier = str(getattr(check, "tier", "") or "").strip()
+        statuses.setdefault((group, tier), []).append(str(getattr(run, "status", "")))
+        if group not in order:
+            order.append(group)
+    unverified = {
+        group
+        for (group, _tier), items in statuses.items()
+        if items and all(status == "skipped" for status in items)
+    }
+    return [group for group in order if group in unverified]
 
 
 def _bound_project_id(

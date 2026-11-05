@@ -31,7 +31,11 @@ from typing import Any
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ymir.api.routers.artifacts import _known_merged_health, _report_health_status
+from ymir.api.routers.artifacts import (
+    BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE,
+    _known_merged_health,
+    _report_health_status,
+)
 from ymir.artifacts.merge import (
     BOOKKEEPING_FILES,
     DEFAULT_MAX_FILE_BYTES,
@@ -44,6 +48,7 @@ from ymir.artifacts.provenance import (
     BASELINE_ARTIFACT_NAME,
     BASELINE_PROMOTED_UNHEALTHY_CODE,
     BASELINE_PROMOTED_UNKNOWN_CODE,
+    BASELINE_PROMOTED_UNVERIFIED_CODE,
     BaselineHealthUnknownError,
     BaselineUnhealthyError,
     promote_merged_to_baseline,
@@ -1315,6 +1320,10 @@ def _report_json(
     tasks: int = 1,
     artifact_version: int | None = None,
     artifact_name: str | None = None,
+    criteria_source: str | None = "template",
+    template_id: str | None = TEMPLATE_ID,
+    criteria_version: str | None = None,
+    unverified_groups: tuple[str, ...] = (),
 ) -> str:
     """铺一份最小 ``evaluation_report.json``。
 
@@ -1334,6 +1343,16 @@ def _report_json(
     ★ v1.4 返修 5（Q-R5-03）：``artifact_name`` 写进 ``tasks[].artifact_ref.name``
     （真实报告的产物身份就在那里）；默认 ``None`` ⇒ 不带 ``artifact_ref``，
     用来覆盖"没声明产物 ⇒ 不否决"的宽松口径。
+
+    ★★ v1.5 T02.5（**计划内迁移，不是放宽断言**）：报告必须自证**判据来源**，
+    否则读取侧一律按"弱口径 = 拿不到结论"处理（A11）。默认按本文件的真实模板
+    （``TEMPLATE_ID``）填 ``criteria_source="template"`` + ``template_id`` +
+    ``criteria_version``（**现算** YAML 指纹，与提升侧完全同一实现
+    ``provenance.template_yaml_hash``）。不这么填，既有的 HTTP 用例会从 201
+    集体变 409 —— 那是新口径在正常工作，不是回归。
+
+    三个 ``criteria_*`` 参数传 ``None`` ⇒ **不带该键**（模拟 v1.4 风格老报告，
+    供 A11 的反向用例使用）。
     """
     task: dict[str, object] = {"id": "t1", "status": status}
     if artifact_name is not None:
@@ -1348,6 +1367,8 @@ def _report_json(
         task["blocking_failed"] = list(blocking_failed)
     if regression:
         task["regression"] = True
+    if unverified_groups:
+        task["unverified_groups"] = list(unverified_groups)
     payload: dict[str, object] = {
         "suite_id": "t",
         "suite_version": 1,
@@ -1355,6 +1376,15 @@ def _report_json(
     }
     if artifact_version is not None:
         payload["artifact_version"] = artifact_version
+    if template_id is not None:
+        payload["template_id"] = template_id
+    if criteria_source is not None:
+        payload["criteria_source"] = criteria_source
+    if criteria_version is not None:
+        payload["criteria_version"] = criteria_version
+    elif criteria_source == "template" and template_id:
+        # 默认现算"当前模板"的指纹（与提升侧 template_yaml_hash 同一实现）
+        payload["criteria_version"] = template_yaml_hash(DEFAULT_TEMPLATES_DIR, template_id)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1366,24 +1396,39 @@ async def _store_report(
     project_id: str,
     report: str | None = None,
     tenant_id: str = DEFAULT_TENANT_ID,
+    name: str = "evaluation_report",
     **report_kwargs: Any,
 ) -> None:
-    """把一份 ``evaluation_report`` 产物挂到指定 run 上（模拟"已经评测过"）。
+    """把一份报告产物挂到指定 run 上（模拟"已经评测过"）。
 
     ``report_kwargs`` 透传给 :func:`_report_json` —— 其中包括 ``artifact_version``
-    （报告与被提升版本的绑定键，v1.4 返修 3）。
+    （报告与被提升版本的绑定键，v1.4 返修 3）与 v1.5 的 ``criteria_*``。
+
+    ``name``（v1.5 T02.1）：``evaluation_report``（QA/补评测）或 ``eval_verdict``
+    （gate 裁决）—— 读取侧按**产物名优先级**取结论，所以两个名字必须都能铺。
     """
     store = ArtifactStore(session_factory, tmp_path / "artifacts")
     body = _report_json(**report_kwargs) if report is None else report
     await store.save(
         project_id=project_id,
-        name="evaluation_report",
+        name=name,
         artifact_type="report",
         files={"evaluation_report.json": body},
         run_id=run_id,
         created_by="qa",
         tenant_id=tenant_id,
     )
+
+
+async def _health(store: Any, **kwargs: Any) -> str:
+    """``_known_merged_health`` 的**状态**（v1.5 起它返回 :class:`MergedHealthReading`）。
+
+    ★ 为什么保留这个薄壳：v1.5 之前返回的是裸 ``str``。绝大多数用例只关心"结论是
+    什么"，不关心"采纳了哪个产物名 / 有没有分歧"。需要后两者时直接调
+    ``_known_merged_health`` 取 dataclass 字段（见 ``TestReportPriority``）。
+    """
+    reading = await _known_merged_health(store, **kwargs)
+    return reading.status
 
 
 class TestMergedHealthFromReport:
@@ -1396,6 +1441,9 @@ class TestMergedHealthFromReport:
     ★ v1.4 返修 3：这里统一传 ``expected_version=3``（报告也标 ``artifact_version=3``），
     于是**版本绑定之后**的结论仍需满足原有判据 —— 只看"合并树"这一层的用例不会因为
     加了版本维度而失去鉴别力（版本不匹配的用例见 :class:`TestReportVersionBinding`）。
+
+    ★ v1.5 T02.2：这里**不传** ``expected_template_id``（``None`` ⇒ 不做判据绑定），
+    刻意保住本类的鉴别力 —— 判据绑定的正/反例在 :class:`TestCriteriaBinding`。
     """
 
     VERSION = 3
@@ -1569,7 +1617,7 @@ class TestKnownMergedHealthAcrossVersions:
 
         # ★ 除最近一次外也必须看得到（首版这两条都会返回 ""）
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=fx.run_id,
@@ -1580,7 +1628,7 @@ class TestKnownMergedHealthAcrossVersions:
             == "unhealthy"
         )
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=second.run_id,
@@ -1592,7 +1640,7 @@ class TestKnownMergedHealthAcrossVersions:
         )
         # ★ 返修 3 的反向：版本对不上 ⇒ 两份都读不到（不拿别的树的结论）
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=fx.run_id,
@@ -1626,7 +1674,7 @@ class TestKnownMergedHealthAcrossVersions:
 
         store = ArtifactStore(session_factory, tmp_path / "artifacts")
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=fx.run_id,
@@ -2182,7 +2230,7 @@ class TestUiEvaluationUnlocksPromote:
         assert parsed["run_id"] == str(row.run_id) == fx.run_id
 
         # ② 该报告喂给闸门能取到结论（非 ""）
-        health = await _known_merged_health(
+        health = await _health(
             store,
             project_id=fx.project_id,
             run_id=fx.run_id,
@@ -2199,7 +2247,12 @@ class TestUiEvaluationUnlocksPromote:
         )
         if health == "healthy":
             assert promoted.status_code == 201, promoted.text
-            assert "warning" not in promoted.json()["data"], promoted.text
+            # ★ v1.5 修复轮 D-1：补评测报告**没有** ``baseline_runnability``（项目维度
+            #   不跑探针）⇒ "回归未检查"必须披露，不再"201 无 warning"
+            assert (
+                promoted.json()["data"]["warning"]
+                == BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE
+            ), promoted.text
         else:
             assert promoted.status_code == 409, promoted.text
             assert promoted.json()["details"]["reason"] == "baseline_unhealthy"
@@ -2265,7 +2318,7 @@ class TestUiEvaluationUnlocksPromote:
         assert parsed["run_id"] is None
         assert parsed["artifact_version"] == orphan.version
 
-        health = await _known_merged_health(
+        health = await _health(
             store,
             project_id=fx.project_id,
             run_id=fx.run_id,
@@ -2314,7 +2367,7 @@ class TestMergedHealthTenantScope:
         )
 
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=fx.run_id,
@@ -2326,7 +2379,7 @@ class TestMergedHealthTenantScope:
         )
         # 默认租户看不见别人的报告（正因如此缺省值才是 bug）
         assert (
-            await _known_merged_health(
+            await _health(
                 store,
                 project_id=fx.project_id,
                 run_id=fx.run_id,
@@ -2335,4 +2388,599 @@ class TestMergedHealthTenantScope:
                 artifact_name="code",
             )
             == ""
+        )
+
+
+# ============================================================ v1.5 · T02 读取侧
+
+
+class TestCriteriaBinding:
+    """T02.2 的钉子：报告必须**自证判据来源**，且判据必须与这棵树同源。
+
+    PRD T2-R2 / R5：只绑"哪一版树"不够 —— 还要绑"用哪把尺子"。
+    v1.4 及之前生成的报告没有 ``criteria_source`` ⇒ 一律按"拿不到结论"处理
+    （A11：fail-closed，用户重评一次即获得强口径）。
+
+    ★ 这里全部是纯函数级用例（``_report_health_status``），零 I/O。
+    """
+
+    VERSION = 3
+
+    def test_legacy_report_without_criteria_is_unknown(self) -> None:
+        """A11：v1.4 风格报告（无判据三键、``blocking_failed=[]``）⇒ ``""``。
+
+        旧实现会返回 ``healthy`` ⇒ 提升闸门放行 —— 那正是"弱口径给强树背书"。
+        """
+        raw = _report_json(
+            artifact_version=self.VERSION,
+            criteria_source=None,
+            template_id=None,
+        )
+        payload = json.loads(raw)
+        assert "criteria_source" not in payload  # 立此存照：确实是老格式
+        assert _report_health_status(raw, self.VERSION) == ""
+
+    @pytest.mark.parametrize("source", ["", "unknown", "TEMPLATE-ish", None])
+    def test_criteria_source_must_be_a_known_literal(self, source: str | None) -> None:
+        """``criteria_source`` 只认 ``template`` / ``suite``（显式字面量，不猜）。"""
+        payload = json.loads(_report_json(artifact_version=self.VERSION))
+        payload["criteria_source"] = source
+        assert _report_health_status(json.dumps(payload), self.VERSION) == ""
+
+    def test_suite_criteria_cannot_vouch_for_a_template_tree(self) -> None:
+        """★ 反向（A12 的反向）：``suite`` 口径的报告不能给"有模板的树"背书。
+
+        判据不同源 = 不可比。这条不需要额外机制 —— 比对 ``criteria_source`` 即可。
+        """
+        raw = _report_json(
+            artifact_version=self.VERSION,
+            criteria_source="suite",
+            template_id="",
+        )
+        # 没给"这棵树属于哪个模板"的调用方仍可采信（无模板 run 的合法口径）
+        assert _report_health_status(raw, self.VERSION) == "healthy"
+        # 一旦调用方知道它属于模板 T ⇒ 套件口径的报告不能给 T 的树背书
+        assert (
+            _report_health_status(
+                raw,
+                self.VERSION,
+                None,
+                expected_template_id=TEMPLATE_ID,
+                expected_template_hash=template_yaml_hash(DEFAULT_TEMPLATES_DIR, TEMPLATE_ID),
+            )
+            == ""
+        )
+
+    def test_other_template_report_does_not_vouch(self) -> None:
+        """别模板的报告不能给这棵树背书（模板 id 不等 ⇒ 拿不到结论）。"""
+        raw = _report_json(
+            artifact_version=self.VERSION,
+            template_id="python-cli",
+            criteria_version=template_yaml_hash(DEFAULT_TEMPLATES_DIR, "python-cli"),
+        )
+        assert (
+            _report_health_status(
+                raw,
+                self.VERSION,
+                None,
+                expected_template_id=TEMPLATE_ID,
+                expected_template_hash=template_yaml_hash(DEFAULT_TEMPLATES_DIR, TEMPLATE_ID),
+            )
+            == ""
+        )
+
+    def test_matching_template_and_hash_is_trusted(self) -> None:
+        """同模板 + 同指纹（现算）⇒ 采信报告结论（healthy / unhealthy 两侧）。"""
+        expected_hash = template_yaml_hash(DEFAULT_TEMPLATES_DIR, TEMPLATE_ID)
+        healthy = _report_json(artifact_version=self.VERSION, criteria_version=expected_hash)
+        blocked = _report_json(
+            artifact_version=self.VERSION,
+            criteria_version=expected_hash,
+            blocking_failed=("python -m pytest -q",),
+        )
+        assert (
+            _report_health_status(
+                healthy,
+                self.VERSION,
+                None,
+                expected_template_id=TEMPLATE_ID,
+                expected_template_hash=expected_hash,
+            )
+            == "healthy"
+        )
+        assert (
+            _report_health_status(
+                blocked,
+                self.VERSION,
+                None,
+                expected_template_id=TEMPLATE_ID,
+                expected_template_hash=expected_hash,
+            )
+            == "unhealthy"
+        )
+
+    def test_template_changed_after_the_report_is_unknown(self) -> None:
+        """★ R6 的读取侧：报告里的判据版本 ≠ 当前模板指纹 ⇒ 拿不到结论。
+
+        模板改了 ⇒ 两把尺子不是同一把（"宁严不松"）。用户处置路径唯一：重评一次。
+        """
+        stale = _report_json(artifact_version=self.VERSION, criteria_version="0" * 64)
+        assert (
+            _report_health_status(
+                stale,
+                self.VERSION,
+                None,
+                expected_template_id=TEMPLATE_ID,
+                expected_template_hash=template_yaml_hash(DEFAULT_TEMPLATES_DIR, TEMPLATE_ID),
+            )
+            == ""
+        )
+
+    def test_no_expected_template_keeps_legacy_leniency(self) -> None:
+        """调用方不知道模板（``None``）⇒ 不绑判据（兼容既有单测与无模板 run）。"""
+        raw = _report_json(artifact_version=self.VERSION, template_id="python-cli")
+        assert _report_health_status(raw, self.VERSION) == "healthy"
+
+
+class TestUnverifiedHealth:
+    """T02.2 的第四态：``unverified``（"某组某档一条检查都没真的执行"）。
+
+    ★ 与"什么都没评"必须分开：空 ``tasks`` / 全 ``skipped`` 仍是 ``""``。
+    """
+
+    VERSION = 3
+
+    def test_unverified_groups_yield_unverified(self) -> None:
+        raw = _report_json(
+            artifact_version=self.VERSION, unverified_groups=("backend",)
+        )
+        assert _report_health_status(raw, self.VERSION) == "unverified"
+
+    def test_blocking_failure_wins_over_unverified(self) -> None:
+        """阻断项失败比"未验证"更严重 ⇒ 仍判 ``unhealthy``（顺序不可颠倒）。"""
+        raw = _report_json(
+            artifact_version=self.VERSION,
+            blocking_failed=("python -m pytest -q",),
+            unverified_groups=("backend",),
+        )
+        assert _report_health_status(raw, self.VERSION) == "unhealthy"
+
+    def test_unverified_does_not_leak_from_skipped_tasks(self) -> None:
+        """★ ``status != evaluated`` 的任务**不参与**判定：没评 ≠ 没验证过。"""
+        payload = json.loads(
+            _report_json(
+                artifact_version=self.VERSION,
+                unverified_groups=("backend",),
+                status="skipped",
+            )
+        )
+        assert _report_health_status(json.dumps(payload), self.VERSION) == ""
+
+    def test_blank_group_names_are_not_unverified(self) -> None:
+        """``[""]`` 不算未验证（防御人工编辑留下的空项）。"""
+        payload = json.loads(_report_json(artifact_version=self.VERSION))
+        payload["tasks"][0]["unverified_groups"] = [""]
+        assert _report_health_status(json.dumps(payload), self.VERSION) == "healthy"
+
+
+class TestUnverifiedPromotionGate:
+    """T02.4 / Q2 的钉子：``unverified`` **不阻断**，但必须留痕。
+
+    违反它的两种写法都会被抓：
+    - ``MergedHealth.known`` 不纳入 ``unverified`` ⇒ ``strict_health`` 判 409（用户
+      已否决：无依赖镜像每次提升都要 ``force`` ⇒ 闸门退化）；
+    - 步骤 8b 不写留痕 ⇒ "没验证过"长得像"验过了"。
+    """
+
+    def test_unverified_counts_as_known(self) -> None:
+        """★ 单元级不变量：``known is True``（否则 ``strict_health`` 会 409）。"""
+        from ymir.artifacts.provenance import HEALTH_UNVERIFIED, MergedHealth
+
+        assert HEALTH_UNVERIFIED == "unverified"
+        assert MergedHealth(status=HEALTH_UNVERIFIED).known is True
+        assert MergedHealth(status=HEALTH_UNVERIFIED).unverified is True
+        assert MergedHealth(status=HEALTH_UNVERIFIED).unhealthy is False
+        # 未知态仍然不算 known（两件事不能混）
+        assert MergedHealth(status="").known is False
+
+    async def test_unverified_passes_with_trace_and_ignores_force(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        """``unverified`` ⇒ 放行 + ``baseline_promoted_unverified:1``（与 ``force`` 无关）。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+
+        # force=False 也放行（这是 Q2 的核心：不阻断）
+        result = await _promote(fx, known_health="unverified", strict_health=True)
+
+        assert result.reused is False
+        assert result.warning == BASELINE_PROMOTED_UNVERIFIED_CODE
+        assert BASELINE_PROMOTED_UNVERIFIED_CODE == "baseline_promoted_unverified:1"
+        assert result.health_status == "unverified"
+        promoted = await fx.store.load(result.artifact_id, result.version)
+        assert BASELINE_PROMOTED_UNVERIFIED_CODE in (promoted.version_row.message or "")
+        # ★ 留痕不进文件树（重建契约：content_hash 仍 == 当时评测树指纹）
+        assert compute_content_hash(promoted.files) == fx.merged_hash
+
+    async def test_unverified_warning_differs_from_the_other_two(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        """三条留痕短码互不相同（排障时能区分"真坏 / 没评测 / 没验证过"）。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        result = await _promote(fx, known_health="unverified")
+        assert result.warning not in {
+            BASELINE_PROMOTED_UNHEALTHY_CODE,
+            BASELINE_PROMOTED_UNKNOWN_CODE,
+        }
+
+
+class TestUnverifiedGateOverHttp:
+    """端点口径：``unverified`` 全链 ⇒ **201** + 留痕（Q2 已拍板的行为）。"""
+
+    async def test_unverified_report_promotes_with_warning(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            artifact_version=fx.code_version,
+            unverified_groups=("backend",),
+        )
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id},
+        )
+        # ★ 不得 409（``strict_health`` 下 ``unverified`` 必须是"已知"）
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["warning"] == BASELINE_PROMOTED_UNVERIFIED_CODE
+
+
+class TestReportPriority:
+    """★ T02.1 / A10：读取优先级由**产物名 tuple** 决定，不靠 ``created_at``。
+
+    v1.4 的遍历是"按 ``list_artifacts`` 的 ``created_at asc`` + 首个结论即返回" ⇒
+    ``evaluation_report``（QA 阶段产物，artifact 更早创建）先于 ``eval_verdict`` 被读到。
+    而补评测的 ``evaluation_report`` 一旦给出 ``healthy``，用户"对坏树点一次补评测"
+    就能让闸门放行（v1.4 §0.3 的静默旁路）。
+
+    两条用例**双向**覆盖：``eval_verdict`` 先创建 / 后创建，结论都必须是它。
+    """
+
+    async def test_eval_verdict_wins_over_evaluation_report(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        """``eval_verdict``(unhealthy) 先创建、``evaluation_report``(healthy) 后创建。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="evaluation_report",
+            artifact_version=fx.code_version,
+        )
+
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        reading = await _known_merged_health(
+            store,
+            project_id=fx.project_id,
+            run_id=fx.run_id,
+            tenant_id=DEFAULT_TENANT_ID,
+            artifact_version=fx.code_version,
+            artifact_name="code",
+        )
+        assert reading.status == "unhealthy"
+        assert reading.source_name == "eval_verdict"
+
+    async def test_eval_verdict_wins_when_created_last(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        """★ 反向（这才是 v1.4 的旁路形态）：弱报告先创建、``eval_verdict`` 后创建。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="evaluation_report",
+            artifact_version=fx.code_version,
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        reading = await _known_merged_health(
+            store,
+            project_id=fx.project_id,
+            run_id=fx.run_id,
+            tenant_id=DEFAULT_TENANT_ID,
+            artifact_version=fx.code_version,
+            artifact_name="code",
+        )
+        assert reading.status == "unhealthy"
+        assert reading.source_name == "eval_verdict"
+        # ★ v1.5 复审：严格结论**也要**披露分歧（用户补评测看到 healthy、提升却
+        #   409 正是最困惑的场景 ⇒ 必须告诉他"存在另一份不同口径的结论"）。
+        assert reading.divergent is True
+
+    async def test_weak_report_alone_is_unknown(self, session_factory, tmp_path: Path) -> None:
+        """A10 反向：只有一份**弱口径**报告（无判据三键）⇒ ``""``（fail-closed）。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            artifact_version=fx.code_version,
+            criteria_source=None,
+            template_id=None,
+        )
+
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        reading = await _known_merged_health(
+            store,
+            project_id=fx.project_id,
+            run_id=fx.run_id,
+            tenant_id=DEFAULT_TENANT_ID,
+            artifact_version=fx.code_version,
+            artifact_name="code",
+        )
+        assert reading.status == ""
+        assert reading.source_name == ""
+
+    async def test_divergent_is_disclosed_when_winner_is_lenient(
+        self, session_factory, tmp_path: Path
+    ) -> None:
+        """胜者是宽松结论（``healthy``）而败者说 ``unhealthy`` ⇒ ``divergent=True``。
+
+        ★ 有界：胜者确定后**最多再读一次**败者最新匹配版（不遍历全部历史版本）。
+        """
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="evaluation_report",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+
+        store = ArtifactStore(session_factory, tmp_path / "artifacts")
+        reading = await _known_merged_health(
+            store,
+            project_id=fx.project_id,
+            run_id=fx.run_id,
+            tenant_id=DEFAULT_TENANT_ID,
+            artifact_version=fx.code_version,
+            artifact_name="code",
+        )
+        assert reading.status == "healthy"
+        assert reading.divergent is True
+
+
+class TestRegressionUnknownDisclosure:
+    """★ v1.5 修复轮 D-1：**没做过回归判定**的提升必须披露（不能静默）。
+
+    背景（对抗验证实测）：同一 run 没有 ``eval_verdict`` 时（CLI 未加 ``--evaluate``），
+    补评测报告里没有 ``baseline_runnability``（项目维度不跑探针）⇒ ``regression`` 恒
+    ``false`` ⇒ "仅 D3 回归"的树被判 ``healthy`` ⇒ ``from-merge`` **201 且无 warning**。
+
+    本版**只披露不根治**（根治要把 ``baseline_ref`` 引进项目维度，属 v1.6）。
+    """
+
+    async def test_201_without_probe_discloses_regression_unknown(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        # 报告里**没有** baseline_runnability（探针没跑）⇒ 回归未检查
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            artifact_version=fx.code_version,
+            baseline=None,
+        )
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id},
+        )
+
+        assert resp.status_code == 201, resp.text
+        assert (
+            resp.json()["data"]["warning"] == BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE
+        ), resp.text
+
+    async def test_probe_skipped_also_discloses(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        """探针跑了但**整体 skipped**（环境缺失 / 基线不完整）⇒ 同样无法判回归。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            artifact_version=fx.code_version,
+            baseline="skipped",
+        )
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["warning"] == BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE
+
+    async def test_healthy_probe_does_not_disclose(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        """反例：探针真的跑过 ⇒ 回归判定成立 ⇒ **无** warning（不误报）。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            artifact_version=fx.code_version,
+        )  # 默认 baseline="healthy" ⇒ 探针跑过
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id},
+        )
+        assert resp.status_code == 201, resp.text
+        assert "warning" not in resp.json()["data"], resp.text
+
+
+class TestMultiCodeWarningOverHttp:
+    """T02.3：``warning`` 是**逗号分隔的码集合**（先业务码、后 ``criteria_diverged:1``）。"""
+
+    async def test_force_unhealthy_warning_stays_a_single_code(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        """★ 既有断言不破：``force`` + unhealthy（只有一份报告）⇒ 恰好一个码。"""
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id, "force": True},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["warning"] == BASELINE_PROMOTED_UNHEALTHY_CODE
+
+    async def test_divergent_appends_second_code_after_the_first(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        """胜者宽松但败者说坏 ⇒ ``warning`` 追加 ``,criteria_diverged:1``（顺序固定）。"""
+        from ymir.api.routers.artifacts import CRITERIA_DIVERGED_CODE
+
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        # eval_verdict 说 healthy（胜者），evaluation_report 说 unhealthy（败者）
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="evaluation_report",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+
+        resp = await client.post(
+            f"/api/v1/projects/{fx.project_id}/baselines/from-merge",
+            json={"run_id": fx.run_id},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["warning"] == CRITERIA_DIVERGED_CODE
+
+    async def test_unhealthy_winner_also_discloses_divergence(
+        self, client: Any, session_factory, tmp_path: Path
+    ) -> None:
+        """★★ v1.5 复审：胜者**严格**（``eval_verdict=unhealthy``）时同样披露分歧。
+
+        这是"用户补评测看到 healthy、提升却 409"那个最需要解释的场景：
+        409 的响应体里没有 ``warning`` 字段（错误体是 ``reason/status/message``），
+        因此披露点落在 ``force=true`` 的 201 响应上——
+        ``baseline_promoted_unhealthy:1,criteria_diverged:1``（顺序固定：先业务码）。
+        """
+        from ymir.api.routers.artifacts import CRITERIA_DIVERGED_CODE
+
+        fx = await _produce_incremental(session_factory, tmp_path)
+        await _add_stage_row(
+            session_factory, run_id=fx.run_id, artifact_id=fx.code_id, version=fx.code_version
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="eval_verdict",
+            artifact_version=fx.code_version,
+            blocking_failed=("python -m pytest -q",),
+        )
+        await _store_report(
+            session_factory,
+            tmp_path,
+            run_id=fx.run_id,
+            project_id=fx.project_id,
+            name="evaluation_report",
+            artifact_version=fx.code_version,
+        )
+        url = f"/api/v1/projects/{fx.project_id}/baselines/from-merge"
+
+        # A9 断言不变：不带 force 仍必须 409 baseline_unhealthy
+        rejected = await client.post(url, json={"run_id": fx.run_id})
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["details"]["reason"] == "baseline_unhealthy"
+
+        forced = await client.post(url, json={"run_id": fx.run_id, "force": True})
+        assert forced.status_code == 201, forced.text
+        assert (
+            forced.json()["data"]["warning"]
+            == f"{BASELINE_PROMOTED_UNHEALTHY_CODE},{CRITERIA_DIVERGED_CODE}"
         )

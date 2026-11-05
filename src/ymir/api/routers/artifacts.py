@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -453,6 +454,10 @@ async def promote_baseline_from_merge(
         tenant_id=tenant_id,
         artifact_version=artifact_version,
         artifact_name=artifact_name,
+        # ★ v1.5（T02.2）：判据也要绑定 —— 报告必须自证"用哪把尺子"，否则
+        #   别的模板的报告不能给这棵树背书（判据不同源 = 不可比）。
+        expected_template_id=template_id,
+        expected_template_hash=template_hash,
     )
 
     result = await promote_merged_to_baseline(
@@ -469,7 +474,7 @@ async def promote_baseline_from_merge(
         max_bytes=settings.baseline_max_bytes,
         tenant_id=tenant_id,
         force=payload.force,
-        known_health=known_health,
+        known_health=known_health.status,
         health_probe=None,
         strict_health=True,
     )
@@ -482,9 +487,47 @@ async def promote_baseline_from_merge(
             content_hash=result.content_hash,
             size_bytes=result.size_bytes,
             reused=result.reused,
-            warning=result.warning,
+            warning=_merge_warning_codes(
+                result.warning,
+                known_health.divergent,
+                # ★ D-1：没做过回归判定 ⇒ 必须披露（否则"没验"与"没回归"长得一样）
+                regression_unknown=known_health.regression_checked is False,
+            ),
         ),
     }
+
+
+def _merge_warning_codes(
+    business_code: str,
+    divergent: bool,
+    regression_unknown: bool = False,
+) -> str:
+    """把「业务留痕码」与「披露码」用 ``,`` 拼成一串（v1.5 T02.3 / 修复轮 D-1）。
+
+    ★ 顺序**固定**（前端按 ``,`` 拆分后逐码匹配，顺序稳定才能写快照断言）：
+    ``业务码`` → ``criteria_diverged:1`` → ``baseline_promoted_regression_unknown:1``。
+    ★ ``divergent`` 与业务码**正交**：两份报告结论不一致时，无论胜者是
+    ``healthy`` / ``unverified`` 还是 ``unhealthy`` 都会披露。因此
+    ``force`` + ``unhealthy`` **且存在分歧**时是
+    ``baseline_promoted_unhealthy:1,criteria_diverged:1``；**只有一份报告**时仍是
+    恰好一个码（既有断言不破 —— 那几条用例本来就只铺了一份报告）。
+    ★ ``regression_unknown``（D-1）：采纳的报告没做过回归判定 ⇒ 追加披露码。
+    它可能**单独出现**（树 healthy 但回归没验过）—— 那正是最需要解释的一档。
+
+    Args:
+        business_code: ``PromoteResult.warning``（空串 = 无业务留痕）。
+        divergent: 两个产物名的结论是否不一致。
+        regression_unknown: 采纳的报告是否**没做过**回归判定。
+
+    Returns:
+        逗号分隔的码串；都无 ⇒ ``""``（``BaselineMergeOut`` 会把空串键摘掉）。
+    """
+    codes = [code for code in (str(business_code or ""),) if code]
+    if divergent:
+        codes.append(CRITERIA_DIVERGED_CODE)
+    if regression_unknown:
+        codes.append(BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE)
+    return ",".join(codes)
 
 
 async def _resolve_promote_stage(
@@ -595,10 +638,22 @@ def _promote_template_ref(run: PipelineRun) -> tuple[dict[str, str], str, str]:
 #: 的 ``name`` 参数），改动频率极低；两侧各有注释互指。
 _REPORT_ARTIFACT_NAMES: tuple[str, ...] = ("evaluation_report", "eval_verdict")
 
+#: 报告产物的**读取优先级**（v1.5 T02.1，docs/17 §1.1.5）。
+#:
+#: ★★ 这是本轮最关键的一行：优先级**由 tuple 顺序显式表达**，不再依赖
+#: ``list_artifacts`` 的 ``created_at asc``。旧实现按创建顺序遍历 + "第一份能给出
+#: 结论的就 return" ⇒ ``evaluation_report``（QA 阶段产物，artifact 更早创建）会先于
+#: ``eval_verdict`` 被读到；而补评测的 ``evaluation_report`` 一旦给出 ``healthy``，
+#: 用户"对坏树点一次补评测"就能让闸门放行（v1.4 §0.3 那条静默旁路）。
+#:
+#: 产品口径（PRD T2-R3）：``eval_verdict``（gate 当时基于同一棵树的判定）>
+#: ``evaluation_report``（事后补评）> 无结论。
+_REPORT_PRIORITY: tuple[str, ...] = ("eval_verdict", "evaluation_report")
+
 #: 评测报告里装「合并树健康结论」的 JSON 正文名。
 _REPORT_JSON_NAME: str = "evaluation_report.json"
 
-#: 合并树健康度三态字面量（与 ``artifacts.provenance.HEALTH_*`` **同源**）。
+#: 合并树健康度四态字面量（与 ``artifacts.provenance.HEALTH_*`` **同源**）。
 #:
 #: ★ 复写而不 import 的理由同上（本模块已 import 了 ``provenance`` 的部分名字，这两
 #: 个字面量刻意不 import 以免"看起来像契约"）：``api``(0) -> ``artifacts``(3) 是**顺**
@@ -606,12 +661,61 @@ _REPORT_JSON_NAME: str = "evaluation_report.json"
 #: 就会同时被抓：``tests/test_baseline_promote.py::TestMergedHealthFromReport``）。
 _HEALTHY: str = "healthy"
 _UNHEALTHY: str = "unhealthy"
+#: ★ v1.5 第四态（T02.2）：某组某档一条检查都没真的执行 ⇒ "我确实不知道"。
+#: ``evaluation.report`` 与 ``artifacts.provenance`` 同名同值（跨层不能 import，
+#: 三处字面量由注释互指）。
+_UNVERIFIED: str = "unverified"
+#: 探针整体未执行（``baseline_probe.BASELINE_SKIPPED`` 同值）：回归**无法**判定。
+_BASELINE_SKIPPED: str = "skipped"
+
+#: 判据来源枚举（与 ``evaluation.report.CRITERIA_SOURCE_*`` **同源**）。
+#: ``artifacts``(3) -> ``evaluation``(1) 是逆层，CI 拦；故复写并互指注释。
+_CRITERIA_TEMPLATE: str = "template"
+_CRITERIA_SUITE: str = "suite"
+
+#: 「回归未检查」的披露短码（v1.5 修复轮 D-1）。
+#:
+#: ★ 触发条件：采纳的报告里**没有** ``baseline_runnability``（探针没跑）或它是
+#: ``skipped`` —— 此时 ``regression`` 恒 ``False``，"没做回归判定"与"没有回归"
+#: 长得一样。那一版的提升若不披露，就是**静默**放行（v1.5 修复轮实测：只有
+#: ``evaluation_report``、没有 ``eval_verdict`` 时，仅 D3 回归的树被判 healthy ⇒ 201 无 warning）。
+#: 本版**只披露不根治**（根治要把 ``baseline_ref`` 引进项目维度，属 v1.6 范围）。
+BASELINE_PROMOTED_REGRESSION_UNKNOWN_CODE: str = "baseline_promoted_regression_unknown:1"
+
+#: 「两份报告的结论不一致」的披露短码（v1.5 T02.3，读侧唯一产生点）。
+#:
+#: ★ 为什么只能读侧产生：写侧（gate / 补评测）各自只看得到自己那一份，无从比较。
+#: 与 ``baseline_promoted_*`` 用 ``,`` 拼装（``,`` 是响应里 `warning` 的分隔符）。
+CRITERIA_DIVERGED_CODE: str = "criteria_diverged:1"
 
 
-def _report_health_status(
+@dataclass(frozen=True)
+class MergedHealthReading:
+    """读取侧对「该 run 这份树」的健康度读取结果（v1.5 T02.1，纯数据）。
+
+    Attributes:
+        status: ``healthy`` / ``unhealthy`` / ``unverified`` / ``""``（拿不到结论）。
+        source_name: 采纳了哪个产物名的报告（``eval_verdict`` / ``evaluation_report``；
+            ``""`` = 没采纳任何一份）。**排障用**：解释"为什么这次是这个结论"。
+        divergent: 两个产物名的结论**不一致**（v1.5 §1.1.5 的有界补读：胜者确定后
+        **最多再读一次**败者最新匹配版）。披露用，**不改变采纳结果** —— 冲突时永远
+        取优先级更高的那份（PRD T2-R3）。
+    """
+
+    status: str = ""
+    source_name: str = ""
+    divergent: bool = False
+    #: 采纳的那份报告**做过回归判定**吗（v1.5 修复轮 D-1）。``False`` ⇒ 该提升要在
+    #: ``warning`` 里披露 ``baseline_promoted_regression_unknown:1``（不静默）。
+    regression_checked: bool = True
+
+
+def _report_health_status(  # noqa: PLR0913 - 判据维度就是这么多（版本/产物/模板/指纹）
     raw: str | None,
     expected_version: int | None = None,
     expected_artifact: str | None = None,
+    expected_template_id: str | None = None,
+    expected_template_hash: str | None = None,
 ) -> str:
     """从 ``evaluation_report.json`` 正文里取**合并树**健康结论（坏数据 ⇒ ``""``）。
 
@@ -628,7 +732,8 @@ def _report_health_status(
 
     - ``blocking_failed`` 非空 ⇒ 阻断项失败 ⇒ ``unhealthy``；
     - ``regression=True`` ⇒ 合并树比基线更差 ⇒ ``unhealthy``；
-    - 报告存在且两者都空 ⇒ ``healthy``。
+    - v1.5：``unverified_groups`` 非空（且上面两条都不成立）⇒ ``unverified``；
+    - 报告存在且都空 ⇒ ``healthy``。
 
     ★★ **v1.4 返修 3（P1）：报告必须与**被提升的 artifact 版本**绑定。**
     ``HarnessEvaluationGate.evaluate`` 评的是 artifact 的**当时最新版本**，而
@@ -637,8 +742,15 @@ def _report_health_status(
     code v4，而提升的是 v3）。用 v4 的结论去闸 v3 的树就是**判据串味**：v4 修好了
     不代表 v3 能跑，v3 的结论也不该由 v4 的报告给出。
 
-    因此报告根部的 ``artifact_version``（``EvaluationReport.artifact_version``）必须
-    等于本次要提升的版本，否则一律按"拿不到结论"处理：
+    ★★ **v1.5（T02.2）：报告必须自证**判据来源**（PRD T2-R2 / A11 / A12 反向）。**
+    只绑"哪一版树"不够 —— 还要绑"用哪把尺子"。``criteria_source`` 必须是
+    ``template`` / ``suite`` 两个显式字面量之一；调用方给了
+    ``expected_template_id``（HTTP 主路径恒给，来自被提升 run 的模板）时，报告必须
+    声明 ``criteria_source="template"`` **且** ``template_id`` 相等；
+    给了 ``expected_template_hash`` 时 ``criteria_version`` 必须相等。
+    不满足 ⇒ ``""``（判据不同源 = 不可比，不需要额外机制）。
+    **v1.4 及之前生成的报告没有这三个字段 ⇒ 一律 ``""``**（A11：fail-closed，
+    用户重评一次即获得强口径）。
 
     Args:
         raw: 报告 JSON 正文（可空 / 可损坏）。
@@ -647,15 +759,21 @@ def _report_health_status(
         expected_artifact: 本次要提升的**产物名**；报告若声明了别的产物（
             ``tasks[].artifact_ref.name``）⇒ 不采信（见 :func:`_report_artifact_matches`，
             ``None`` ⇒ 不做产物绑定）。
+        expected_template_id: 本次要提升的树**归属的模板 id**；``None`` / 空串 ⇒
+            不做判据绑定（兼容既有纯函数用例与"无模板 run"）。
+        expected_template_hash: 该模板**现算**的 YAML 指纹（与报告里的
+            ``criteria_version`` 对比）；``None`` / 空串 ⇒ 不做指纹绑定。
 
     Returns:
-        ``healthy`` / ``unhealthy`` / ``""``（拿不到结论 / 版本或产物不匹配）。
+        ``healthy`` / ``unhealthy`` / ``unverified`` / ``""``（拿不到结论 / 版本 /
+        产物 / 判据不匹配）。
 
     Note:
         **绝不抛**：报告正文可能被人工改过 / 是旧版本格式。读不出来就返回 ``""``，
         由调用方按 fail-closed（HTTP 主路径）或放行（探针路径）处置。
         报告里**没有任何已评测任务**（空 ``tasks`` / 全是 ``skipped``）也算拿不到结论
-        —— "没评测"不等于"跑得好"。
+        —— "没评测"不等于"跑得好"；而"任务跑了但某组某档一条检查都没执行"是
+        ``unverified``（"没验证过"）—— 两者**必须分开**。
         报告**缺** ``artifact_version``（旧格式）同样按不匹配处理 —— **不猜**：
         猜错的代价是"用别的树"的结论去放行坏树。
     """
@@ -667,6 +785,8 @@ def _report_health_status(
         return ""
     if not isinstance(payload, dict):
         return ""
+    if not _criteria_matches(payload, expected_template_id, expected_template_hash):
+        return ""
     if not _report_version_matches(payload, expected_version):
         return ""
     if not _report_artifact_matches(payload, expected_artifact):
@@ -675,6 +795,7 @@ def _report_health_status(
     if not isinstance(tasks, list):
         return ""
     evaluated = 0
+    unverified = False
     for task in tasks:
         if not isinstance(task, dict):
             continue
@@ -687,7 +808,90 @@ def _report_health_status(
             return _UNHEALTHY
         if task.get("regression") is True:
             return _UNHEALTHY
-    return _HEALTHY if evaluated else ""
+        groups = task.get("unverified_groups")
+        if isinstance(groups, list) and any(str(item or "").strip() for item in groups):
+            # v1.5：任务**跑了**，但某组某档的检查一条都没真的执行 ⇒ 未验证
+            unverified = True
+    if not evaluated:
+        return ""
+    return _UNVERIFIED if unverified else _HEALTHY
+
+
+def _report_regression_checked(payload: dict[str, Any]) -> bool:
+    """该报告是否**做过回归判定**（v1.5 修复轮 D-1）。
+
+    判据只用一个**既有**字段，不新增报告键（避免动字节契约）：``TaskOut`` 的
+    ``baseline_runnability``（探针结果）。三种情形：
+
+    - 键不存在 ⇒ 探针**根本没跑**（项目维度没有 ``baseline_ref``，或基线正文不可用）
+      ⇒ 回归未检查；
+    - ``status == "skipped"`` ⇒ 探针跑了但一条检查都没执行（环境缺失 / 基线不完整）
+      ⇒ 也无法判回归 ⇒ 回归未检查；
+    - 其余（``healthy`` / ``unhealthy``）⇒ 检查过了。
+
+    ★ 只要**有一个已评测任务**做过回归判定就算"检查过"（与 ``_report_health_status``
+    的"任一任务给坏结论即坏"同向：宽松判定只会在所有任务都没判过时成立）。
+    """
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or "").strip().lower()
+        if status and status != "evaluated":
+            continue
+        probe = task.get("baseline_runnability")
+        if isinstance(probe, dict) and str(probe.get("status") or "") != _BASELINE_SKIPPED:
+            return True
+    return False
+
+
+def _criteria_matches(
+    payload: dict[str, Any],
+    expected_template_id: str | None,
+    expected_template_hash: str | None,
+) -> bool:
+    """报告自证的判据来源是否与「本次要提升的树」同源（``""`` 视为不同源）。
+
+    ★ 判据来源必须是**显式字面量**（PRD R5 / A11）：不接受"字段缺失 ⇒ 弱口径"这种
+    隐式判定 —— 隐式判定在下一版会重演 v1.4 §0.3 那类静默旁路，而且没有测试抓手。
+
+    ★ 只绑"报告自称的"判据（模板侧现算 vs 报告里记的值）。本地产物本来就可人工改写：
+    这条判据防的是**串味**，不是**伪造**（与 ``docs/16`` §1 第 8 条同口径）。
+    """
+    source = str(payload.get("criteria_source") or "").strip().lower()
+    if source not in {_CRITERIA_TEMPLATE, _CRITERIA_SUITE}:
+        logger.warning(
+            "报告未自证判据来源（criteria_source=%r）⇒ 按未知处置（A11 fail-closed）",
+            payload.get("criteria_source"),
+        )
+        return False
+    expected = str(expected_template_id or "").strip()
+    if not expected:
+        # 调用方不知道这棵树属于哪个模板（无模板 run / 老调用方）⇒ 不绑判据。
+        return True
+    if source != _CRITERIA_TEMPLATE:
+        logger.warning(
+            "报告用的是套件口径（criteria_source=suite），而本次提升的树归属模板 %s "
+            "⇒ 判据不同源，按未知处置",
+            expected,
+        )
+        return False
+    if str(payload.get("template_id") or "").strip() != expected:
+        logger.warning(
+            "报告的判据模板不是本树的模板：report=%s promote=%s ⇒ 按未知处置",
+            payload.get("template_id"),
+            expected,
+        )
+        return False
+    expected_hash = str(expected_template_hash or "").strip()
+    if expected_hash and str(payload.get("criteria_version") or "").strip() != expected_hash:
+        logger.warning(
+            "报告的判据版本与当前模板指纹不符（模板已变更）⇒ 按未知处置，请重评一次"
+        )
+        return False
+    return True
 
 
 def _report_artifact_matches(payload: dict[str, Any], expected_artifact: str | None) -> bool:
@@ -752,7 +956,7 @@ def _report_version_matches(payload: dict[str, Any], expected_version: int | Non
     return True
 
 
-async def _known_merged_health(
+async def _known_merged_health(  # noqa: PLR0913 - 绑定的维度见 docstring
     store: Any,
     *,
     project_id: str,
@@ -760,7 +964,9 @@ async def _known_merged_health(
     tenant_id: str,
     artifact_version: int | None,
     artifact_name: str | None,
-) -> str:
+    expected_template_id: str | None = None,
+    expected_template_hash: str | None = None,
+) -> MergedHealthReading:
     """复用**该 run 已有评测报告**里的**合并树**健康结论（零额外沙箱调用）。
 
     设计口径是"优先复用 run 自身已有的结论"：评测阶段已经真的跑过（并记录了
@@ -780,29 +986,136 @@ async def _known_merged_health(
       更早 run 每次提升都被迫 ``force``，且 reason 会说"没有健康结论"（把已经评测过、
       结论是 unhealthy 的树指向"补评测"而不是"修代码"）。
 
-    ★ **返修 3（P1）：报告必须绑定到被提升的 ``artifact_version``。**
-    ``artifact_version`` 是**必填**关键字（不给默认 ``None``）：漏传等于闸门静默退回
-    "只看 run_id"的串味口径，且没有任何报错 —— 这类"忘传就失效"的参数不该有默认值。
-    同一 run 落了多份报告时，**从新到旧**找第一份"版本匹配且能给出结论"的；都不匹配
-    就返回 ``""``（fail-closed ⇒ 409 ``baseline_health_unknown``）。
+    ★ **返修 3（P1）**：报告必须绑定到被提升的 ``artifact_version``（同一 run 落了
+    多份报告时，**从新到旧**找第一份"版本匹配且能给出结论"的）。
 
-    ★ **返修 5（Q-R5-03）：``artifact_name`` 同样是必填关键字。**
-    只绑 ``run_id + 版本号`` 时，"对同 run 的**另一个产物**（版本号恰好相等）评测一次"
-    就能给这棵树背书（实测：``prd`` v1 的 healthy 结论被当成 ``code`` v1 的结论，
-    坏代码树静默提升）。``None`` 表示调用方确实不知道产物名（退化为只绑版本）。
+    ★ **返修 5（Q-R5-03）**：``artifact_name`` 同样参与绑定（同 run 的别的产物不给
+    这棵树背书）。``None`` 表示调用方确实不知道产物名（退化为只绑版本）。
+
+    ★★ **v1.5（T02.1，docs/17 §1.1.5）：遍历结构从"按 artifact 创建顺序"改为
+    "按产物名优先级成组"。**
+
+    ```
+    for name in _REPORT_PRIORITY:          # ★ 优先级 = 这个循环的顺序
+        for artifact in by_name[name]:
+            for row in reversed(matched_versions(run_id)):   # 同 run 内版本从新到旧
+                if status: 采纳并跳出
+    ```
+
+    旧结构按 ``created_at asc`` 遍历 + 首个结论即返回 ⇒ ``evaluation_report``
+    （QA 阶段产物，artifact 更早创建）会先于 ``eval_verdict`` 被读到，而补评测的
+    报告 ``blocking_failed`` 恒空 ⇒ ``healthy`` ⇒ **闸门被旁路且静默**。
+    现在优先级是 tuple 的字面量顺序：谁先创建都不影响结论（A10 的双向保证）。
+
+    Args:
+        store: 产物库。
+        project_id: 项目 id。
+        run_id: 归属 run（只认同一 run 的报告）。
+        tenant_id: 租户（**必须透传**，否则非默认租户下闸门静默失效）。
+        artifact_version: 本次要提升的版本（``None`` ⇒ 不绑版本，仅调试路径）。
+        artifact_name: 本次要提升的产物名（``None`` ⇒ 不绑产物）。
+        expected_template_id: 被提升 run 的模板 id（判据绑定，``None``/``""`` ⇒ 不绑）。
+        expected_template_hash: 该模板现算 YAML 指纹（判据版本绑定）。
 
     Returns:
-        ``healthy`` / ``unhealthy`` / ``""``（拿不到 / 报告版本与被提升版本不匹配）。
+        :class:`MergedHealthReading`。``status=""`` = 拿不到结论（fail-closed 409）。
         **任何异常都降级成 ``""``** —— 这只是省成本的旁路，不能让 I/O 抖动变成 500。
+
+    Note:
+        N+1 评估：``get_artifact_detail`` 每个报告产物名最多 1 次（≤2），``store.load``
+        每个产物名最多「首个结论」1 次 + 「胜者确定后再判 diverged」1 次 ⇒ **≤4 次
+        文件读**（v1.5 复审把 diverged 改成双向披露后 +1），与现状同阶。
+        不做批量改：这里最多 6 行元数据，换来的复杂度大于收益。
     """
     try:
         artifacts = await store.list_artifacts(project_id, tenant_id=tenant_id)
     except Exception:  # noqa: BLE001 - 旁路：读不到就按"没结论"处置
-        return ""
+        return MergedHealthReading()
+    by_name: dict[str, list[Any]] = {}
     for artifact in artifacts:
-        if str(getattr(artifact, "name", "")) not in _REPORT_ARTIFACT_NAMES:
+        name = str(getattr(artifact, "name", ""))
+        if name in _REPORT_ARTIFACT_NAMES:
+            by_name.setdefault(name, []).append(artifact)
+
+    winner = ""
+    winner_name = ""
+    regression_checked = True
+    for name in _REPORT_PRIORITY:
+        groups = by_name.get(name)
+        if not groups:
             continue
-        # ★ P1-A：拿**全部版本行**（含各自 ``run_id``），而不是只加载 current_version。
+        status, checked = await _first_conclusive_status(
+            store,
+            groups,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            artifact_version=artifact_version,
+            artifact_name=artifact_name,
+            expected_template_id=expected_template_id,
+            expected_template_hash=expected_template_hash,
+        )
+        if status:
+            winner, winner_name, regression_checked = status, name, checked
+            break
+
+    if not winner:
+        return MergedHealthReading()
+    # ★ 无论胜者严格还是宽松，**都**补读败者一次判 diverged（有界：≤1 个产物名 × 1 次）。
+    #
+    # 为什么不能"严格结论就短路"（v1.5 复审修正）：``eval_verdict=unhealthy`` +
+    # ``evaluation_report=healthy`` 恰恰是**最需要解释**的场景 —— 用户补评测看到
+    # healthy、提升却 409，正是最困惑的时候。PRD T2-R3 的字面口径也是"两者并存且
+    # 结论不一致 ⇒ 披露"，不区分胜者方向。代价是最坏多 1 次产物读（毫秒级）。
+    for name in _REPORT_PRIORITY[_REPORT_PRIORITY.index(winner_name) + 1 :]:
+        groups = by_name.get(name)
+        if not groups:
+            continue
+        loser, _loser_checked = await _first_conclusive_status(
+            store,
+            groups,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            artifact_version=artifact_version,
+            artifact_name=artifact_name,
+            expected_template_id=expected_template_id,
+            expected_template_hash=expected_template_hash,
+        )
+        return MergedHealthReading(
+            status=winner,
+            source_name=winner_name,
+            divergent=bool(loser) and loser != winner,
+            regression_checked=regression_checked,
+        )
+    return MergedHealthReading(
+        status=winner,
+        source_name=winner_name,
+        regression_checked=regression_checked,
+    )
+
+
+async def _first_conclusive_status(  # noqa: PLR0913 - 绑定维度与 _known_merged_health 一致
+    store: Any,
+    groups: list[Any],
+    *,
+    run_id: str,
+    tenant_id: str,
+    artifact_version: int | None,
+    artifact_name: str | None,
+    expected_template_id: str | None,
+    expected_template_hash: str | None,
+) -> tuple[str, bool]:
+    """在**同一产物名**的分组里取第一份「版本匹配且能给出结论」的报告。
+
+    组内：先并列 artifact（同项目同名理论上只有 1 个，但手工命名可能有多份），
+    再让每个 artifact 的**同 run 版本从新到旧**——最新那版若绑的是别的树
+    （返修 3 的串味形态），继续往旧版找。
+
+    Returns:
+        ``(status, regression_checked)``：``status`` 为
+        ``healthy`` / ``unhealthy`` / ``unverified`` / ``""``（本组给不出结论）；
+        第二项 = 该报告的**回归判定是否真的做过**（D-1：探针没跑 ⇒ ``False``）。
+    """
+    for artifact in groups:
         try:
             _artifact, versions = await store.get_artifact_detail(
                 artifact.id, tenant_id=tenant_id
@@ -814,12 +1127,8 @@ async def _known_merged_health(
         ]
         if not matched:
             # ★ 只认同一个 run 的报告：别的 run 的健康度与这棵树无关
-            #   （P2-6：这条判据必须有反向用例，否则"跨 run 串味"无测试守护；
-            #    P1-A 之后反向用例还必须断言"自己的看得到"，否则
-            #    "永远返回空"也能让隔离用例变绿）
+            #   （P2-6：这条判据必须有反向用例，否则"跨 run 串味"无测试守护）
             continue
-        # ``list_versions`` 按版本号升序 ⇒ 同一 run 落了多份报告时**先看最新**那一版；
-        # 最新那版若是"别的 artifact 版本"的报告（返修 3 的串味形态），继续往旧版找。
         for version_row in reversed(matched):
             try:
                 loaded = await store.load(
@@ -827,9 +1136,25 @@ async def _known_merged_health(
                 )
             except Exception:  # noqa: BLE001 - 单个版本读不出来不影响其它候选
                 continue
+            raw = loaded.files.get(_REPORT_JSON_NAME)
             status = _report_health_status(
-                loaded.files.get(_REPORT_JSON_NAME), artifact_version, artifact_name
+                raw,
+                artifact_version,
+                artifact_name,
+                expected_template_id,
+                expected_template_hash,
             )
             if status:
-                return status
-    return ""
+                return status, _raw_regression_checked(raw)
+    return "", False
+
+
+def _raw_regression_checked(raw: str | None) -> bool:
+    """``_report_regression_checked`` 的**容错包装**（坏正文 ⇒ ``False``＝未检查）。"""
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return _report_regression_checked(payload) if isinstance(payload, dict) else False

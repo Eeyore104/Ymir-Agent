@@ -60,6 +60,12 @@ SANDBOX_IMAGE_PACKAGES: frozenset[str] = frozenset(
         # data-pipeline 模板的 `python -c "import pandas"` 检查依赖它们
         "pandas",
         "numpy",
+        # v1.5（T03.10）：镜像**一直**装了这两个（`docker/sandbox.Dockerfile` 的
+        # pip 行里早就有），但包表漏登记 —— 包表比镜像**小**会让"声明了、镜像也有、
+        # 却被判缺失"的误跳过发生（虽然当前没有模板声明它们）。本版由 CI 钉子
+        # `tests/test_sandbox_image_manifest.py` 强制"表 == 镜像"，故一并补齐。
+        "greenlet",
+        "pytest-asyncio",
     }
 )
 
@@ -86,6 +92,48 @@ ALLOWED_LANGUAGES: frozenset[str] = frozenset({"python", "typescript"})
 
 #: 允许的模板模式（``supports`` 的取值集合，与 ``run.context`` 的模式同构）。
 RunMode = Literal["from_scratch", "patch"]
+
+#: ★ v1.5（docs/17 §1.2.1）：交付树「可用性」的三档，做成**一等字段**而不靠
+#: ``blocking`` 暗示 —— 否则"这条检查属于 D1 还是 D2"只存在于注释里，
+#: A6 那种参数化断言没法写。
+#:
+#: ============  =============  ============================  ==========
+#: 档              tier           失败语义                       blocking
+#: ============  =============  ============================  ==========
+#: D1 不可加载     ``loadable``   解释器/构建器读不进来          **强制 true**
+#: D2 行为不符     ``behavior``   能加载但行为不符              **强制 true**
+#: D3 规范不符     ``style``      能跑对数但风格/类型不达标     **强制 false**
+#: 未声明          ``""``         老口径（由 ``blocking`` 决定） 不约束
+#: ============  =============  ============================  ==========
+TIER_LOADABLE: str = "loadable"
+TIER_BEHAVIOR: str = "behavior"
+TIER_STYLE: str = "style"
+
+#: 合法 ``tier`` 取值（``""`` = 未声明，老口径）。
+ALLOWED_TIERS: frozenset[str] = frozenset({TIER_LOADABLE, TIER_BEHAVIOR, TIER_STYLE})
+
+#: **强制阻断**的两档（D1 不可加载 / D2 行为不符）：``tier`` 是规格，``blocking`` 是后果。
+BLOCKING_TIERS: frozenset[str] = frozenset({TIER_LOADABLE, TIER_BEHAVIOR})
+
+#: ``blocking: true`` 的检查**必须**显式声明的最小超时（PRD T1-R4"不得沿用默认值"）。
+BLOCKING_MIN_TIMEOUT_S: float = 60.0
+
+#: ``requires_deps`` 的通配 token -> 生态名（docs/17 §1.2.3）。
+#:
+#: 为什么不用裸 ``"*"``：``fastapi-vue3`` 的后端检查与前端构建在**同一棵树**里；
+#: 若 ``"*"`` 表示"树内全部依赖"，``web/package.json`` 里模型新增的 ``vue-router``
+#: 会让后端 ``pytest`` 被 skip —— 那是把无关生态的缺失算到后端头上。
+REQUIRES_DEPS_WILDCARDS: dict[str, str] = {"python:*": "python", "node:*": "node"}
+
+
+def image_package_map() -> dict[str, frozenset[str]]:
+    """两张镜像包表按**生态名**合并（v1.5 T03：``requires_deps`` 探针的唯一入参）。
+
+    ★ 为什么返回纯 dict/frozenset 而不是模型：消费方是 ``evaluation``(rank 1) 的
+    纯函数模块与 ``orchestrator`` 的冒烟段，它们只该拿到"镜像里有什么包"这份事实，
+    不该 import 模板实现。
+    """
+    return {"python": SANDBOX_IMAGE_PACKAGES, "node": SANDBOX_IMAGE_NODE_PACKAGES}
 
 
 class CheckSpec(BaseModel):
@@ -123,6 +171,36 @@ class CheckSpec(BaseModel):
             "该检查依赖的**基线文件**：精确相对路径，或以 / 结尾的目录前缀"
             "（= 该目录下 ≥1 个文件）。仅探针侧消费：基线里一个都没有 ⇒ 该检查 "
             "skipped + baseline_incomplete（不是 unhealthy）；合并树侧仍判 failed"
+        ),
+    )
+    # ---- v1.5（docs/17 §1.2.1 / §1.2.3 / §1.2.5）四个新字段，全部带默认值 ----
+    tier: str = Field(
+        default="",
+        description=(
+            "可用性档位（一等字段）：loadable(D1) / behavior(D2) / style(D3)；"
+            "空 = 未声明（老口径，由 blocking 决定）。加载期校验 24 强制与 blocking 一致"
+        ),
+    )
+    requires_deps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "该检查依赖的**交付树依赖声明**（环境探针）：python:* / node:*（按生态）"
+            "或具体包名。交付树声明了但镜像没预装 ⇒ 该检查 skipped（不扣分、不阻断）"
+        ),
+    )
+    requires_build_output: str = Field(
+        default="",
+        description=(
+            "该检查依赖的**本 run 上游检查产出的构建物**（以 / 结尾的目录前缀）："
+            "缺物 ⇒ 级联 skipped。★ 与 requires_files 刻意分开：后者是基线里的源码"
+            "依赖（仅探针侧），前者是构建产物（两侧都跳过）"
+        ),
+    )
+    no_tests_exit_code: int | None = Field(
+        default=None,
+        description=(
+            "把该退出码映射为 skipped(no_tests_collected)（pytest 未收集到用例 = 5）："
+            "'没测'不是'测失败'。None = 老行为"
         ),
     )
 

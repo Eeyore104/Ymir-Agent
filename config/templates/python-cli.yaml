@@ -91,10 +91,19 @@ skeleton:
         pytest>=8.2
 
 checks:
-  - { type: command, run: "python -m compileall -q ymir_cli", weight: 1 }
-  - { type: command, run: "python -m pytest -q", weight: 2 }
-  - { type: command, run: "ruff check .", weight: 1 }
-  - { type: command, run: 'python -c "import ymir_cli"', weight: 1 }
+  # ★★ v1.5（T1，docs/17 §1.2.2）：与 fastapi-vue3 的**后端三条同构**：
+  #   D1 不可加载（阻断）/ D2 行为不符（阻断）/ D3 规范不符（只扣分）。
+  #   `group: backend` 是本版新补的**标签**：本模板没有声明 `scoring`（走按
+  #   `checks[].weight` 归一的老口径），因此 group 对分数**零影响**。
+  - { type: command, run: "python -m compileall -q ymir_cli", weight: 1, group: backend,
+      tier: loadable, blocking: true, timeout_s: 120 }
+  - { type: command, run: "python -m pytest -q", weight: 2, group: backend,
+      tier: behavior, blocking: true, requires_deps: ["python:*"],
+      no_tests_exit_code: 5, timeout_s: 180 }
+  - { type: command, run: "ruff check .", weight: 1, group: backend,
+      tier: style, timeout_s: 120 }
+  - { type: command, run: 'python -c "import ymir_cli"', weight: 1, group: backend,
+      tier: loadable, blocking: true, requires_deps: ["python:*"], timeout_s: 120 }
 
 prompting:
   pm: PRD 必须声明为命令行工具形态（子命令 + 参数），不得引入 Web 框架。

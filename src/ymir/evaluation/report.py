@@ -20,6 +20,20 @@ v1.3.1 增量（docs/13 §7.2.3，**全部纯增量、默认值即关闭**）：
   （后者只在 ``skeleton_filled`` 时序列化，M7 ①）；
 - ``FailureAttributionOut`` + ``TaskOut.failure_attribution``（归因**提示**，
   不参与 verdict / 分数 / ``regression``；``None`` ⇒ markdown 逐字节不变）。
+
+v1.5 增量（docs/17 §1.1.4 / §1.2.4，**报告自证判据来源 + 未验证披露**）：
+
+- ``TaskOut.criteria_source`` / ``template_id`` / ``criteria_version``：本次用的
+  判据**种类 / 归属 / 版本**（由唯一装配点写入，见 ``evaluation.run_task``）；
+- ``EvaluationReport.criteria_source`` / ``template_id`` / ``criteria_version``：
+  **由 :meth:`EvaluationReport.build` 从 ``tasks[0]`` 派生**，禁止 caller 传 ——
+  "忘传就静默退回弱口径"这类缺陷在构造上不可能发生；
+- ``TaskOut.unverified_groups``：某组某档**一条检查都没真的执行**（环境缺失）的
+  组名清单（写入侧在 ``harness``，闸门据此给 ``unverified`` 第四态）。
+
+★ 序列化纪律（A19 字节契约）：上述新字段**为空时一律 pop 掉**；
+``criteria_source`` 非空时三键**一起保留**（``template_id`` / ``criteria_version``
+允许空串 —— A12 要求 ``jq`` 不返回 ``null``）。
 """
 
 from __future__ import annotations
@@ -50,6 +64,14 @@ SKIP_NOT_RUN: str = "not_run"
 
 TaskStatus = Literal["evaluated", "skipped"]
 VerdictSource = Literal["harness", "llm_qa"]
+
+#: 判据来源唯一枚举（v1.5 §1.1.4）：``template`` = 用了模板 ``checks``；
+#: ``suite`` = 只有套件 ``checks``（**未绑定模板**，判据更弱）。
+CRITERIA_SOURCE_TEMPLATE: str = "template"
+CRITERIA_SOURCE_SUITE: str = "suite"
+
+#: 三个「判据自证」字段的键名（``TaskOut`` 与 ``EvaluationReport`` 同口径）。
+CRITERIA_FIELDS: tuple[str, str, str] = ("criteria_source", "template_id", "criteria_version")
 
 
 def _utcnow_iso() -> str:
@@ -214,10 +236,23 @@ class TaskOut(BaseModel):
     #: ⇒ markdown 与 v1.3 逐字节一致（不渲染任何归因行）。
     #: ★ 归因是**提示**，不参与 verdict / 分数 / ``regression``。
     failure_attribution: FailureAttributionOut | None = None
+    # --- 判据自证（v1.5 §1.1.4）：由唯一装配点写入，读取侧据此判「同不同源」---
+    #: ``template`` | ``suite``（空 = **老报告**，v1.4 及之前没有这三个字段）。
+    criteria_source: str = ""
+    #: 判据归属的模板 id（``suite`` 时为 ``""``）。
+    template_id: str = ""
+    #: 判据版本（模板 YAML 原始字节 sha256；``suite`` 时为 ``""``）。
+    criteria_version: str = ""
+    #: 未验证的组（v1.5 §1.2.4）：该组**某个档**声明了检查却一条都没真的执行
+    #: （环境缺失 / 无用例）⇒ 记在这里。空列表 ⇒ 键不进 JSON（字节契约）。
+    unverified_groups: list[str] = Field(default_factory=list)
+    #: ★ v1.5 修复轮 D-2：``requirement`` 的来源（``run`` / ``caller`` / ``none``）。
+    #: 空串 = 老口径（v1.5 之前的报告）⇒ 键不进 JSON（字节契约）。
+    requirement_source: str = ""
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
-        """``failure_attribution is None`` 时把键从 JSON 里摘掉（A9 红线）。
+        """默认值一律摘键（A19 字节契约）；判据三键**成组**保留或成组摘掉。
 
         ★ 为什么是**模型级**序列化而不是单独的 ``to_json``：报告 JSON 的产出路径是
         ``EvaluationReport.to_json() -> self.model_dump(mode="json")``，``TaskOut`` 是
@@ -229,6 +264,15 @@ class TaskOut(BaseModel):
         data = handler(self)
         if data.get("failure_attribution") is None:
             data.pop("failure_attribution", None)
+        if not data.get("criteria_source"):
+            # 三键成组：没有 ``criteria_source`` 就等于「这份报告不自证判据」
+            # （老报告），三个键一起摘掉，v1.3/v1.4 正文逐字节不变。
+            for key in CRITERIA_FIELDS:
+                data.pop(key, None)
+        if not data.get("unverified_groups"):
+            data.pop("unverified_groups", None)
+        if not data.get("requirement_source"):
+            data.pop("requirement_source", None)
         return data
 
     def model_post_init(self, __context: Any) -> None:
@@ -264,8 +308,17 @@ class TaskOut(BaseModel):
         run_id: str | None = None,
         thresholds: dict[str, float] | None = None,
         wall_time_ms: int = 0,
+        criteria_source: str = "",
+        template_id: str = "",
+        criteria_version: str = "",
+        requirement_source: str = "",
     ) -> TaskOut:
-        """构造「未执行」任务结果（无沙箱、无 judge、零成本）。"""
+        """构造「未执行」任务结果（无沙箱、无 judge、零成本）。
+
+        v1.5：``criteria_*`` 由调用方（``harness._skipped``）从 ``EvalTask`` 平移 ——
+        未执行的任务同样要能自证"本来打算按哪套判据评"，否则报告根部的判据来源
+        会在「产物缺失」这类最需要排查的场景下恰好缺失。
+        """
         return cls(
             id=task_id,
             scenario=scenario,
@@ -283,6 +336,11 @@ class TaskOut(BaseModel):
             wall_time_ms=wall_time_ms,
             cost_cny=0.0,
             tokens=0,
+            criteria_source=criteria_source,
+            template_id=template_id,
+            criteria_version=criteria_version,
+            # ★ v1.5 修复轮 D-2：未执行任务也要自证"用的是谁的需求"
+            requirement_source=requirement_source,
         )
 
 
@@ -314,6 +372,33 @@ class EvaluationReport(BaseModel):
     #: 派生字段，勿手写；单次报告 ``first_pass_rate == final_pass_rate``
     #: （单次只评一个产物版本）；批量口径见 BaselineTable
     final_pass_rate: float | None = None
+    # --- 判据自证（v1.5 §1.1.4）：**派生字段**，只由 :meth:`build` 从 ``tasks[0]`` 写入 ---
+    #: ``template`` | ``suite``（空 = 老报告 / 无判据信息）
+    criteria_source: str = ""
+    #: 判据归属的模板 id（``suite`` 时为空串 —— A12 要求 jq 不返回 null）
+    template_id: str = ""
+    #: 判据版本（模板 YAML 指纹；``suite`` 时为空串）
+    criteria_version: str = ""
+    #: ★ v1.5 修复轮 D-2：``requirement`` 的来源（派生字段，同样只由 :meth:`build` 写）。
+    #: ``run`` = 与 gate 同源（同尺的**前提**）；``caller`` = 补评测自带（仅无归属 run）；
+    #: ``none`` = 两边都没有。空串 = 老报告 ⇒ 键不进 JSON。
+    requirement_source: str = ""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        """判据三键**全空**时摘掉（A19 字节契约），非空时三键一起保留。
+
+        ★ 为什么不逐个判空：``template_id`` / ``criteria_version`` 在 ``suite`` 口径下
+        就是空串，逐个判空会把它们摘掉 ⇒ ``jq .template_id`` 返回 ``null``（A12 要求
+        显式空串）。因此判据三键**成组**处置。
+        """
+        data = handler(self)
+        if not data.get("criteria_source"):
+            for key in CRITERIA_FIELDS:
+                data.pop(key, None)
+        if not data.get("requirement_source"):
+            data.pop("requirement_source", None)
+        return data
 
     def model_post_init(self, __context: Any) -> None:
         """构造后按 ``tasks`` 归算执行/跳过计数与通过率（派生字段，始终一致）。"""
@@ -370,6 +455,10 @@ class EvaluationReport(BaseModel):
         """汇总报告：报告级总分 = 各**已执行**任务均值；双门槛在报告级复核。
 
         全为 ``evaluated`` 时与 v1.0 逐字节等价（分母集合不变）。
+
+        ★ v1.5（§1.1.4）：判据三键**不设 caller 参数**，只从 ``tasks[0]`` 派生 ——
+        "忘传就静默退回弱口径"在构造上不可能（该 codebase 已为
+        ``_known_merged_health(artifact_version=...)`` 的"忘传即失效"付过一次代价）。
         """
         task_list = list(tasks)
         executed = [task for task in task_list if task.status == STATUS_EVALUATED]
@@ -377,11 +466,22 @@ class EvaluationReport(BaseModel):
         runnability = _mean([task.runnability for task in executed])
         cost = round(sum(task.cost_cny for task in task_list), 6)
         tokens = sum(task.tokens for task in task_list)
+        # ★ v1.5（T05.1 发现的 v1.4 遗留口径裂缝）：报告级 ``passed`` 必须与
+        # ``TaskOut.passed`` 一致 —— 阻断项失败 ⇒ **不可交付**（PRD Q4 / T1-R3）。
+        #
+        # 旧实现只复核双门槛，于是"后端 pytest 全红"的树会得到
+        # ``tasks[0].passed=False`` + ``tasks[0].blocking_failed=[...]`` 却
+        # ``report.passed=True``：``/evaluations`` 的响应与列表都读报告级字段，
+        # 用户在报告页看到的是"✅ 通过"（而 verdict 与提升闸门都说坏）。
+        # ``TaskOut.model_post_init`` 早已守住**任务级**不变量，这里补上**报告级**。
+        blocking = any(task.blocking_failed for task in executed)
         passed = (
             bool(executed)
+            and not blocking
             and total >= thresholds.total
             and runnability >= thresholds.runnability
         )
+        head = task_list[0] if task_list else None
         return cls(
             suite_id=suite_id,
             suite_version=suite_version,
@@ -399,6 +499,10 @@ class EvaluationReport(BaseModel):
             cost_cny=cost,
             total_tokens=tokens,
             wall_time_ms=wall_time_ms,
+            criteria_source=(getattr(head, "criteria_source", "") or ""),
+            template_id=(getattr(head, "template_id", "") or ""),
+            criteria_version=(getattr(head, "criteria_version", "") or ""),
+            requirement_source=(getattr(head, "requirement_source", "") or ""),
         )
 
     # ------------------------------------------------------------------ 序列化
@@ -414,6 +518,12 @@ class EvaluationReport(BaseModel):
             f"# 评测报告（{verdict}）",
             "",
             f"- 套件：`{self.suite_id}` v{self.suite_version}",
+        ]
+        # 判据来源行**只在有判据信息时**输出（老报告 / 套件批量口径与 v1.3 逐字节一致）
+        criteria_line = self._criteria_line()
+        if criteria_line:
+            lines.append(criteria_line)
+        lines += [
             f"- 生成时间：{self.generated_at}",
             f"- 加权总分：**{self.total_score:.2f}** / 100"
             f"（门槛 {self.thresholds.get('total', 75)}）",
@@ -531,6 +641,21 @@ class EvaluationReport(BaseModel):
             for name in DIMENSION_ORDER
         )
 
+    def _criteria_line(self) -> str:
+        """判据来源行（v1.5 §1.1.4）：无判据信息 ⇒ ``""``（不渲染、字节不变）。
+
+        ``suite`` 口径必须**显式**写「未绑定模板」——那种结论不能给"有模板的树"背书，
+        读者要能一眼看出"这次的尺子和流水线那把不是同一把"。
+        """
+        source = str(self.criteria_source or "").strip()
+        if not source:
+            return ""
+        if source == CRITERIA_SOURCE_TEMPLATE:
+            version = str(self.criteria_version or "")
+            fingerprint = f"`{version[:12]}`" if version else "（未记录指纹）"
+            return f"- 判据来源：模板 `{self.template_id or '（未记录）'}`（{fingerprint}）"
+        return f"- 判据来源：套件 `{self.suite_id}`（**未绑定模板**）"
+
 
 def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
@@ -576,6 +701,12 @@ def _incremental_health_lines(task: TaskOut) -> list[str]:
             for item in task.skipped_checks
         )
         lines.append(f"- 已跳过检查（不扣分）：{skipped}")
+    if task.unverified_groups:
+        # v1.5 §1.2.4 唯一文案（**禁止**写成"通过"）：没验证 ≠ 验过了
+        groups = "、".join(task.unverified_groups)
+        lines.append(
+            f"- 未验证（环境缺失：{groups}）— 该组的 D2 检查一条都没执行；未验证 ≠ 通过"
+        )
     lines += _attribution_lines(task.failure_attribution)
     return lines
 

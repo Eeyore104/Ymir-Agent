@@ -147,19 +147,34 @@ class BaselineMergeOut(BaselineUploadOut):
     ``reused=True``：重建结果与当前基线最新版**内容相同**，未新建版本（幂等）。
     HTTP 状态仍是 201（与既有基线端点一致），语义只靠该字段区分。
 
-    ``warning``（v1.4 T2.1 / 返修 P1-3）：取值集合封闭，目前两种——
+    ``warning``（v1.4 T2.1 / 返修 P1-3；v1.5 **多码**）：取值集合封闭，可能的值——
 
-    - ``baseline_promoted_unhealthy:1`` = 这次是**强制**把一个探针不健康的合并树提成了
-      基线（前端据此提示"后续回归比较的起点不健康"）；
+    - ``baseline_promoted_unhealthy:1`` = 这次是**强制**把一个健康结论为 unhealthy 的
+      合并树提成了基线（前端据此提示"后续回归比较的起点不健康"）；
     - ``baseline_promoted_unknown:1`` = 这次是**强制**提升的，而该 run **没有**可用的
-      健康结论（"没人说它好"≠"评测说它坏"，前端文案与上一条分开）。
+      健康结论（"没人说它好"≠"评测说它坏"，前端文案与上一条分开）；
+    - ``baseline_promoted_unverified:1`` = 提升成功，但**部分检查因环境缺失未执行**
+      （v1.5 第四态：不阻断、必须留痕；文案「未验证 ≠ 通过」）；
+    - ``criteria_diverged:1`` = 同一版树上 ``eval_verdict`` 与 ``evaluation_report``
+      的结论**不一致**（已按优先级采纳 gate 的结论，本条只作披露）；
+    - ``baseline_promoted_regression_unknown:1`` = 采纳的报告**没做过回归判定**
+      （探针没跑 / 整体 skipped ⇒ ``regression`` 恒 false，"没验"≠"没回归"）；
+      v1.5 修复轮 D-1 新增，**可能单独出现**（树 healthy 但回归没验过）。
+
+    ★ v1.5 起 ``warning`` 是**逗号分隔的留痕码集合**（如
+    ``baseline_promoted_unhealthy:1,criteria_diverged:1``）：顺序**固定**——
+    ``业务码`` → ``criteria_diverged:1`` → ``baseline_promoted_regression_unknown:1``；
+    前端必须按 ``,`` 拆分后逐码匹配（严格相等比对会在多码时静默退回默认文案）。
+    字段类型不变（``str``）⇒ 逐字节兼容。
 
     空串 = 没有可披露的降级（非强制提升时**不出现**该键的语义等价物）。
     """
 
     reused: bool = False
-    #: 强制提升留痕（空串 = 无）。取值集合封闭：
-    #: ``baseline_promoted_unhealthy:1`` / ``baseline_promoted_unknown:1``。
+    #: 提升留痕（空串 = 无）。取值集合封闭、**逗号分隔**：
+    #: ``baseline_promoted_unhealthy:1`` / ``baseline_promoted_unknown:1`` /
+    #: ``baseline_promoted_unverified:1`` / ``criteria_diverged:1`` /
+    #: ``baseline_promoted_regression_unknown:1``。
     warning: str = ""
 
     @model_serializer(mode="wrap")

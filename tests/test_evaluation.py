@@ -793,7 +793,10 @@ async def test_evaluations_api_infers_run_id_from_artifact_version(client) -> No
     assert json.loads(body)["run_id"] == run_id
 
     # ★ 端到端（零沙箱）：闸门按 (run, 产物, 版本) 真的取到了这份报告
-    status = await _known_merged_health(
+    # v1.5（T02.1）：返回类型升级为 ``MergedHealthReading``（带 source_name / divergent），
+    # 结论本身仍在 ``.status`` 上 —— 这里顺带立此存照：门补评测的报告**也能**给闸门
+    # 提供结论（同尺之后它不再是"弱口径"）。
+    reading = await _known_merged_health(
         store,
         project_id=project_id,
         run_id=run_id,
@@ -801,7 +804,8 @@ async def test_evaluations_api_infers_run_id_from_artifact_version(client) -> No
         artifact_version=1,
         artifact_name="code",
     )
-    assert status == "healthy"
+    assert reading.status == "healthy"
+    assert reading.source_name == "evaluation_report"
 
 
 async def test_evaluation_project_missing_artifact(client) -> None:

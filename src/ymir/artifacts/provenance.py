@@ -39,6 +39,7 @@ v1.3.1 真跑 R-c1 的前端构建就是坏的，v2 因此也坏）。因此提�
 |---|---|---|
 | ``healthy`` | 正常提升 | 正常提升（``force`` 无副作用） |
 | ``unhealthy`` | **``BaselineUnhealthyError``（1003）** | 放行 + 不健康留痕短码 |
+| ``unverified``（v1.5 第四态） | 放行 + 未验证留痕短码 | 同左（与 ``force`` 无关） |
 | ``skipped`` | 放行（"跑不了"≠"跑坏了"） | 放行 |
 | 未知（``""``） | 见下 | 放行 + 未知留痕短码 |
 
@@ -125,9 +126,11 @@ __all__ = [
     "BASELINE_ARTIFACT_NAME",
     "BASELINE_PROMOTED_UNHEALTHY_CODE",
     "BASELINE_PROMOTED_UNKNOWN_CODE",
+    "BASELINE_PROMOTED_UNVERIFIED_CODE",
     "HEALTH_HEALTHY",
     "HEALTH_SKIPPED",
     "HEALTH_UNHEALTHY",
+    "HEALTH_UNVERIFIED",
     "BaselineHealthUnknownError",
     "BaselineUnhealthyError",
     "MergedHealth",
@@ -139,7 +142,7 @@ __all__ = [
     "template_yaml_hash",
 ]
 
-#: 合并树健康度三态（字面量与 ``evaluation.baseline_probe`` **同源**）。
+#: 合并树健康度四态（字面量前三项与 ``evaluation.baseline_probe`` **同源**）。
 #:
 #: ★ 为什么不 import 那边的常量：``artifacts``(3) -> ``evaluation``(1) 是逆层
 #: （CI 用 AST 断言拦）。两处字面量由本条注释互指，与 ``BASELINE_ARTIFACT_NAME``
@@ -147,6 +150,10 @@ __all__ = [
 HEALTH_HEALTHY: str = "healthy"
 HEALTH_UNHEALTHY: str = "unhealthy"
 HEALTH_SKIPPED: str = "skipped"
+#: ★★ v1.5（T02.4 / docs/17 §1.2.4）：**第四态**「某组某档一条检查都没真的执行」。
+#: 它既不是 ``healthy``（那等于宣称"验过了"），也不是 ``""``（那会让
+#: ``strict_health`` 必然 409，无依赖镜像每次提升都要 ``force`` ⇒ 闸门退化）。
+HEALTH_UNVERIFIED: str = "unverified"
 
 #: 「不健康的合并树被强制提升」的留痕短码（v1.4 T2.1，A4：不静默）。
 BASELINE_PROMOTED_UNHEALTHY_CODE: str = "baseline_promoted_unhealthy:1"
@@ -157,6 +164,13 @@ BASELINE_PROMOTED_UNHEALTHY_CODE: str = "baseline_promoted_unhealthy:1"
 #: 会让排障时无法区分"真坏"与"没评测"，而这两件事的处置完全不同（前者要修代码，
 #: 后者要补评测）。
 BASELINE_PROMOTED_UNKNOWN_CODE: str = "baseline_promoted_unknown:1"
+
+#: 「部分检查未执行（环境缺失）却被提升」的留痕短码（v1.5 T02.4 / Q2）。
+#:
+#: ★ 与上面两条都不同：``unverified`` **不阻断**（否则纯 lint 镜像每次提升都要
+#: ``force``，用户会习惯性 ``force`` ⇒ 闸门退化），但必须**留痕**可回查 ——
+#: 因为"没验证过"绝不能长得像"验过了"。
+BASELINE_PROMOTED_UNVERIFIED_CODE: str = "baseline_promoted_unverified:1"
 
 
 class BaselineUnhealthyError(StateConflictError):
@@ -227,7 +241,7 @@ class MergedHealth:
     """「待提升合并树」的健康度结论（纯数据）。
 
     Attributes:
-        status: ``healthy`` / ``unhealthy`` / ``skipped`` / ``""``（未知）。
+        status: ``healthy`` / ``unhealthy`` / ``unverified`` / ``skipped`` / ``""``（未知）。
         source: 结论来源，仅供日志与排障：``run``（复用 run 已有结论）/
             ``probe``（对合并树现跑一次探针）/ ``unknown``。
     """
@@ -241,13 +255,37 @@ class MergedHealth:
         return self.status == HEALTH_UNHEALTHY
 
     @property
+    def unverified(self) -> bool:
+        """部分检查因环境缺失**一条都没执行**（v1.5 第四态，docs/17 §1.2.4）。
+
+        ★ 语义是"我确实不知道"，不是"验过了"也不是"坏了"：**不阻断**提升，
+        但必须在版本 ``message`` 与响应 ``warning`` 上留痕（``Q2`` 已拍板）。
+        """
+        return self.status == HEALTH_UNVERIFIED
+
+    @property
     def known(self) -> bool:
-        """是否有**可用的**健康结论（``healthy`` / ``unhealthy`` / ``skipped``）。
+        """是否有**可用的**健康结论（``healthy`` / ``unhealthy`` / ``unverified`` / ``skipped``）。
 
         ★ ``skipped`` 算"已知"：那是探针明确回报"这个环境跑不了检查"，是结论而不是
         缺失。只有 ``""`` 才是"什么都没拿到"。
+
+        ★★ v1.5（T02.4）：``unverified`` 与 ``skipped`` **同族** —— 两者都是"结论"
+        （"我确实没验成"），不是"没拿到结论"，所以一并算 ``known``。
+
+        ★ v1.5 修复轮 D-7 更正注释：先前这里写的是"不纳入就会 409"，**那个因果是错的** ——
+        步骤 8b 里 ``elif health.unverified`` 排在 ``elif strict_health and not known``
+        **之前**，因此即使不把它纳入 ``known``，行为也不变（变异 m2 已实测）。
+        保留纳入是**防御性**的：① 与 ``HEALTH_SKIPPED`` 保持同一分类（同为"有结论"）；
+        ② 将来若有人调整 8b 的分支顺序，``known`` 仍是唯一"是否有结论"的判据，
+        不会因为顺序变化把 `unverified` 误判成未知 ⇒ 409。
         """
-        return self.status in {HEALTH_HEALTHY, HEALTH_UNHEALTHY, HEALTH_SKIPPED}
+        return self.status in {
+            HEALTH_HEALTHY,
+            HEALTH_UNHEALTHY,
+            HEALTH_UNVERIFIED,
+            HEALTH_SKIPPED,
+        }
 
 
 async def resolve_merged_health(
@@ -552,6 +590,19 @@ async def promote_merged_to_baseline(
         warning = BASELINE_PROMOTED_UNHEALTHY_CODE
         logger.warning(
             "以不健康的合并树提升基线（force=true，已留痕）：project=%s run=%s status=%s",
+            project_id,
+            run_id,
+            health.status,
+        )
+    elif health.unverified:
+        # ---- v1.5（T02.4 / Q2）：部分检查未执行 ⇒ **放行 + 留痕**，与 force 无关 ----
+        # ★ 不 raise 是刻意的：无依赖镜像（如纯 lint 镜像）每次提升都 409 的话，
+        #   用户会习惯性 force，闸门随即退化（Q2 已否决那条路）。但"没验证过"必须
+        #   可回查 —— 留痕落在版本 message 与响应 warning 上，与两条既有短码并列。
+        warning = BASELINE_PROMOTED_UNVERIFIED_CODE
+        logger.warning(
+            "以「部分检查未执行」的合并树提升基线（已留痕，不阻断）："
+            "project=%s run=%s status=%s",
             project_id,
             run_id,
             health.status,

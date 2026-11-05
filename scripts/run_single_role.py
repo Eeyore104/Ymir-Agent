@@ -25,17 +25,19 @@ import argparse
 import asyncio
 import sys
 import time
+from typing import Any
 
 from sqlalchemy import select
 
 from ymir.artifacts.store import BASELINE_TYPE, ArtifactStore
-from ymir.bootstrap import build_execution_stack
+from ymir.bootstrap import build_execution_stack, build_repair_stack
 from ymir.common.errors import NotFoundError
 from ymir.common.logging import setup_logging
 from ymir.config import PROJECT_ROOT, get_settings, load_env_file
+from ymir.evaluation.gate import reduce_to_verdict, repair_round_of
 from ymir.evaluation.harness import build_eval_harness
 from ymir.evaluation.report import TaskOut
-from ymir.evaluation.run_task import evaluate_run
+from ymir.evaluation.run_task import evaluate_run_report
 from ymir.gateway.usage import UsageRecorder
 from ymir.models.entities import DEFAULT_TENANT_ID, Message, ModelCall, StageExecution
 from ymir.models.enums import RunStatus
@@ -93,14 +95,154 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluate",
         action="store_true",
-        help="run 终态后补一次四维打分（与 gate / 批量同源；不影响 verdict）",
+        help=(
+            "run 终态后按 harness 口径补一次四维打分，并把结论**落盘为 eval_verdict**"
+            "（v1.5 起不再只打印；提升闸门据此解锁）"
+        ),
     )
     parser.add_argument(
         "--suite",
         default="default",
         help="评测套件 id（默认 default；仅 --evaluate 时生效）",
     )
+    # ★ v1.5（T04.3 / PRD T4-R2）：**默认不启用自动返修**（线性、便宜、可预测）
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "显式开启 run 内自动返修（默认关）。仅当本次阶段链**含 evaluation 阶段**时"
+            "生效；否则 stderr 警告「--repair 未生效」且不改变退出码"
+        ),
+    )
     return parser.parse_args()
+
+
+def repair_chain_warning(definition: PipelineDefinition, truncated: PipelineDefinition) -> str:
+    """``--repair`` 是否真的能生效；不能 ⇒ 返回**警告文案**（空串 = 生效）。
+
+    v1.5（T04.3 / A16）的两条硬约束（v1.4 §0.2 已实测）：
+
+    1. 只装 ``eval_gate`` 而不装 ``repair`` 时 gate **根本不会被调用**
+       （``engine.py`` 的分叉条件是两者同时非空）；
+    2. 即使两者都装，``RepairController.should_evaluate`` 只在
+       ``stage.id == definition.eval_stage_id()`` 时真 —— 而 ``--role engineer`` 的
+       截断链被截到 ``coding``，**永远不含** ``evaluation``。
+
+    因此"开了但不生效"必须**显式说出来**（PRD T4-R2 要求写 **stderr**：写在 stdout
+    会被当成正常输出）。给用户一个静默失效的开关，比不给更糟。
+    """
+    eval_stage = definition.eval_stage_id()
+    chain_ids = {stage.id for stage in truncated.stages}
+    if eval_stage is None or eval_stage not in chain_ids or not truncated.repair_active():
+        return "--repair 未生效：本次阶段链不含 evaluation 阶段"
+    return ""
+
+
+#: ``verdict=absent`` 的**唯一**文案（T4-R3：不裁决 ≠ 通过了）。
+ABSENT_VERDICT_LINE = "[verdict] absent（未裁决）— 提升需 force；如需结论请加 --evaluate"
+
+#: 落盘成功的那一行（A13/A14 的 grep 目标，措辞**不可改**）。
+PERSISTED_VERDICT_LINE = (
+    "评测结论已落盘（eval_verdict v{artifact}，绑定 code v{code}）——提升闸门可用"
+)
+
+
+def verdict_lines(
+    verdict: Any,
+    *,
+    saved_version: int | None,
+    artifact_version: int | None,
+    unverified_groups: Any = (),
+) -> list[str]:
+    """评测段的结论行（设计 §1.3.3 的四种状态，**唯一**生成点）。
+
+    Args:
+        verdict: :class:`~ymir.common.contracts.EvalVerdict`。
+        saved_version: ``eval_verdict`` 落盘后的版本号；``None`` = 没落盘 ⇒ 只能是 absent。
+        artifact_version: 被评测的 ``code`` 版本（``None`` ⇒ 文案里退化成 ``v0``）。
+        unverified_groups: 未验证的组（``unverified`` 文案要列出它们）。
+
+    Returns:
+        行列表（0–2 行）。**落盘成功**时第一行是固定的「评测结论已落盘（…）」，
+        第二行是 ``[verdict] <status> …`` —— A13/A14 的 grep 目标就是这两行。
+    """
+    code = artifact_version if artifact_version is not None else 0
+    if saved_version is None:
+        # 没落盘 ⇒ 结论就是"未裁决"（**不能**说 pass：闸门读不到任何东西）
+        detail = str(getattr(verdict, "reason", "") or "")
+        return [ABSENT_VERDICT_LINE + (f"｜{detail}" if detail else "")]
+
+    lines = [PERSISTED_VERDICT_LINE.format(artifact=saved_version, code=code)]
+    status = str(getattr(verdict, "status", "") or "")
+    groups = [str(item) for item in (unverified_groups or ()) if str(item).strip()]
+    if status == "pass" and groups:
+        # ★ v1.5 修复轮 D-6：**未验证时不再印 pass 行** —— 设计 §1.3.3 是"只印一行"，
+        #   而同一块输出里同时出现"pass（通过）"与"未验证 ≠ 通过"会让用户以为矛盾。
+        #   `pass` 只表示"双门槛过了且无阻断项"，它**不**代表检查都验过。
+        lines.append(
+            f"[verdict] unverified（部分检查未执行：{'、'.join(groups)}）— 未验证 ≠ 通过"
+        )
+        return lines
+    if status == "pass":
+        lines.append(
+            f"[verdict] pass（eval_verdict v{saved_version} ← code v{code}）— 提升闸门可用"
+        )
+    elif status == "fail":
+        reason = str(getattr(verdict, "reason", "") or "未达标")
+        lines.append(f"[verdict] fail（eval_verdict v{saved_version} ← code v{code}）— {reason}")
+    elif status == "unknown":
+        detail = str(getattr(verdict, "reason", "") or "")
+        lines.append(ABSENT_VERDICT_LINE + (f"｜{detail}" if detail else ""))
+    else:  # pragma: no cover - EvalVerdict.status 封闭为 pass/fail/unknown
+        lines.append(f"[verdict] {status} — 未验证 ≠ 通过")
+    # ★ v1.5 收口（N-5）：这里**复用**上面已算好的 ``groups`` —— 原先又重算了一遍，
+    #   对 ``pass`` 分支是死代码（该分支已在上面 return），对其它分支是纯冗余。
+    if groups:
+        # R8 唯一文案：**禁止**写成"通过"
+        lines.append(
+            f"[verdict] unverified（部分检查未执行：{'、'.join(groups)}）— 未验证 ≠ 通过"
+        )
+    return lines
+
+
+async def persist_verdict(
+    store: ArtifactStore,
+    report: Any,
+    *,
+    run_id: str,
+    project_id: str,
+) -> Any | None:
+    """把评测报告落成 **``eval_verdict`` 新版本**（不覆写，产物不可变契约）。
+
+    ★ 落盘失败**绝不改变 run 终态与退出码**（T04.4 / A13 的降级口径，与
+    ``gate._save_report`` 一致）：评测是附加信息，磁盘/DB 抖动不该让一次成功的 run
+    变成失败。失败时在 **stderr** 留一句可操作提示。
+
+    Args:
+        store: 产物库。
+        report: :class:`~ymir.evaluation.report.EvaluationReport`。
+        run_id: 归属 run（闸门按它取报告）。
+        project_id: 项目 id。
+
+    Returns:
+        :class:`~ymir.artifacts.store.SavedVersion`（含 ``version``）；失败 ⇒ ``None``。
+    """
+    from ymir.evaluation.gate import VERDICT_ARTIFACT_NAME
+
+    try:
+        return await report.save(
+            store,
+            project_id=project_id,
+            run_id=run_id,
+            created_by="cli",
+            name=VERDICT_ARTIFACT_NAME,
+        )
+    except Exception as exc:  # noqa: BLE001 - 落盘失败只降级，不改终态与退出码
+        print(
+            f"[verdict] 结论未落盘（{exc}）— 提升仍需 force；请检查磁盘/数据库后重跑",
+            file=sys.stderr,
+        )
+        return None
 
 
 async def resolve_baseline_ref(
@@ -403,12 +545,36 @@ async def run_main(args: argparse.Namespace) -> int:
             return 0
 
         stack = build_execution_stack(settings, session_factory)
+        # ★ v1.5（T04.3 / A16）：``--repair`` 默认关；开了但链上没 evaluation 阶段 ⇒
+        #   **stderr** 警告且**不改变退出码**（警告只是警告）。
+        repair_warning = repair_chain_warning(definition, truncated) if args.repair else ""
+        if repair_warning:
+            print(repair_warning, file=sys.stderr)
+        repair_stack = None
+        if args.repair and not repair_warning:
+            # 真生效的分支（例如 ``--role qa``：截断链含 evaluation，回边两端都在链上）
+            repair_stack = build_repair_stack(
+                session_factory=session_factory,
+                events=stack.event_publisher,
+                messages=stack.message_publisher,
+                harness=build_eval_harness(
+                    settings,
+                    stack.artifact_store,
+                    gateway=stack.gateway,
+                    session_factory=session_factory,
+                    events=stack.event_publisher,
+                ),
+                store=stack.artifact_store,
+            )
         orchestrator = OrchestrationEngine(
             session_factory=session_factory,
             events=stack.event_publisher,
             messages=stack.message_publisher,
             executor=stack.executor,
             definition_loader=lambda _pid: truncated,
+            # 两者**同时**注入引擎才会走裁决分叉（engine.py 的 and 语义，v1.5 不改）
+            eval_gate=(repair_stack.gate if repair_stack is not None else None),
+            repair=(repair_stack.controller if repair_stack is not None else None),
         )
 
         project_id = await resolve_project(session_factory, args)
@@ -433,9 +599,13 @@ async def run_main(args: argparse.Namespace) -> int:
         final = await wait_terminal(session_factory, run_id, args.timeout)
         elapsed = time.perf_counter() - started
         await print_report(session_factory, run_id, elapsed)
+        saved_version: int | None = None
+        artifact_version: int | None = None
+        unverified_groups: Any = ()
         if args.evaluate:
-            # v1.3（T4.1）：与 gate 裁决 / 批量补评**同一装配点**（run_task.evaluate_run），
-            # 不重复实现打分逻辑，也不改写 run 的终态与 verdict。
+            # v1.3（T4.1）：与 gate 裁决 / 批量补评**同一装配点**（run_task）；
+            # ★ v1.5（T04.2）：不再"只打印"—— 报告落盘为 **eval_verdict 新版本**，
+            #   提升闸门（`_known_merged_health`）因此能读到结论，用户不必再 force。
             async with session_factory() as session:
                 fresh_run = await RunRepository(session).get(run_id)
             if fresh_run is None:
@@ -449,9 +619,30 @@ async def run_main(args: argparse.Namespace) -> int:
                     events=stack.event_publisher,
                 )
                 print("- 评测（附加信息，不参与 verdict）")
-                outcome = await evaluate_run(
-                    harness, fresh_run, default_suite=args.suite
+                outcome, suite, report = await evaluate_run_report(
+                    harness,
+                    fresh_run,
+                    default_suite=args.suite,
+                    # 与 gate 同一个"第几轮"口径（v1.5：提为公开函数）
+                    repair_round=repair_round_of(fresh_run.context),
                 )
+                verdict = reduce_to_verdict(
+                    suite,
+                    outcome,
+                    artifact_name="code",
+                    repair_round=repair_round_of(fresh_run.context),
+                )
+                raw_version = outcome.artifact_ref.get("version")
+                artifact_version = raw_version if isinstance(raw_version, int) else None
+                unverified_groups = tuple(outcome.unverified_groups)
+                # 落盘失败 ⇒ saved_version 保持 None ⇒ 文案退化为 absent（**不谎报**）
+                saved = await persist_verdict(
+                    stack.artifact_store,
+                    report,
+                    run_id=fresh_run.id,
+                    project_id=fresh_run.project_id,
+                )
+                saved_version = getattr(saved, "version", None)
                 # v1.3.1（T4.3）：既有「合计：N 次调用 / tokens / ¥」是**执行阶段**
                 # 口径，刻意不动；这里补一行「含 --evaluate」的口径，
                 # 让"单跑 + 评测"的真实花费可核（两行并存，不混叠）。
@@ -463,6 +654,18 @@ async def run_main(args: argparse.Namespace) -> int:
                         f"{totals.total_tokens} tokens / ¥{totals.cost_cny:.6f}"
                     ),
                 )
+                # 结论行放在评测块**之后**（A13/A14 的 grep 目标；与四维分数分开读）
+                for line in verdict_lines(
+                    verdict,
+                    saved_version=saved_version,
+                    artifact_version=artifact_version,
+                    unverified_groups=unverified_groups,
+                ):
+                    print(line)
+        else:
+            # ★ T4-R3（A17）：**不裁决 ≠ 通过**。没加 ``--evaluate`` 时必须显式标注
+            #   ``absent``，否则"没评测"与"评测通过"在屏幕上长得一样。
+            print(ABSENT_VERDICT_LINE)
         await orchestrator.shutdown()
         return 0 if final.status == RunStatus.COMPLETED.value else 1  # type: ignore[attr-defined]
     finally:

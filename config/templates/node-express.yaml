@@ -121,20 +121,51 @@ skeleton:
         }
 
 checks:
+  # ★★ v1.5（T1，docs/17 §1.2.2 / §1.2.5）：三档 + 级联跳过。
+  #   `group: backend` 只是标签（本模板未声明 `scoring` ⇒ 走按权重归一的老口径）。
+  #
+  #   ★ v1.5 修复轮 D-3：**D2 由 `npx tsc --noEmit` 承担**。
+  #   原因（真跑/对抗验证共同暴露）：`node-build .` 与 `node --test dist` 都声明了
+  #   `requires_deps: ["node:*"]` —— 真实 Node 树几乎必然声明镜像外的 npm 包
+  #   （`lodash` 之类），于是三条检查**全部** `skipped`，`executed=[]`：
+  #   这个模板的阻断判据在真实树上是**假的**。
+  #   `tsc` 只需要 `typescript`（镜像**预装**、恒真），它本身就是"类型/编译层面
+  #   能不能加载"的**行为**判据 ⇒ 改 `tier: behavior` + `blocking: true` +
+  #   `requires_deps: ["typescript"]`，与 ruff（python 侧的 D3）不再对称 ——
+  #   这是刻意的：python 的 ruff 是"风格"，tsc 是"类型能不能过"。
   - type: command
     run: "node-build ."
     weight: 2
+    group: backend
+    tier: loadable
+    blocking: true
     requires: node-build
+    requires_deps: ["node:*"]
     timeout_s: 300
   - type: command
     run: "node --test dist"
     weight: 2
+    group: backend
+    tier: behavior
+    blocking: true
     requires: node
+    requires_deps: ["node:*"]
+    # ★ T1-R6 级联跳过：`dist/` 是**本 run 上游构建产出的构建物**（不是基线里的源码）。
+    #   若 `node-build .` 因环境缺失/失败导致 `dist/` 不存在 ⇒ 本检查 skipped，
+    #   **不判 fail**（同一件事不该被记两次失败；构建失败本身已由 D1 阻断）。
+    #   ★ 与 requires_files 刻意分开：后者是基线里的源码依赖，只在探针侧生效。
+    requires_build_output: "dist/"
     timeout_s: 300
+  # ★ v1.5 修复轮 D-3：从 D3 改成 **D2（阻断）**，且只依赖 `typescript`
+  #   ⇒ 真实 Node 树里它**真的会跑**，`blocking_failed` 因此不再恒空。
   - type: command
     run: "npx tsc --noEmit"
     weight: 1
+    group: backend
+    tier: behavior
+    blocking: true
     requires: npx
+    requires_deps: ["typescript"]
     timeout_s: 300
 
 prompting:

@@ -22,8 +22,10 @@ import {
   FORCE_PROMOTE_LABEL,
   HEALTH_UNKNOWN_CONFIRM_TITLE,
   HEALTH_UNKNOWN_CONFIRM_WARNING,
+  CRITERIA_DIVERGED_CODE,
   PROMOTED_UNHEALTHY_CODE,
   PROMOTED_UNKNOWN_CODE,
+  PROMOTED_UNVERIFIED_CODE,
   STATE_CONFLICT_CODE,
   UNHEALTHY_CONFIRM_TITLE,
   UNHEALTHY_CONFIRM_WARNING,
@@ -35,6 +37,7 @@ import {
   promoteResultText,
   promoteWarningText,
   requiresForceConfirm,
+  splitWarningCodes,
   shortRunId,
   withForce,
 } from '@/utils/promoteBaseline'
@@ -303,5 +306,66 @@ describe('utils/promoteBaseline · unhealthy 闸门（v1.4 T2.2）', () => {
     expect(UNHEALTHY_CONFIRM_WARNING).toContain('不健康')
     expect(UNHEALTHY_CONFIRM_WARNING).toContain('污染后续基线')
     expect(FORCE_PROMOTE_LABEL).toContain('force')
+  })
+
+  // ---- v1.5（T05.2）：warning 变成**逗号分隔的码集合**，必须逐码匹配 ----
+
+  it('splitWarningCodes：按逗号拆分、去空白、保持顺序、空值给空数组', () => {
+    expect(splitWarningCodes(undefined)).toEqual([])
+    expect(splitWarningCodes('')).toEqual([])
+    expect(splitWarningCodes('a:1')).toEqual(['a:1'])
+    expect(splitWarningCodes('a:1,criteria_diverged:1')).toEqual(['a:1', 'criteria_diverged:1'])
+    expect(splitWarningCodes(' a:1 , , b:2 ')).toEqual(['a:1', 'b:2'])
+  })
+
+  it('promoteWarningText：三种输入各命中（单码 unhealthy / 单码 unverified / 多码）', () => {
+    // ① 单码：不健康
+    const unhealthy = promoteWarningText({
+      reused: false,
+      version: 6,
+      warning: PROMOTED_UNHEALTHY_CODE,
+    })
+    expect(unhealthy).toContain('强制提升不健康的合并树')
+    expect(unhealthy).toContain('v6')
+
+    // ② 单码：未验证（★ 文案必须含「未验证 ≠ 通过」，且不得断言"已通过"）
+    expect(PROMOTED_UNVERIFIED_CODE).toBe('baseline_promoted_unverified:1')
+    const unverified = promoteWarningText({
+      reused: false,
+      version: 7,
+      warning: PROMOTED_UNVERIFIED_CODE,
+    })
+    expect(unverified).toContain('未验证 ≠ 通过')
+    expect(unverified).toContain('部分检查因环境缺失未执行')
+    expect(unverified).toContain('v7')
+    expect(unverified).not.toContain('已通过')
+    expect(unverified).not.toContain('验证通过')
+    expect(unverified).not.toBe(unhealthy)
+
+    // ③ 多码：两个提示都要出，**不得**退回默认文案（v1.4 严格相等就退回了）
+    expect(CRITERIA_DIVERGED_CODE).toBe('criteria_diverged:1')
+    const multi = promoteWarningText({
+      reused: false,
+      version: 8,
+      warning: `${PROMOTED_UNHEALTHY_CODE},${CRITERIA_DIVERGED_CODE}`,
+    })
+    expect(multi).toContain('强制提升不健康的合并树')
+    expect(multi).toContain('两份口径不一致的评测报告')
+    expect(multi).toContain('v8')
+    expect(multi.split('；').length).toBe(2)
+    // 顺序与后端一致：先业务码、后 diverged
+    expect(multi.indexOf('强制提升不健康的合并树')).toBeLessThan(
+      multi.indexOf('两份口径不一致'),
+    )
+  })
+
+  it('promoteWarningText：只有 diverged 时也要披露（不静默）', () => {
+    const onlyDiverged = promoteWarningText({
+      reused: true,
+      version: 9,
+      warning: CRITERIA_DIVERGED_CODE,
+    })
+    expect(onlyDiverged).toContain('两份口径不一致')
+    expect(onlyDiverged).toContain('未新建版本') // suffix 仍生效
   })
 })

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter
@@ -24,11 +25,13 @@ from ymir.api.schemas import (
     EvaluationSummaryOut,
     PageData,
 )
+from ymir.artifacts.provenance import template_yaml_hash
 from ymir.common.errors import InvalidParamError, NotFoundError
 from ymir.evaluation.report import EvaluationReport
 from ymir.models.entities import Artifact
 from ymir.models.enums import ArtifactType
-from ymir.storage.repositories import ProjectRepository
+from ymir.storage.repositories import ProjectRepository, RunRepository
+from ymir.templates import DEFAULT_TEMPLATES_DIR
 
 router = APIRouter(tags=["evaluations"])
 
@@ -212,6 +215,68 @@ async def _infer_report_run_id(
     return str(run_id) if run_id else None
 
 
+@dataclass(frozen=True)
+class _RunCriteria:
+    """归属 run 的「判据来源 + 需求文本」（一次读库、两处用，v1.5 D-2 修复）。
+
+    Attributes:
+        template_id: 模板 id（``""`` = 无模板）。
+        template_hash: 该模板的 YAML 指纹（现算；``""`` = 无模板）。
+        requirement: run 当时的原始需求（``""`` = run 没记）。
+    """
+
+    template_id: str = ""
+    template_hash: str = ""
+    requirement: str = ""
+
+
+async def _resolve_template_ref(
+    session, run_id: str | None, *, tenant_id: str
+) -> _RunCriteria:
+    """按归属 run 反查它当时的模板与需求（v1.5 T01.4；v1.5 修复轮 D-2 扩了需求）。
+
+    ★ 为什么必须做（docs/17 §1.1.3 第 1 档）：``evaluate_project`` 没有 ``Run`` 对象
+    ⇒ 拿不到 ``run.context["template"]["id"]`` ⇒ 补评测只能用套件 ``checks``，而 gate
+    用的是模板 ``checks`` —— 那就是 v1.4 §0.3 那条闸门旁路（弱口径覆盖强口径）。
+    UI 的评测请求**不带 ``run_id``**（``web/src/views/EvalReport.vue``），所以这里
+    复用 :func:`_infer_report_run_id` 反查出的归属 run，再读它的模板。
+
+    ``template_hash`` 在**这一层现算**（``api`` rank 0 可合法 import ``templates``）：
+    ``artifacts.template_yaml_hash`` 收目录入参正是为了这种跨层调用（单一实现）。
+
+    ★★ **D-2（v1.5 修复轮）**：同一个归因 run 的 ``requirement`` 也在这里取。
+    gate 的 ``requirement`` 取的是 ``run.context["requirement"]``；补评测若允许调用方
+    自带 ``requirement``，**同一棵树会被评出两个分数**（真跑实测 92.65 vs 62.65，
+    差值恰好是该维权重）。判据同尺的前提是**输入同尺**。
+
+    Args:
+        session: 数据库会话。
+        run_id: 归属 run（``None`` ⇒ 无模板、无需求）。
+        tenant_id: 租户（**必须透传**，否则非默认租户下永远读不到 run）。
+
+    Returns:
+        :class:`_RunCriteria`；无 run / 读不到 / 模板已删除 ⇒ 对应字段为空
+        （装配点据此落 ``criteria_source="suite"`` 显式弱口径，**不静默**）。
+    """
+    if not run_id:
+        return _RunCriteria()
+    try:
+        run = await RunRepository(session).get(run_id, tenant_id=tenant_id)
+    except Exception:  # noqa: BLE001 - 反查失败只影响判据来源，不该让评测 500
+        return _RunCriteria()
+    context = run.context if run is not None and isinstance(run.context, dict) else {}
+    requirement = str(context.get("requirement") or "").strip()
+    ref = context.get("template")
+    template_id = str(ref.get("id") or "").strip() if isinstance(ref, dict) else ""
+    if not template_id:
+        return _RunCriteria(requirement=requirement)
+    return _RunCriteria(
+        template_id=template_id,
+        template_hash=template_yaml_hash(DEFAULT_TEMPLATES_DIR, template_id),
+        requirement=requirement,
+    )
+
+
 @router.post(
     "/projects/{project_id}/evaluations",
     response_model=ApiResponse[EvaluationReport],
@@ -241,15 +306,35 @@ async def run_evaluation(
     effective_run_id = payload.run_id or await _infer_report_run_id(
         harness.store, target, payload.version, tenant_id=tenant_id
     )
+    # ★ v1.5（T01.4）：判据来源同样按归属 run 反查并**透传**给装配点。
+    #   UI 口径（无 ``run_id``）因此也能拿到 ``criteria_source="template"``；
+    #   拿不到时装配点落 ``"suite"`` 显式弱口径（A12 要求不返回 null）。
+    run_criteria = await _resolve_template_ref(
+        session, effective_run_id, tenant_id=tenant_id
+    )
+    # ★★ v1.5 修复轮 D-2：**有归属 run 就用它的 requirement**，忽略调用方自带的
+    #   那份 —— 否则"同一棵树、两次补评测传不同 requirement"会得到两个分数
+    #   （真跑实测 92.65 vs 62.65）。``payload.requirement`` 只在**无归属 run**
+    #   （手工导入 / 脚本写入的产物）时才生效，并在报告里标 ``requirement_source``。
+    requirement = payload.requirement
+    requirement_source = "caller" if str(requirement or "").strip() else "none"
+    if effective_run_id and run_criteria.requirement:
+        requirement = run_criteria.requirement
+        requirement_source = "run"
 
     report = await harness.evaluate_project(
         project_id,
         suite_id=payload.suite_id,
         artifact_name=payload.artifact_name,
         version=payload.version,
-        requirement=payload.requirement,
+        requirement=requirement,
+        # ★ D-2：需求来源随任务进报告（报告自证"我用的是谁的需求"）
+        requirement_source=requirement_source,
         # ★ 返修 4（Q-R4-02）：报告要自证归属（版本 + run），否则版本绑定读不到。
         run_id=effective_run_id,
+        # ★ v1.5（T01.1 / T01.4）：判据来源 —— 与 gate 的装配点同源（A8「同尺」）。
+        template_id=run_criteria.template_id or None,
+        template_hash=run_criteria.template_hash or None,
     )
 
     if payload.save:

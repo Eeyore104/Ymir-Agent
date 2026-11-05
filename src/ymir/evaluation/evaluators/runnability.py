@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import json
 
+from ymir.evaluation.deps import describe_ignored, missing_deps_for
 from ymir.evaluation.evaluators.base import (
     RUNNABILITY,
     EvalContext,
@@ -49,9 +50,25 @@ class RunnabilityEvaluator(Evaluator):
 
         # v1.3（T1.2）：改用共享执行器 —— 证据字符串格式与 v1.2 **逐字符一致**，
         # 同时拿到结构化 ``CheckRun``（供 harness 判定 regression / blocking / skipped）。
+        #
+        # ★ v1.5（T03.6）：把「交付树声明的依赖 ∩ 镜像预装清单」的差集传进去 ——
+        # 这是"环境缺失"与"代码坏了"可区分的唯一依据（PRD T1-R2：运行前、与代码
+        # 无关、可重复）。探针侧（``baseline_probe``）用同一个 ``deps`` 模块算，
+        # 保证两侧同口径。``image_packages`` 为空（表未知）⇒ ``deps`` 不判定（不误伤）。
+        image_packages = dict(getattr(ctx.task, "image_packages", None) or {})
+        missing_deps, ignored_deps = missing_deps_for(ctx.workdir, image_packages)
         runs = await run_checks(
-            ctx.sandbox, checks, exec_timeout=ctx.exec_timeout, evidence=evidence
+            ctx.sandbox,
+            checks,
+            exec_timeout=ctx.exec_timeout,
+            evidence=evidence,
+            missing_deps=missing_deps,
+            image_packages=image_packages,
         )
+        ignored_note = describe_ignored(ignored_deps)
+        if ignored_note:
+            # 披露"有多少行依赖声明没参与判定"（URL / -e / -r），不静默
+            evidence.append(Evidence("metric", "deps_declaration", ignored_note))
 
         # v1.3（Q3）：模板声明 ``scoring.runnability_points`` ⇒ 分组配分；
         # 未声明 ⇒ 走下面的老口径（v1.2 算式一字不改）。

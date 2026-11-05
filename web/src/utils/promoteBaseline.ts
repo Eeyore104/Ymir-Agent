@@ -82,7 +82,13 @@ export interface PromoteOutcome {
   reused: boolean
   /** 本次落成 / 命中的基线版本号。 */
   version: number
-  /** 降级留痕（v1.4 T2.1）：``baseline_promoted_unhealthy:1`` 或缺省。 */
+  /**
+   * 降级留痕（v1.4 T2.1 单码 → **v1.5 逗号分隔多码**）。
+   *
+   * 取值集合封闭：``baseline_promoted_unhealthy:1`` /
+   * ``baseline_promoted_unknown:1`` / ``baseline_promoted_unverified:1`` /
+   * ``criteria_diverged:1``（可并列，顺序固定：先业务码、后 ``criteria_diverged:1``）。
+   */
   warning?: string
 }
 
@@ -119,6 +125,47 @@ export const PROMOTED_UNHEALTHY_CODE = 'baseline_promoted_unhealthy:1'
  * 混成一个字面量会让用户无法判断该修代码还是该补评测。
  */
 export const PROMOTED_UNKNOWN_CODE = 'baseline_promoted_unknown:1'
+
+/**
+ * 「部分检查未执行（环境缺失）却被提升」的留痕短码（后端
+ * ``artifacts.provenance.BASELINE_PROMOTED_UNVERIFIED_CODE``，v1.5 T02.4 / Q2）。
+ *
+ * ★ 语义是**第三种处境**：不阻断提升（否则无依赖镜像每次提升都要 force，闸门退化），
+ * 但"没验证过"绝不能长得像"验过了"。文案只允许「未验证」，**禁止**出现
+ * "已通过 / 验证通过"这类断言（与后端 markdown 的 R8 唯一文案同源）。
+ */
+export const PROMOTED_UNVERIFIED_CODE = 'baseline_promoted_unverified:1'
+
+/**
+ * 「两份报告的结论不一致」的披露码（后端 ``artifacts.routers.CRITERIA_DIVERGED_CODE``，
+ * v1.5 T02.3 / PRD T2-R3）。
+ *
+ * ★ 它**只披露、不改采纳结果**：冲突时后端永远取优先级更高的 ``eval_verdict``。
+ * 前端要做的只是告诉用户"还存在另一份不同口径的结论"。
+ */
+export const CRITERIA_DIVERGED_CODE = 'criteria_diverged:1'
+
+/**
+ * ``warning`` 里的**码分隔符**（后端从 v1.5 起用 ``,`` 拼装多码）。
+ *
+ * ★ 严格相等比对是 v1.4 的实现 —— 多码时它会静默退回默认文案（不报错、不解释）。
+ */
+export const WARNING_CODE_SEPARATOR = ','
+
+/**
+ * 把 ``warning`` 拆成码列表（去空白 / 去空项 / **保持顺序**）。
+ *
+ * @param warning 服务端回执里的 ``warning``（可空）
+ */
+export function splitWarningCodes(warning?: string): string[] {
+  if (!warning) {
+    return []
+  }
+  return warning
+    .split(WARNING_CODE_SEPARATOR)
+    .map((code) => code.trim())
+    .filter((code) => code.length > 0)
+}
 
 /**
  * 闸门拒绝原因（后端错误信封 ``details.reason``，v1.4 返修 P1-3）。
@@ -168,25 +215,53 @@ export const HEALTH_UNKNOWN_CONFIRM_TITLE = '没有健康结论'
 export const FORCE_PROMOTE_LABEL = '仍要提升（force）'
 
 /**
- * 强制提升成功后的提示文案（``warning`` 命中留痕短码时）。
+ * 强制提升成功后的提示文案（``warning`` 命中留痕码时）。
+ *
+ * v1.5（T05.2）：``warning`` 从"单个短码"升级为**逗号分隔的码集合**（后端把
+ * "业务留痕"与"判据分歧"并列披露，如
+ * ``baseline_promoted_unhealthy:1,criteria_diverged:1``）。
+ * 因此这里**先按 ``,`` 拆分、再逐码匹配**；多码时把各自的提示用 ``；`` 连起来
+ * （只披露命中的码，未知码忽略 —— 与 v1.4 的宽松口径一致）。
+ *
+ * ★ 严格相等比对（v1.4 实现）在多码时会**静默退回默认文案**：用户看到"提升成功"
+ * 却不知道"起点不健康"或"两份报告打架"。这是本版必须修掉的 P1。
  *
  * @param result 服务端回执（只看 ``warning`` / ``version`` / ``reused``）
  */
 export function promoteWarningText(result: PromoteOutcome): string {
-  const warning = result.warning
-  if (warning !== PROMOTED_UNHEALTHY_CODE && warning !== PROMOTED_UNKNOWN_CODE) {
+  const codes = splitWarningCodes(result.warning)
+  if (codes.length === 0) {
     return ''
   }
   const suffix = promoteSuffix(result)
-  const head =
-    warning === PROMOTED_UNHEALTHY_CODE
-      ? '已强制提升不健康的合并树为新基线'
-      : '已强制提升「没有健康结论」的合并树为新基线'
-  const tail =
-    warning === PROMOTED_UNHEALTHY_CODE
-      ? '后续回归比较的起点不健康'
-      : '该树未经过评测，后续回归比较没有可信起点'
-  return `${head}${suffix}：${tail}`
+  // 「业务留痕」最多一条（后端一次只给一个），「披露」可以并列（diverged）
+  let business = ''
+  const disclosures: string[] = []
+  for (const code of codes) {
+    if (!business && code === PROMOTED_UNHEALTHY_CODE) {
+      business = `已强制提升不健康的合并树为新基线${suffix}：后续回归比较的起点不健康`
+    } else if (!business && code === PROMOTED_UNKNOWN_CODE) {
+      business =
+        `已强制提升「没有健康结论」的合并树为新基线${suffix}：` +
+        '该树未经过评测，后续回归比较没有可信起点'
+    } else if (!business && code === PROMOTED_UNVERIFIED_CODE) {
+      // ★ 只说"未验证"，不说"通过"：这是第三种处境，不是"检查都过了"
+      business =
+        `已提升为新基线${suffix}：部分检查因环境缺失未执行（未验证 ≠ 通过），` +
+        '后续回归比较的依据不完整'
+    } else if (code === CRITERIA_DIVERGED_CODE) {
+      disclosures.push('另：本次存在两份口径不一致的评测报告（已采纳流水线内的 eval_verdict）')
+    }
+    // 未知码：忽略（不猜、不显示原始码，与 v1.4 的宽松口径一致）
+  }
+  if (business) {
+    return [business, ...disclosures].join('；')
+  }
+  if (disclosures.length === 0) {
+    return ''
+  }
+  // 只有披露（这次提升本身没有降级）：仍要把"提升到哪一版"说清
+  return [`已提升为新基线${suffix}`, ...disclosures].join('；')
 }
 
 /** 版本号后缀（幂等命中 / 已知版本 / 未知三种口径）。 */

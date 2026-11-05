@@ -44,6 +44,7 @@ from ymir.artifacts.provenance import strip_bookkeeping, template_yaml_hash
 from ymir.artifacts.store import ArtifactStore
 from ymir.artifacts.versioning import compute_content_hash
 from ymir.common.errors import InvalidParamError, NotFoundError, SandboxError, YmirError
+from ymir.evaluation.deps import check_requires_deps, missing_deps_for  # 冒烟↔评测同尺
 from ymir.events.bus import EventPublisher
 from ymir.events.log import EventType
 from ymir.models.entities import Message, PipelineRun
@@ -63,7 +64,7 @@ from ymir.sandbox.session import SandboxService
 from ymir.sop.models import ENTRY_INPUT, StageSpec
 from ymir.storage.repositories import ProjectRepository
 from ymir.templates import DEFAULT_TEMPLATES_DIR, load_template
-from ymir.templates.models import TemplateSpec
+from ymir.templates.models import TemplateSpec, image_package_map
 from ymir.tools.read_artifact import read_artifacts
 
 logger = logging.getLogger(__name__)
@@ -1030,12 +1031,23 @@ class RoleStageExecutor:
                     }
                 )
             # ---- v1.3.1：模板命令（去重后追加；条目多一个 source 字段）----
+            # ★ v1.5（T03.9）：先算一次「交付树声明 ∩ 镜像包表」的差集，与评测侧同口径
+            smoke_packages = {
+                language: sorted(packages)
+                for language, packages in image_package_map().items()
+            }
+            missing_deps, _ignored = missing_deps_for(tree, smoke_packages)
             for check in template_checks:
                 command = str(check.run or "").strip()
                 if command in commands:
                     continue  # 模型已经自报过同一条：不重复执行（省时且避免噪音）
                 report["commands"].append(
-                    await self._run_smoke_template_check(session, check)
+                    await self._run_smoke_template_check(
+                        session,
+                        check,
+                        missing_deps=missing_deps,
+                        image_packages=smoke_packages,
+                    )
                 )
             executed = [item for item in report["commands"] if not item.get("skipped")]
             if executed:
@@ -1055,17 +1067,41 @@ class RoleStageExecutor:
         return report
 
     async def _run_smoke_template_check(
-        self, session: Any, check: Any
+        self,
+        session: Any,
+        check: Any,
+        *,
+        missing_deps: Any = None,
+        image_packages: Any = None,
     ) -> dict[str, Any]:
         """执行一条模板命令，返回冒烟报告条目（**唯一**带 ``source`` 的形态）。
 
-        ``requires`` 非空 ⇒ 先 ``command -v <bin>`` 探测：非 0 即记 ``skipped``，
-        **不执行主命令**（否则要白等满 ``timeout_s``，构建类检查是 300s）。
+        判定顺序与 :func:`ymir.evaluation.evaluators.base.run_checks` **刻意一致**
+        （v1.5 T03.9）：
+
+        1. ``requires_deps`` 声明的包在镜像里没有 ⇒ ``skipped``（``requires_missing_deps:``）；
+        2. ``requires`` 非空 ⇒ 先 ``command -v <bin>`` 探测，非 0 即 ``skipped``，
+           **不执行主命令**（否则要白等满 ``timeout_s``，构建类检查是 300s）。
+
+        ★ 为什么冒烟侧也必须做第 1 步：否则同一棵缺包的树会出现"冒烟说 failed、
+        评测说 skipped"的自相矛盾 —— 而用户看到的第一份证据恰恰是冒烟报告。
         """
         command = str(check.run or "").strip()
         timeout = (
             float(check.timeout_s) if check.timeout_s else float(self._exec_timeout)
         )
+        deps_reason = check_requires_deps(
+            getattr(check, "requires_deps", None),
+            missing_deps=missing_deps,
+            image_packages=image_packages,
+        )
+        if deps_reason:
+            return {
+                "command": command,
+                "source": "template",
+                "skipped": True,
+                "reason": deps_reason,
+            }
         requires = str(check.requires or "").strip()
         if requires:
             available = False

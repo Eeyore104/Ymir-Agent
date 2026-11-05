@@ -122,13 +122,25 @@ skeleton:
 #                      回退 /opt/fe-baseline/node_modules → npm run build）
 # frontend_static 没有 check：由前端结构规则打分（见 evaluation/runnability.py）
 #
-# ★ `blocking: true` 落在构建检查上（Q4）：构建失败 ⇒ `TaskOut.passed=False`
-#   ⇒ verdict 直接 fail，但**分数照算照披露**（报告会写「未通过：阻断项失败」）。
-# ★ `requires: node`：镜像里没有 node 工具链时该检查 `skipped`（**不扣分、不阻断**），
-#   报告标注「前端构建未执行（环境缺失）」—— 绝不因环境缺失把好代码判 fail。
+# ★★ v1.5（T1，docs/17 §1.2.1/§1.2.2）：把「不可用」的三档做成**一等字段** `tier`：
+#   - D1 `loadable`（不可加载）/ D2 `behavior`（行为不符）⇒ **强制阻断**；
+#   - D3 `style`（规范不符）⇒ **不阻断**，只扣分；
+#   - 环境缺失（`requires_deps` / `requires` / `requires_build_output` 不满足）
+#     ⇒ `skipped`，**不扣分、不阻断**，报告记「未验证」（未验证 ≠ 通过）。
+# ★ 改动面**只**是 tier / blocking / requires* / timeout_s：
+#   `weight`、`group`、`scoring.runnability_points`（backend 10 / frontend_static 10 /
+#   frontend_build 10）与四维权重、双门槛**一字未改**。
 checks:
-  - { type: command, run: "python -m compileall -q app", weight: 1, group: backend }
-  - { type: command, run: "python -m pytest -q", weight: 2, group: backend }
+  # ---- D1 不可加载（阻断）----
+  # compileall 只做语法编译、**不 import** ⇒ 不依赖第三方包（无 requires_deps）
+  - { type: command, run: "python -m compileall -q app", weight: 1, group: backend,
+      tier: loadable, blocking: true, timeout_s: 120 }
+  # ---- D2 行为不符（阻断）----
+  # requires_deps: python:* ⇒ 交付树声明的包镜像里没有 ⇒ 跳过（环境缺失，不扣分）；
+  # no_tests_exit_code: 5 ⇒ pytest「未收集到用例」记 skipped(no_tests_collected)，不是失败
+  - { type: command, run: "python -m pytest -q", weight: 2, group: backend,
+      tier: behavior, blocking: true, requires_deps: ["python:*"],
+      no_tests_exit_code: 5, timeout_s: 180 }
   # ★ v1.4（T5.2）：`--ignore B008` 改成**限定作用域**的 `--per-file-ignores`。
   #   这一条负责"基线无关"的那一半修复（另一半是骨架 ruff.toml 里的
   #   `[lint.per-file-ignores]`）：骨架优先级 1 规定"基线已有该路径 ⇒ 骨架完全不参与"
@@ -139,14 +151,22 @@ checks:
   #   ⚠ 已记录的取舍：ruff 的 CLI `--per-file-ignores` 会**覆盖**配置文件里的
   #   per-file-ignores；基线自带的 per-file-ignores 因此在检查时失效（方向是
   #   "多报错"= fail-closed，不会放过真问题）。
-  - { type: command, run: 'ruff check --per-file-ignores "app/**:B008" .', weight: 1, group: backend }
-  - { type: command, run: 'python -c "from app.main import app"', weight: 1, group: backend }
+  # ---- D3 规范不符（**不阻断**）----
+  - { type: command, run: 'ruff check --per-file-ignores "app/**:B008" .', weight: 1,
+      group: backend, tier: style, timeout_s: 120 }
+  # ---- D1 不可加载（阻断）：入口导入（真正验证"能加载"，compileall 验不出 import 失败）----
+  - { type: command, run: 'python -c "from app.main import app"', weight: 1, group: backend,
+      tier: loadable, blocking: true, requires_deps: ["python:*"], timeout_s: 120 }
   - type: command
     run: "fe-build web"
     weight: 2
     group: frontend_build
+    tier: loadable
     blocking: true
     requires: node
+    # ★ v1.5：node 生态的依赖声明（`web/package.json` 里模型新增的包）镜像里没有
+    #   ⇒ 该检查 skipped（环境缺失），而不是把「装不上依赖」记成「构建坏了」。
+    requires_deps: ["node:*"]
     # ★ v1.3.1（T1.2，docs/13 §7.2.6）`requires_files`：探针（基线独立执行）的
     #   **前置文件**判定 —— 基线里连 `web/` 目录都没有（v1.2 时代的补丁产物就是
     #   这种形态）⇒ 该检查在**探针侧** `skipped`，报告写

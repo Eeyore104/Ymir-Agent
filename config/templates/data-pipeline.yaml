@@ -90,12 +90,21 @@ skeleton:
         pytest>=8.2
 
 checks:
-  - { type: command, run: "python -m compileall -q pipeline", weight: 1 }
-  - { type: command, run: "python -m pytest -q", weight: 2 }
-  - { type: command, run: "ruff check .", weight: 1 }
-  - { type: command, run: 'python -c "import pipeline"', weight: 1 }
-  # pandas 检查：镜像已预装 pandas / numpy（v1.3 T2.2），断网可跑、真能通过
-  - { type: command, run: 'python -c "import pandas"', weight: 1 }
+  # ★★ v1.5（T1，docs/17 §1.2.2）：与 fastapi-vue3/python-cli 的后端三条同构。
+  #   `group: backend` 只是标签（本模板未声明 `scoring` ⇒ 走按权重归一的老口径）。
+  - { type: command, run: "python -m compileall -q pipeline", weight: 1, group: backend,
+      tier: loadable, blocking: true, timeout_s: 120 }
+  - { type: command, run: "python -m pytest -q", weight: 2, group: backend,
+      tier: behavior, blocking: true, requires_deps: ["python:*"],
+      no_tests_exit_code: 5, timeout_s: 180 }
+  - { type: command, run: "ruff check .", weight: 1, group: backend,
+      tier: style, timeout_s: 120 }
+  - { type: command, run: 'python -c "import pipeline"', weight: 1, group: backend,
+      tier: loadable, blocking: true, requires_deps: ["python:*"], timeout_s: 120 }
+  # pandas 检查：**环境探针**（镜头外单列）——镜像已预装 pandas / numpy（v1.3 T2.2），
+  # 断网可跑；缺包 ⇒ `skipped(requires_missing_deps:pandas)`，**永不阻断**（D3 口径）。
+  - { type: command, run: 'python -c "import pandas"', weight: 1, group: backend,
+      tier: style, requires_deps: ["pandas"], timeout_s: 120 }
 
 prompting:
   pm: >-

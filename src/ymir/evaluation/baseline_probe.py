@@ -42,6 +42,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from ymir.artifacts.merge import DEFAULT_MAX_FILE_BYTES, merge_trees
+from ymir.evaluation.deps import missing_deps_for
 from ymir.evaluation.evaluators.base import EvalCheck, run_checks
 
 #: 基线三态（唯一口径，docs/11 §7.5-1）。
@@ -318,6 +319,8 @@ async def probe_baseline(
     cache_key: str = "",
     # ---- v1.3.1 新增（唯一新增入参，带默认值，既有调用点零改动）----
     skeleton: Mapping[str, str] | None = None,
+    # ---- v1.5（T03.6）新增：与合并树侧**同一份**镜像包表（纯数据）----
+    image_packages: Mapping[str, Sequence[str]] | None = None,
 ) -> BaselineProbe:
     """在**独立沙箱会话**内对基线自身跑模板 ``checks``（T1.2 / v1.3.1 T1.1）。
 
@@ -342,6 +345,10 @@ async def probe_baseline(
         skeleton: 模板骨架（纯数据，由 ``harness._probe`` 从
             ``EvalTask.baseline_skeleton`` 传入）。缺省 ``None`` ⇒ 探针树 = 基线
             原样 ⇒ 与 v1.3 逐字节/逐分一致，且 ``probe_mode`` 不进报告。
+        image_packages: 沙箱镜像预装清单（按生态，纯数据，由 ``harness._probe`` 从
+            ``EvalTask.image_packages`` 传入）。v1.5（T03.6）：探针树里的依赖声明
+            与它的差集 ⇒ 该检查 ``skipped(requires_missing_deps:<pkg>)``，与合并树侧
+            同口径；缺省 ``None`` ⇒ 不做依赖判定（老调用方零改动）。
     """
     started = time.perf_counter()
     if cache is not None and cache_key:
@@ -398,7 +405,15 @@ async def probe_baseline(
             # ★ 写进沙箱的是**探针树**（骨架补缺后的基线），不是基线原样
             for path, content in tree.items():
                 await session.write_file(path, content)
-            runs = await run_checks(session, runnable, exec_timeout=exec_timeout)
+            # ★ v1.5（T03.6）：与合并树侧**同一份**依赖差集（探针树里的声明 ∩ 镜像表）
+            missing_deps, _ignored = missing_deps_for(tree, image_packages)
+            runs = await run_checks(
+                session,
+                runnable,
+                exec_timeout=exec_timeout,
+                missing_deps=missing_deps,
+                image_packages=image_packages,
+            )
     except Exception as exc:  # noqa: BLE001 - 会话异常一律降级，绝不阻断评测
         return _degraded(
             SKIP_SANDBOX_ERROR,

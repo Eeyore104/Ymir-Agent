@@ -1,8 +1,8 @@
-"""模板加载与加载期校验（v1.3.1：**23 条**；v1.2 为 17 条，v1.3 为 21 条）。
+"""模板加载与加载期校验（v1.5：**26 条**；v1.3.1 为 23 条，v1.3 为 21 条）。
 
 目录约定：``config/templates/<id>.yaml``，``id`` 必须等于文件名主干。
 
-**23 条加载期校验**（违反任一条 → :class:`TemplateDefinitionError`，业务码 1001）：
+**26 条加载期校验**（违反任一条 → :class:`TemplateDefinitionError`，业务码 1001）：
 
 ===========  ================================================================
 #            校验
@@ -33,6 +33,13 @@
              （骨架补缺会让它恒真 ⇒ 配了等于没配，属配置错误）
 23           ``protected.symbol_deletions ∈ {off, reject, ignore}``
              （与校验 19 同风格：显式复核，防默认值被静默放宽）
+24           ``checks[].tier ∈ {loadable, behavior, style, ""}``；``loadable``/``behavior``
+             **必须** ``blocking: true``、``style`` **必须** ``blocking: false``；
+             且 ``blocking: true`` 必须显式声明 ``timeout_s >= 60``
+25           ``checks[].requires_deps``：token 只允许 ``python:*`` / ``node:*`` / 具体包名；
+             ``*`` 类 token 的语言镜像表必须非空；具体包名必须 ∈ 该模板语言的镜像表
+26           ``checks[].requires_build_output``：以 ``/`` 结尾的相对目录前缀，且
+             **不得与 ``layout.required_dirs`` / ``skeleton`` 重叠**（构建产物不能是源码）
 ===========  ================================================================
 
 设计取舍（与 ``sop/loader.py`` 同构）：
@@ -43,7 +50,9 @@
   ``TemplateEntry.loading_error``，只有 :func:`load_template` 才抛异常。
 
 v1.3 追加校验 18–21（T1.1 / Q3），17 条原有语义**全部不变**；
-v1.3.1 追加校验 22（docs/13 §7.2.7）与 23（``symbol_deletions``），前 21 条语义**全部不变**。
+v1.3.1 追加校验 22（docs/13 §7.2.7）与 23（``symbol_deletions``），前 21 条语义**全部不变**；
+v1.5 追加校验 24–26（``tier`` / ``requires_deps`` / ``requires_build_output``，
+docs/17 §1.2），前 23 条语义**全部不变**（``tier`` 留空 ⇒ 校验 24 不约束 ⇒ 老模板零改动）。
 """
 
 from __future__ import annotations
@@ -61,8 +70,13 @@ from ymir.common.secrets import scan_secret
 from ymir.config import PROJECT_ROOT
 from ymir.templates.models import (
     ALLOWED_LANGUAGES,
+    ALLOWED_TIERS,
+    BLOCKING_MIN_TIMEOUT_S,
+    BLOCKING_TIERS,
+    REQUIRES_DEPS_WILDCARDS,
     SANDBOX_IMAGE_NODE_PACKAGES,
     SANDBOX_IMAGE_PACKAGES,
+    TIER_STYLE,
     CheckSpec,
     ConventionFile,
     LayoutSpec,
@@ -71,6 +85,7 @@ from ymir.templates.models import (
     SkeletonSpec,
     TemplateEntry,
     TemplateSpec,
+    image_package_map,
 )
 
 #: 模板目录（平台配置，不是用户数据：docs/09 §4.4.1「模板库不要表」）。
@@ -547,12 +562,29 @@ def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> Te
             f"（合法值：{sorted(_SYMBOL_POLICIES)}）",
         )
 
+    # ---- v1.5（docs/17 §1.2.1 / §1.2.3 / §1.2.5）校验 24 / 25 / 26 ----
+    # 24 · ``tier`` 与 ``blocking`` 必须自洽（``tier`` 是规格、``blocking`` 是后果）
+    _validate_tiers(template_id, spec.checks)
+    # 25 · ``requires_deps`` 语法 + 具体包名 ∈ 镜像表 + token 语言表非空
+    _validate_requires_deps(template_id, spec.checks, spec.stack.language)
+    # 26 · ``requires_build_output`` 不得与「源码目录 / 骨架」重叠
+    requires_build_output = _validate_build_output(
+        template_id,
+        spec.checks,
+        required_dirs=normalized_layout.required_dirs,
+        skeleton_paths=skeleton_paths,
+    )
+
     return spec.model_copy(
         update={
             "layout": normalized_layout,
             "conventions": normalized_conventions,
             "skeleton": normalized_skeleton,
             "checks": [
+                # ⚠ **逐字段转发**：``CheckSpec(...)`` 是**重新构造**而不是 ``model_copy``，
+                # 漏一个字段的后果是「YAML 写了 tier、加载后静默变成 ""」——没有任何
+                # 报错，且下游（``resolve_checks`` → ``EvalTask`` → ``run_checks``）
+                # 全部按空档位处理（v1.5 T03.2 点名的"最阴的坑"）。
                 CheckSpec(
                     type=check.type,
                     run=check.run,
@@ -562,12 +594,213 @@ def _validate(spec: TemplateSpec, stem: str, known_roles: set[str] | None) -> Te
                     requires=check.requires,
                     timeout_s=check.timeout_s,
                     requires_files=list(paths),
+                    tier=check.tier,
+                    requires_deps=list(deps),
+                    requires_build_output=build_output,
+                    no_tests_exit_code=check.no_tests_exit_code,
                 )
-                for check, paths in zip(spec.checks, requires_files, strict=True)
+                for check, paths, deps, build_output in zip(
+                    spec.checks,
+                    requires_files,
+                    _normalized_requires_deps(spec.checks),
+                    requires_build_output,
+                    strict=True,
+                )
             ],
             "protected": normalized_protected,
         }
     )
+
+
+def _validate_tiers(template_id: str, checks: Sequence[CheckSpec]) -> None:
+    """校验 24：``tier`` ↔ ``blocking`` 一致性 + ``blocking`` 必带 ``timeout_s``（v1.5）。
+
+    三条规则（docs/17 §1.2.1）：
+
+    1. ``tier ∈ {loadable, behavior}`` ⇒ **必须** ``blocking: true``；
+    2. ``tier == "style"`` ⇒ **必须** ``blocking: false``；
+    3. ``blocking: true`` ⇒ **必须**显式声明 ``timeout_s >= 60``（PRD T1-R4
+       "不得沿用默认值"由加载期硬保证，而不是靠评审记得）。
+
+    ``tier == ""``（未声明）⇒ **不约束**：老模板/老套件行为零变化（A19）。
+    """
+    for check in checks:
+        tier = str(check.tier or "").strip()
+        if tier and tier not in ALLOWED_TIERS:
+            raise _error(
+                template_id,
+                24,
+                f"checks[].tier 取值非法: {tier!r}（合法值：{sorted(ALLOWED_TIERS)} 或留空）",
+            )
+        if tier in BLOCKING_TIERS and not check.blocking:
+            raise _error(
+                template_id,
+                24,
+                f"checks[].tier={tier} 必须 blocking: true（不可加载/行为不符是不可交付）: "
+                f"run={check.run!r}",
+            )
+        if tier == TIER_STYLE and check.blocking:
+            raise _error(
+                template_id,
+                24,
+                "checks[].tier=style 必须 blocking: false（规范不符只是扣分，不是不可交付）: "
+                f"run={check.run!r}",
+            )
+        if check.blocking:
+            timeout = check.timeout_s
+            if timeout is None:
+                raise _error(
+                    template_id,
+                    24,
+                    f"blocking 检查必须显式声明 timeout_s（>= {BLOCKING_MIN_TIMEOUT_S:g}s）: "
+                    f"run={check.run!r}",
+                )
+            if float(timeout) < BLOCKING_MIN_TIMEOUT_S:
+                raise _error(
+                    template_id,
+                    24,
+                    f"blocking 检查的 timeout_s 必须 >= {BLOCKING_MIN_TIMEOUT_S:g}s"
+                    f"（当前 {timeout}）: run={check.run!r}",
+                )
+
+
+def _validate_requires_deps(
+    template_id: str, checks: Sequence[CheckSpec], language: str
+) -> None:
+    """校验 25：``requires_deps`` 的 token 语法 + 具体包名必须在镜像表里（v1.5）。
+
+    规则（docs/17 §1.2.3）：
+
+    1. token 只允许 ``python:*`` / ``node:*`` / 具体包名；``*`` 类 token 对应语言的
+       镜像表必须**非空**（空表 ⇒ 全部声明都算缺失 ⇒ 永久 skip，必须在加载期拒）；
+    2. 具体包名必须 ∈ **该模板语言**的镜像表 —— 防 typo 变成"永久静默未验证"
+       （``pandas`` 满足；镜像将来收缩时它会先在这里红，而不是静默跳过）；
+    3. 同一条 check 内 token 不得重复。
+
+    已知限制（写进 ``docs/04``）：运行期仍对具体包名做比对（镜像被手工改动时
+    宁可 skip 也不误判 fail），因此本校验只保证"声明的东西镜像里确实有"。
+    """
+    table = image_packages_for(language)
+    # ★ ``requires_deps`` 的 ``*`` token 用的是**生态名**（``python`` / ``node``），
+    # 与 ``stack.language``（``python`` / ``typescript``）不是同一套名字：node 侧
+    # 模板的语言叫 typescript，而生态叫 node。两张表的**权威键**是生态名
+    # （``image_package_map()``），具体包名再按模板语言选表。
+    ecosystems = image_package_map()
+    for check in checks:
+        seen: set[str] = set()
+        for raw in check.requires_deps:
+            token = str(raw or "").strip()
+            if not token:
+                raise _error(
+                    template_id, 25, f"checks[].requires_deps 含空元素（run={check.run!r}）"
+                )
+            if token in seen:
+                raise _error(
+                    template_id, 25, f"checks[].requires_deps 重复: {token}（run={check.run!r}）"
+                )
+            seen.add(token)
+            language_key = REQUIRES_DEPS_WILDCARDS.get(token)
+            if language_key is not None:
+                if not ecosystems.get(language_key):
+                    raise _error(
+                        template_id,
+                        25,
+                        f"checks[].requires_deps 声明了 {token}，但该语言的镜像表为空"
+                        "（空表 ⇒ 全部检查永久 skip，必须先补镜像与包表）",
+                    )
+                continue
+            if "*" in token or ":" in token:
+                raise _error(
+                    template_id,
+                    25,
+                    f"checks[].requires_deps token 非法: {token!r}"
+                    f"（只允许 {sorted(REQUIRES_DEPS_WILDCARDS)} 或具体包名）",
+                )
+            if token not in table:
+                raise _error(
+                    template_id,
+                    25,
+                    f"checks[].requires_deps 的包不在镜像清单里: {token!r}"
+                    f"（语言 {language}；镜像表 {sorted(table)}）",
+                )
+
+
+def _normalized_requires_deps(checks: Sequence[CheckSpec]) -> list[list[str]]:
+    """``requires_deps`` 的归一化形态（去空白；校验 25 已保证元素非空且不重复）。
+
+    ★ 为什么单独一个函数：上面那个 ``zip(...)`` 需要**与 checks 等长**的清单，
+    在 ``model_copy`` 的列表推导里现算会让那行长得不可读（也就更容易漏字段）。
+    """
+    return [[str(item or "").strip() for item in check.requires_deps] for check in checks]
+
+
+def _validate_build_output(
+    template_id: str,
+    checks: Sequence[CheckSpec],
+    *,
+    required_dirs: Sequence[str],
+    skeleton_paths: Sequence[str],
+) -> list[str]:
+    """校验 26：``requires_build_output`` 的形态 + 不得与源码目录/骨架重叠（v1.5）。
+
+    - 非空 ⇒ 必须以 ``/`` 结尾、不得含反斜杠、过 ``normalize_scope_path``；
+    - 不得与 ``layout.required_dirs`` 或 ``skeleton`` 的路径**前缀重叠**：
+      这条防的正是"有人把 ``web/`` 写成构建产物，从而悄悄把 ``web/`` 的
+      requires_files 不对称抹平"——那会推翻 v1.3.1 的 Q1 定案
+      （基线缺 ``web/`` 应判 ``baseline_incomplete``，交付树缺 ``web/`` 应判 failed）。
+    - ★ **不**与 ``layout.forbidden_dirs`` 比较：``dist`` 在两个世界里都合规
+      （模型不得提交它 + 构建产物就是它），那不是矛盾。
+
+    Returns:
+        与 ``checks`` 等长的归一化清单（空串 = 未声明）。
+    """
+    source_paths = {str(item).strip() for item in required_dirs if str(item).strip()}
+    skeleton = {str(item).strip() for item in skeleton_paths if str(item).strip()}
+    normalized: list[str] = []
+    for check in checks:
+        raw = str(check.requires_build_output or "").strip()
+        if not raw:
+            normalized.append("")
+            continue
+        if "\\" in raw:
+            raise _error(
+                template_id, 26, f"checks[].requires_build_output 不得含反斜杠: {raw!r}"
+            )
+        if not raw.endswith("/"):
+            raise _error(
+                template_id,
+                26,
+                f"checks[].requires_build_output 必须以 / 结尾（目录前缀语义）: {raw!r}",
+            )
+        if raw.startswith("/"):
+            raise _error(
+                template_id, 26, f"checks[].requires_build_output 不得以 / 开头: {raw!r}"
+            )
+        try:
+            path = normalize_scope_path(raw)
+        except InvalidParamError as exc:
+            raise _error(
+                template_id,
+                26,
+                f"checks[].requires_build_output 路径非法（{raw!r}）: {exc}",
+            ) from exc
+        for candidate in sorted(source_paths | skeleton):
+            if _prefix_overlap(path, candidate):
+                raise _error(
+                    template_id,
+                    26,
+                    "checks[].requires_build_output 与源码目录/骨架重叠"
+                    f"（构建产物不能是源码路径）: {path} <-> {candidate}",
+                )
+        normalized.append(path)
+    return normalized
+
+
+def _prefix_overlap(left: str, right: str) -> bool:
+    """两个路径是否互为前缀（目录语义：``web/`` 与 ``web/src`` 重叠）。"""
+    a = left if left.endswith("/") else f"{left}/"
+    b = right if right.endswith("/") else f"{right}/"
+    return a.startswith(b) or b.startswith(a)
 
 
 def load_template_file(path: Path, *, known_roles: set[str] | None = None) -> TemplateSpec:
