@@ -256,6 +256,50 @@ v1.2 真跑暴露的核心问题：**模型在增量模式下会重写 `tests/co
 
 设计与任务分解见 **`docs/15-增量设计与任务列表-v1.4.md`**（§9 为 as-built：8 条偏差 + 3 条未覆盖），验收结论与已知限制见 **`docs/16-验收报告-v1.4.md`**（§5 记录七轮 QA 共 24 项缺陷的修复与复验）。
 
+### v1.5（验收完成 2026-11-05）：同一棵树，不管走哪条路径都给同一个判定
+
+本版**不加能力**，只把"判定"这一个动作在三条路径（run 内 gate / Web 补评测 / CLI 单跑）上对齐到同一把尺子，并让每条结论都能**自证**"我按什么判据、评的哪一版树"。
+
+| 能力 | 一句话 |
+|---|---|
+| **T1 三档判据（D1/D2 阻断、D3 只扣分）** | `tier` 做成一等字段（`loadable` / `behavior` / `style`），加载期校验 24 强制 `tier ↔ blocking` 自洽、阻断项必须显式 `timeout_s ≥ 60`；`fastapi-vue3` / `python-cli` / `data-pipeline` / `node-express` **四套统一口径** |
+| **环境缺失 ≠ 代码坏了** | `requires_deps`（交付树依赖声明 ∩ 镜像预装清单，**运行前、与代码无关、可重复**，不解析报错文本）⇒ 缺失即 `skipped(requires_missing_deps:<pkg>)`，**不扣分、不阻断**；CI 钉子强制"包表 == Dockerfile 镜像" |
+| **"没测" ≠ "测失败"** | `no_tests_exit_code: 5` ⇒ `skipped(no_tests_collected)` + `warning`；`requires_build_output` ⇒ 缺上游构建物级联 `skipped`（不把同一件事记两次失败） |
+| **`unverified` 第四态** | 某组**某档**声明了检查却一条都没执行 ⇒ 记 `unverified`（报告 `warnings` 追加 `runnability_unverified:<group>`）。**不阻断**提升，但留痕 `baseline_promoted_unverified:1`；对外文案只有「未验证 ≠ 通过」 |
+| **T2 补评测并入唯一装配点** | 补评测与 gate 共用 `build_task_for_project` / `build_task_for_run`（同一 `_assemble`）⇒ 同一产物的 `checks` 逐字段相同；**闸门旁路关闭**（补评测的 `blocking_failed` 不再恒空） |
+| **报告自证判据来源** | 报告根部 `criteria_source` / `template_id` / `criteria_version`（模板 YAML 指纹）由构建器从任务派生（**调用方传不进来**）；无模板 ⇒ 显式 `suite` + 空串；v1.5 之前的报告无此三键 ⇒ 视为弱口径，提升 409（重评一次即修复） |
+| **读取优先级显式化** | `eval_verdict` > `evaluation_report`（按产物名 tuple，**不再依赖创建时间**）；两份结论不一致 ⇒ `warning` 追加 `criteria_diverged:1`（只披露，采纳结果不变） |
+| **T4 CLI 落盘解锁** | `--evaluate` 把结论落成 **`eval_verdict` 新版本**（`run_id` / `artifact_version` / `verdict_source="harness"`）⇒ `from-merge` 不再只能 `force`；落盘失败只降级（不改终态与退出码）；未加 `--evaluate` 显式打印 `[verdict] absent（未裁决）`；`--repair` 默认关，链上无 `evaluation` 阶段时 **stderr** 警告且不改退出码 |
+
+**质量数据（实测）**：后端 **1361 passed / 0 failed / 0 errors**（单测全部 mock LLM、0 费用；含 QA 两轮独立对抗用例 69 例）· 前端 **80 passed / 14 files** · `ruff check .` / `scripts/check_import_graph.py` / `alembic check` 零漂移 / `npm run build`（1901 modules，`index` 492.83 kB / gzip 167.63 kB）全绿。三轮变异共 **18 处全部被杀**，189 个文件哈希快照 0 残留。
+
+| 项 | v1.4 | v1.5 |
+|---|---|---|
+| 后端测试 | 1102 | **1361**（+259） |
+| 前端测试 | 77 | **80**（+3） |
+| 数据库迁移 | — | **零新增**（`alembic check` 无漂移） |
+
+**真跑验收**：4 次真实 run + 2 次补评测，累计 **¥0.689 298**（34 次调用；含 1 次夹具写坏作废重跑；证据归档在 `data/v15/`，不入库）。关键证据：R-a 的树"加权总分 **92.65** 但后端 pytest 红" ⇒ verdict `fail` + `from-merge` **409**（补评测后仍 409）；R-b 的树"声明了镜像没有的 `python-multipart`" ⇒ 双 `skipped` + `unverified` + **201 + `baseline_promoted_unverified:1`**；R-d（`--role qa --evaluate`）落盘 `eval_verdict` 后 `from-merge` 返回 409 `baseline_unhealthy`（**不再是** `baseline_health_unknown`）。
+
+**实施中被 QA 对抗验证抓出、修复轮关掉的三条**（都是"同一棵树两个结论"的活口）：
+
+1. **补评测可被调用方的 `requirement` 改分** —— 同一棵树，gate 给 92.65、补评测给 62.65，差值恰好是需求符合度的 30 分。修法：有归属 run 时**忽略**请求体里的 `requirement`，报告新增 `requirement_source ∈ {run, caller, none}` 由构建器派生。
+2. **node-express 的阻断判据在真实树上是假的** —— 三条检查都挂 `requires_deps: ["node:*"]`，真实 Node 树必然声明镜像外 npm 包 ⇒ 三条全 `skipped`、`executed=[]`。修法：`npx tsc --noEmit` 改判 **D2 阻断**、只依赖 `typescript`（镜像恒有），真实树里它真的会跑。
+3. **回归未检查会静默提升** —— 没有 `eval_verdict` 时补评测的 `regression` 恒 `false`，只在 D3 回归的树 201 且**无 warning**。修法：披露 `baseline_promoted_regression_unknown:1`（只披露不根治，根治属 v1.6）。
+
+**⚠️ 升级前必读（两处不可回退的口径变化）**：
+
+1. **模板 YAML 已变 ⇒ `template_hash` 变化 ⇒ v1.4 遗留的待提升 patch 产物在本版后无法提升**（`from-merge` 以 1003「模板已变更（含注释）」拒绝）。处置：**用当前模板重新跑一轮**再提升。本版不为绕开它放松指纹校验（宁严不松）。
+2. **v1.4 风格的评测报告没有判据来源字段 ⇒ 视为弱口径**，提升按 409 `baseline_health_unknown` 处理。处置：**重新补评测一次**（一次点击）即可获得强口径报告。
+3. **镜像能力边界**：`fe-build web` 现在按 `node:*` 判环境缺失，而镜像只预装 `express / typescript / @types/*`。真实 Vue 前端（声明 `vue` / `vite`）会让该检查 `skipped` ⇒ `frontend_build` 组记**未验证**（不是失败，但也**不是"验过了"**）。要真正验证前端构建，需在镜像里补 `vue`/`vite`。
+4. **`tsc` 的一条经裁决口径例外**：真实 Node 树声明镜像装不了的包时，`npx tsc --noEmit` 仍会执行并报 `TS2307`（exit=2）⇒ 进 `blocking_failed` ⇒ 判**不可交付**。这与"环境缺失一律 `skipped`、不阻断"字面冲突，属有意取舍——否则 node-express 在真实树里一条判据都不剩。v1.6 评估 `tsc --noEmit --noResolve` 能否规避。
+
+**验收判定**：A1–A20 = **17 PASS + 1 PARTIAL + 2 条按约定降级**。PARTIAL 是 **A8**（补评测与 gate 的"同尺"只到夹具层：真跑期间补评测被传了占位 `requirement`，同一棵树 92.65 vs 62.65；根因已修，但**修复后的真跑未重做**）。降级两项：**A7**（级联跳过，要重建镜像才能真验）、**A15**（"默认不返修"只有源码级断言 + 运行台账，无行为用例）。
+
+**v1.5 的四条能力边界**：① `unverified` 采用**窄口径**（只对"某组某档一条都没执行"），"D1 跳过而 D2 跑过"不算未验证；② 补评测路径没有 `baseline_ref` ⇒ 报告里 `regression` 恒 `false`，**仅当同 run 存在 `eval_verdict` 时**读取侧取更严结论才安全；单独存在时仍会 201，但披露 `baseline_promoted_regression_unknown:1`（根治属 v1.6）；③ `tier` 只在**加载期**校验 —— 绕过 `templates.loader` 直接构造 `EvalCheck` 可跳过校验 24；④ 判据防的是**串味**不是**伪造**：本地产物可人工改写报告正文，要防伪造需签名。
+
+设计与任务分解见 **`docs/17-增量设计与任务列表-v1.5.md`**（§7 为 as-built：8 条偏差 + 4 条未取证 + 6 条新增风险），真跑台账见 `data/v15/INDEX.md`（gitignore 内），使用与文案见 `docs/04-使用手册.md` §14。
+
 ## 架构一览
 
 ```mermaid
@@ -467,6 +511,10 @@ ymir-agent/
 | `docs/12-验收报告-v1.3.md` | **v1.3 版本验收报告**（结论 / 14 条验收线 / 质量数据 / 镜像与断网构建 / 分数口径断点 / F1–F9 缺陷台账 / L1–L8 已知限制 / 遗留） |
 | `docs/13-增量设计与任务列表-v1.3.1.md` | **v1.3.1 设计与实施记录**（补丁版：探针与合并树同一把尺子 / 失败归因 / 符号删除保护 / 前端构建进冒烟 / 基线事实注入 / 另存为新基线 / 成本口径）；**§9 as-built 含契约映射表、八条红线、四条限定、真跑回写（§9.6）与遗留去向（§9.7）** |
 | `docs/14-验收报告-v1.3.1.md` | **v1.3.1 版本验收报告**（结论 / A1–A10 验收线 / 3 次真跑 ¥0.80 台账 / 六门 / 缺陷与修复 / 已知限制 / v1.4 遗留） |
+| `docs/15-增量设计与任务列表-v1.4.md` | **v1.4 设计与实施记录**（符号级回退 / 提升健康度闸门 / 报告版本与产物双绑定）；**§9 as-built（8 条偏差 + 3 条未覆盖）** |
+| `docs/16-验收报告-v1.4.md` | **v1.4 版本验收报告**（结论 / A1–A10 验收线 / 4 次真跑 ¥1.0169 台账 / 七轮 QA 共 24 项缺陷 / 已知限制 / v1.5 遗留） |
+| `docs/17-增量设计与任务列表-v1.5.md` | **v1.5 设计与实施记录**（判据口径统一：补评测唯一装配点 / 报告自证判据 / 读取优先级 / 三档 blocking / `unverified` 第四态 / CLI verdict 链路）；**§7 as-built（10 条偏差 + 经裁决口径例外 + 未取证项 + 新增风险）**；真跑台账见 `data/v15/INDEX.md` |
+| `docs/18-验收报告-v1.5.md` | **v1.5 版本验收报告**（结论与七条边界 / A1–A20 判定 / 4 次真跑 ¥0.6893 台账 / 18 处变异 / D-1~D-8 与 N-1~N-5 处置 / v1.6 候选） |
 
 ## License
 

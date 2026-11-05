@@ -1,0 +1,159 @@
+%% ymir-agent v1.5 类图（**只画相对 v1.4 的变化面**）
+%% 阅读顺序：① 判据来源三元组（TaskCriteria → EvalTask → TaskOut → EvaluationReport）
+%%           ② 环境探针（deps.py + CheckSpec/EvalCheck 新字段 + CheckRun.tier）
+%%           ③ 健康度第四态（MergedHealth.unverified + MergedHealthReading）
+%% 约定：`+` = v1.5 新增字段/方法；其余字段只作为上下文出现，不重复列举。
+
+classDiagram
+    direction LR
+
+    %% ---------------- ① 判据来源三元组 ----------------
+    class TaskCriteria {
+        <<dataclass, run_task.py>>
+        +template_id : str
+        +criteria_source : str
+        +criteria_version : str
+        +is_strong() bool
+    }
+
+    class EvalTask {
+        <<pydantic, evaluators/base.py>>
+        id : str
+        checks : list~EvalCheck~
+        scoring : ScoringRules?
+        +image_packages : tuple~str, ...~
+        +python_packages : tuple~str, ...~
+        +node_packages : tuple~str, ...~
+        +criteria_source : str
+        +criteria_version : str
+        +template_id : str
+    }
+
+    class TaskOut {
+        <<pydantic, report.py>>
+        status : str
+        blocking_failed : list~str~
+        skipped_checks : list~SkippedCheckOut~
+        +unverified_groups : list~str~
+        +criteria_source : str
+        +criteria_version : str
+        +template_id : str
+        _serialize() 空值 pop
+    }
+
+    class EvaluationReport {
+        <<pydantic, report.py>>
+        run_id : str?
+        artifact_version : int?
+        +criteria_source : str
+        +criteria_version : str
+        +template_id : str
+        +build(...) 从 tasks[0] 派生三元组
+        +to_markdown() 增「判据来源」「未验证」行
+    }
+
+    class RunTaskModule {
+        <<module, evaluation/run_task.py>>
+        +build_task_for_run(run, ...) EvalTask
+        +build_task_for_project(project_id, artifact_name, version, template_id, template_hash, manifest_files, run_id) TaskCriteria
+        +build_run_report(run, suite, outcome, repair_round) EvaluationReport
+        +_assemble(spec, base, criteria) EvalTask
+        +resolve_checks(spec, base) list~EvalCheck~
+    }
+
+    %% ---------------- ② 环境探针 ----------------
+    class CheckSpec {
+        <<pydantic, templates/models.py>>
+        run : str
+        blocking : bool
+        requires : str
+        requires_files : list~str~
+        +tier : str  "loadable|behavior|style|"
+        +requires_deps : list~str~  "'python:*'|'node:*'|包名"
+        +requires_build_output : str  "dist/"
+        +no_tests_exit_code : int?
+    }
+
+    class EvalCheck {
+        <<pydantic, evaluators/base.py>>
+        run : str
+        blocking : bool
+        requires : str
+        +tier : str
+        +requires_deps : list~str~
+        +requires_build_output : str
+        +no_tests_exit_code : int?
+    }
+
+    class CheckRun {
+        <<dataclass, evaluators/base.py>>
+        command : str
+        status : str  "passed|failed|skipped"
+        blocking : bool
+        skipped_reason : str
+        +tier : str
+    }
+
+    class DepsProbe {
+        <<module, evaluation/deps.py（新）>>
+        +declared_deps(files) dict
+        +missing_image_deps(declared, python_pkgs, node_pkgs) tuple
+        +check_requires_deps(check, missing) tuple
+        +MISSING_DEPS_PREFIX = "requires_missing_deps:"
+    }
+
+    class RunChecks {
+        <<function, evaluators/base.py>>
+        +run_checks(sandbox, checks, exec_timeout, evidence, missing_deps) list~CheckRun~
+    }
+
+    %% ---------------- ③ 健康度第四态 ----------------
+    class MergedHealth {
+        <<dataclass frozen, artifacts/provenance.py>>
+        status : str
+        source : str
+        +unverified : bool
+        +known : bool  "纳入 unverified"
+    }
+
+    class MergedHealthReading {
+        <<dataclass frozen, api/routers/artifacts.py（新）>>
+        +status : str
+        +source_name : str
+        +divergent : bool
+    }
+
+    class HealthLiterals {
+        <<provenance.py 常量>>
+        HEALTH_HEALTHY = "healthy"
+        HEALTH_UNHEALTHY = "unhealthy"
+        HEALTH_SKIPPED = "skipped"
+        +HEALTH_UNVERIFIED = "unverified"
+        +BASELINE_PROMOTED_UNVERIFIED_CODE = "baseline_promoted_unverified:1"
+        +CRITERIA_DIVERGED_CODE = "criteria_diverged:1"
+    }
+
+    class PromoteResult {
+        <<dataclass frozen, provenance.py>>
+        reused : bool
+        +warning : str  "逗号分隔的留痕码集合"
+        health_status : str
+    }
+
+    %% ---------------- 关系 ----------------
+    TaskCriteria ..> EvalTask : 注入
+    EvalTask --> EvalCheck : checks
+    CheckSpec ..> EvalCheck : resolve_checks 同构转发
+    RunChecks --> CheckRun : 产出
+    EvalCheck ..> RunChecks : tier/requires_deps/no_tests_exit_code
+    DepsProbe ..> RunChecks : missing_deps
+    EvalTask ..> DepsProbe : image_packages
+    RunTaskModule ..> TaskCriteria : 产出
+    RunTaskModule ..> EvalTask : 唯一装配（run / project 两入口共用 _assemble）
+    RunTaskModule ..> EvaluationReport : build_run_report（gate 与 CLI 共用）
+    EvaluationReport *-- TaskOut : tasks
+    TaskOut ..> EvaluationReport : 三元组派生源
+    EvalTask ..> TaskOut : criteria_* 透传
+    MergedHealthReading ..> MergedHealth : 归约（unverified 不阻断）
+    HealthLiterals ..> MergedHealth
+    HealthLiterals ..> PromoteResult : warning 短码

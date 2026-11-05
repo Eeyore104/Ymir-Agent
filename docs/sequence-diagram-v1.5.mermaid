@@ -1,0 +1,98 @@
+%% ymir-agent v1.5 时序图：三条路径收敛到同一把尺子
+%% 段落 A：CLI --evaluate 落盘 verdict（T4）
+%% 段落 B：Web 补评测走唯一装配点 + 报告自证判据（T2-R1/R2）
+%% 段落 C：from-merge 读取优先级 + disclosure + unverified 留痕（T2-R3 / T1-R3 / R2）
+%% 关键不变量：
+%%   1) A/B 两条路径的报告都由 run_task.build_run_report 产出（逐字段同构）
+%%   2) 报告根部必须带 criteria 三元组；缺失 = 弱口径 ⇒ 409 unknown（不猜）
+%%   3) eval_verdict 永远优先于 evaluation_report，与 created_at 无关
+%%   4) unverified 不阻断，但必须留痕 baseline_promoted_unverified:1
+
+sequenceDiagram
+    autonumber
+    participant CLI as scripts/run_single_role.py
+    participant RT as run_task 唯一装配点
+    participant H as EvaluationHarness
+    participant SB as Sandbox
+    participant ST as ArtifactStore
+    participant WEB as POST /projects/{id}/evaluations
+    participant PR as POST /baselines/from-merge
+    participant ART as artifacts._known_merged_health
+    participant PV as provenance.promote_merged_to_baseline
+
+    rect rgb(238, 246, 255)
+    Note over CLI,ST: 段落 A · CLI 单跑落盘 eval_verdict（--evaluate）
+    CLI->>CLI: truncate_pipeline 截到目标角色（engineer 链内无 evaluation）
+    CLI->>RT: evaluate_run(harness, run)
+    RT->>ST: 加载 code 最新版本 + 基线（run.context.baseline 精确引用）
+    RT->>SB: run_checks（D1/D2/D3 + requires_deps 探针）
+    SB-->>RT: CheckRun[]（passed / failed / skipped）
+    RT-->>CLI: TaskOut（blocking_failed / unverified_groups / 三维度分数）
+    CLI->>RT: build_run_report(run, suite, outcome, repair_round)
+    RT-->>CLI: EvaluationReport（criteria 三元组由 tasks[0] 派生）
+    CLI->>ST: report.save(name="eval_verdict", run_id=run.id) 新版本，不覆写
+    ST-->>CLI: vN
+    CLI->>CLI: 打印「评测结论已落盘（eval_verdict vN，绑定 code vM）—— 提升闸门可用」
+    alt 未加 --evaluate 或落盘失败
+        CLI->>CLI: 打印 verdict=absent（未裁决）—— 提升需 force；如需结论请加 --evaluate
+    end
+    end
+
+    rect rgb(243, 250, 240)
+    Note over WEB,ST: 段落 B · Web 补评测与 gate 同尺（不再自拼 EvalTask）
+    WEB->>ST: 反查归属 run（artifact_versions.run_id）
+    WEB->>ST: 读 run.context.template.id 取 template_id
+    alt 拿不到归属 run
+        WEB->>ST: 降级读 patch_manifest.provenance.template_id / template_hash
+    end
+    WEB->>RT: build_task_for_project(project_id, artifact_name, version, template_id, template_hash)
+    RT->>RT: _assemble 与 build_task_for_run 共用 → checks 逐字段相同
+    RT-->>WEB: (EvalTask, EvalSuite, TaskCriteria)
+    WEB->>H: evaluate_task(task, suite)
+    H->>SB: 同一批 checks 命令
+    SB-->>H: CheckRun[]
+    H->>H: 计算 blocking_failed / unverified_groups / regression
+    H-->>WEB: TaskOut
+    WEB->>RT: build_run_report(...)
+    RT-->>WEB: EvaluationReport（criteria_source=template, criteria_version=YAML sha256）
+    WEB->>ST: report.save(name="evaluation_report") 新版本
+    Note over WEB,ST: 都拿不到模板 ⇒ criteria_source="suite" + template_id=""（显式空串）<br/>该结论不得给"有模板的树"背书
+    end
+
+    rect rgb(255, 248, 235)
+    Note over PR,PV: 段落 C · 提升闸门：优先级 → 结论 → 留痕
+    PR->>PR: 解析 artifact_id / artifact_version、base_ref、template_id + template_hash（现算）
+    PR->>ART: _known_merged_health(run_id, artifact_version, artifact_name, template_id, template_hash)
+    loop 按产物名优先级 eval_verdict → evaluation_report（不依赖 created_at）
+        ART->>ST: get_artifact_detail → 同 run 匹配版本，从新到旧
+        ART->>ST: load(version) 取 evaluation_report.json
+        ART->>ART: _report_health_status（版本绑定 + 产物绑定 + criteria 绑定）
+        alt 拿到结论
+            ART->>ART: winner = status（healthy / unhealthy / unverified）
+        end
+    end
+    opt 胜者是宽松结论（healthy / unverified）
+        ART->>ST: 补读败者最新匹配版 1 次
+        ART->>ART: divergent = 两结论不一致
+    end
+    ART-->>PR: MergedHealthReading(status, source_name, divergent)
+    alt criteria 缺失（v1.4 历史报告）
+        ART-->>PR: status="" ⇒ 409 baseline_health_unknown（不猜，重评一次可解）
+    end
+    PR->>PV: promote_merged_to_baseline(known_health=status, force=payload.force, strict_health=True)
+    PV->>PV: 步骤 5 模板指纹 → 步骤 6/7 重建与逐字节校验（本版 YAML 改动 ⇒ 存量产物 1003）
+    alt unhealthy 且 force=false
+        PV-->>PR: BaselineUnhealthyError（409 baseline_unhealthy）
+    else unhealthy 且 force=true
+        PV->>PV: warning = baseline_promoted_unhealthy:1
+    else unverified（不阻断，Q2）
+        PV->>PV: warning = baseline_promoted_unverified:1
+    else 未知（criteria 弱 / 无报告）
+        PV-->>PR: BaselineHealthUnknownError（409 baseline_health_unknown）
+    end
+    opt divergent=true
+        PV->>PV: warning += ,criteria_diverged:1
+    end
+    PV->>ST: save(name="baseline") version.message 内嵌留痕码
+    PV-->>PR: PromoteResult(warning, health_status, reused)
+    end
